@@ -1,0 +1,1648 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CASCADE — Market Effect Terminal</title>
+<style>
+/* ================= palette (dataviz reference, dark mode selected) ============= */
+:root {
+  --page:        #0d0d0d;
+  --surface-1:   #141413;
+  --surface-2:   #1a1a19;
+  --surface-3:   #21211f;
+  --ink:         #ffffff;
+  --ink-2:       #c3c2b7;
+  --ink-muted:   #898781;
+  --grid:        #2c2c2a;
+  --baseline:    #383835;
+  --border:      rgba(255,255,255,0.10);
+  --accent:      #fb8b1e;            /* chrome accent only — never a data series */
+  --accent-dim:  rgba(251,139,30,0.14);
+  /* categorical (dark steps, validated) — fixed sector order */
+  --s-tech:      #3987e5;
+  --s-semi:      #199e70;
+  --s-fin:       #c98500;
+  --s-energy:    #008300;
+  --s-health:    #9085e9;
+  --s-consumer:  #e66767;
+  --s-indus:     #d55181;
+  --s-macro:     #d95926;
+  /* diverging pair for correlation: blue(+) / red(−), neutral midpoint */
+  --div-pos:     #3987e5;
+  --div-neg:     #e66767;
+  --div-mid:     #383835;
+  /* price direction (status semantics, reserved) */
+  --up:          #0ca30c;
+  --down:        #e66767;
+  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--page);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 13px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.num { font-variant-numeric: tabular-nums; }
+
+/* ================= header ================= */
+header {
+  display: flex; align-items: center; gap: 14px;
+  padding: 0 14px; height: 44px; flex: 0 0 44px;
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border);
+}
+.logo {
+  display: flex; align-items: center; gap: 8px;
+  font-weight: 700; letter-spacing: 2.5px; font-size: 14px;
+}
+.logo .block {
+  width: 20px; height: 20px; border-radius: 3px;
+  background: linear-gradient(135deg, var(--accent), #d95926);
+  box-shadow: 0 0 14px rgba(251,139,30,0.45);
+}
+.logo small { color: var(--ink-muted); font-weight: 400; letter-spacing: 1px; font-size: 10px; }
+.hdr-right { margin-left: auto; display: flex; align-items: center; gap: 14px; }
+.badge {
+  font-size: 10px; letter-spacing: 1.2px; padding: 3px 8px; border-radius: 3px;
+  border: 1px solid var(--border); color: var(--ink-2);
+}
+button.badge { font-family: var(--font); cursor: pointer; }
+button.badge:hover { border-color: rgba(255,255,255,0.28); }
+.badge.live { color: var(--up); border-color: rgba(12,163,12,0.45); background: rgba(12,163,12,0.12); }
+.badge.off { color: var(--ink-muted); border-color: var(--border); background: transparent; }
+#clock { color: var(--ink-2); font-size: 12px; letter-spacing: 1px; }
+
+/* ================= ticker tape ================= */
+.tape-wrap {
+  height: 28px; flex: 0 0 28px; overflow: hidden; position: relative;
+  background: var(--surface-1); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center;
+}
+.tape { display: flex; gap: 26px; white-space: nowrap; animation: tape 55s linear infinite; padding-left: 10px; }
+.tape-wrap:hover .tape { animation-play-state: paused; }
+@keyframes tape { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+.tape span { font-size: 11.5px; color: var(--ink-2); }
+.tape b { color: var(--ink); font-weight: 600; margin-right: 5px; }
+.tape .u { color: var(--up); } .tape .d { color: var(--down); }
+
+/* ================= layout ================= */
+main { flex: 1; display: grid; grid-template-columns: 236px 1fr 380px; min-height: 0; }
+.panel { background: var(--surface-1); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+.panel-title {
+  font-size: 10px; letter-spacing: 1.6px; color: var(--ink-muted);
+  padding: 10px 12px 8px; text-transform: uppercase; flex: 0 0 auto;
+}
+
+/* left: universe list */
+#search {
+  margin: 0 10px 8px; padding: 7px 10px; width: calc(100% - 20px);
+  background: var(--surface-3); border: 1px solid var(--border); border-radius: 4px;
+  color: var(--ink); font-family: var(--font); font-size: 12px; outline: none;
+}
+#search:focus { border-color: rgba(251,139,30,0.5); }
+#search::placeholder { color: var(--ink-muted); }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 10px 8px; }
+.chip {
+  font-size: 9.5px; letter-spacing: 0.6px; padding: 3px 7px; border-radius: 10px;
+  border: 1px solid var(--border); color: var(--ink-2); cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 5px; background: transparent;
+  font-family: var(--font);
+}
+.chip .dot { width: 7px; height: 7px; border-radius: 50%; }
+.chip.off { opacity: 0.35; }
+#companies { overflow-y: auto; flex: 1; }
+.co-row {
+  display: grid; grid-template-columns: 10px 52px 1fr auto; gap: 8px; align-items: center;
+  padding: 6px 12px; cursor: pointer; border-left: 2px solid transparent;
+}
+.co-row:hover { background: var(--surface-3); }
+.co-row.sel { background: var(--accent-dim); border-left-color: var(--accent); }
+.co-row .dot { width: 8px; height: 8px; border-radius: 50%; }
+.co-row .dot.macro { border-radius: 1px; transform: rotate(45deg); }
+.co-row .tk { font-weight: 700; font-size: 12px; }
+.co-row .nm { color: var(--ink-muted); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.co-row .chg { font-size: 11px; }
+
+/* center: network stage */
+#stage-wrap { position: relative; min-width: 0; background:
+  radial-gradient(ellipse 80% 60% at 50% 40%, #161615 0%, var(--page) 100%); }
+#stage { width: 100%; height: 100%; display: block; cursor: grab; }
+#stage.panning { cursor: grabbing; }
+.toolbar {
+  position: absolute; top: 10px; left: 12px; right: 12px;
+  display: flex; align-items: center; gap: 10px; pointer-events: none;
+}
+.toolbar > * { pointer-events: auto; }
+.tool-group {
+  display: flex; align-items: center; gap: 8px;
+  background: rgba(20,20,19,0.88); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 10px; backdrop-filter: blur(6px);
+}
+.tool-label { font-size: 9.5px; letter-spacing: 1.2px; color: var(--ink-muted); text-transform: uppercase; }
+input[type=range] { accent-color: var(--accent); width: 120px; }
+#shock-val { font-weight: 700; min-width: 46px; text-align: right; font-size: 12px; }
+.seg { display: flex; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+.seg button {
+  background: transparent; border: none; color: var(--ink-2); font-family: var(--font);
+  font-size: 10px; padding: 4px 8px; cursor: pointer; letter-spacing: 0.3px;
+}
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button.on { background: var(--accent-dim); color: var(--accent); font-weight: 700; }
+.tbtn {
+  background: rgba(20,20,19,0.88); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--ink-2); font-family: var(--font); font-size: 10.5px; letter-spacing: 0.8px;
+  padding: 7px 12px; cursor: pointer; backdrop-filter: blur(6px);
+}
+.tbtn:hover { color: var(--ink); border-color: rgba(255,255,255,0.25); }
+.legend {
+  position: absolute; left: 12px; bottom: 12px;
+  background: rgba(20,20,19,0.88); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 3px 14px;
+  backdrop-filter: blur(6px);
+}
+.legend .li { display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--ink-2); }
+.legend .sw { width: 8px; height: 8px; border-radius: 50%; }
+.legend .sw.macro { border-radius: 1px; transform: rotate(45deg); }
+.order-key {
+  position: absolute; right: 12px; bottom: 12px;
+  background: rgba(20,20,19,0.88); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; display: none; gap: 4px; flex-direction: column; backdrop-filter: blur(6px);
+}
+.order-key.show { display: flex; }
+.order-key .li { display: flex; align-items: center; gap: 8px; font-size: 10px; color: var(--ink-2); }
+.order-key svg { flex: 0 0 auto; }
+
+/* node/edge svg styling */
+.edge { stroke: var(--baseline); fill: none; transition: stroke 0.3s, opacity 0.3s, stroke-width 0.3s; }
+.edge.dim { opacity: 0.06; }
+.edge.flow { stroke-dasharray: 6 5; animation: flow 0.9s linear infinite; }
+@keyframes flow { to { stroke-dashoffset: -11; } }
+.node { cursor: pointer; }
+.node circle.body, .node path.body { transition: opacity 0.35s; }
+.node.dim { opacity: 0.13; }
+.node text {
+  font-family: var(--font); font-size: 9.5px; font-weight: 600; fill: var(--ink-2);
+  pointer-events: none; text-anchor: middle; paint-order: stroke; stroke: var(--page); stroke-width: 3px;
+}
+.node.sel text, .node.hit text { fill: var(--ink); font-size: 10.5px; }
+.node .halo { fill: none; opacity: 0; }
+.node.hit .halo { opacity: 1; }
+.ripple { fill: none; stroke: var(--accent); pointer-events: none; }
+@keyframes rippleAnim {
+  0%   { opacity: 0.85; }
+  100% { opacity: 0; }
+}
+.impact-chip {
+  font-size: 8.5px; font-weight: 700; text-anchor: middle;
+  paint-order: stroke; stroke: var(--page); stroke-width: 3px;
+}
+
+/* tooltip */
+#tip {
+  position: fixed; z-index: 50; pointer-events: none; display: none;
+  background: rgba(26,26,25,0.97); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; min-width: 150px; box-shadow: 0 6px 24px rgba(0,0,0,0.5);
+}
+#tip .t-head { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+#tip .t-key { width: 12px; height: 3px; border-radius: 2px; }
+#tip .t-title { font-weight: 700; font-size: 12px; }
+#tip .t-sub { color: var(--ink-muted); font-size: 10px; margin-bottom: 5px; }
+#tip .t-row { display: flex; justify-content: space-between; gap: 16px; font-size: 11px; padding: 1.5px 0; }
+#tip .t-row .lbl { color: var(--ink-2); }
+#tip .t-row .val { font-weight: 700; }
+
+/* right panel */
+.rpanel { border-right: none; border-left: 1px solid var(--border); }
+.tabs { display: flex; border-bottom: 1px solid var(--border); flex: 0 0 auto; }
+.tabs button {
+  flex: 1; background: transparent; border: none; border-bottom: 2px solid transparent;
+  color: var(--ink-muted); font-family: var(--font); font-size: 10.5px; letter-spacing: 0.8px;
+  padding: 10px 0 9px; cursor: pointer; text-transform: uppercase;
+}
+.tabs button.on { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-body { flex: 1; overflow-y: auto; min-height: 0; }
+.tab-page { display: none; padding: 12px; }
+.tab-page.on { display: block; }
+
+/* overview */
+.co-card { margin-bottom: 12px; }
+.co-card .tk-line { display: flex; align-items: baseline; gap: 8px; }
+.co-card .tk-line .tk { font-size: 20px; font-weight: 800; letter-spacing: 0.5px; }
+.co-card .tk-line .sect { font-size: 10px; letter-spacing: 1px; color: var(--ink-muted); text-transform: uppercase; }
+.co-card .nm { color: var(--ink-2); font-size: 12px; margin-top: 2px; }
+.hero { display: flex; align-items: baseline; gap: 10px; margin: 10px 0 2px; }
+.hero .px { font-size: 30px; font-weight: 800; }
+.hero .chg { font-size: 14px; font-weight: 700; }
+.hero .chg.u { color: var(--up); } .hero .chg.d { color: var(--down); }
+.stat-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin: 12px 0; }
+.stat {
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
+}
+.stat .k { font-size: 9px; letter-spacing: 1px; color: var(--ink-muted); text-transform: uppercase; }
+.stat .v { font-size: 14px; font-weight: 700; margin-top: 3px; }
+.chart-card { background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin-bottom: 12px; }
+.chart-card h3 { font-size: 10px; letter-spacing: 1.4px; color: var(--ink-muted); text-transform: uppercase; font-weight: 600; margin-bottom: 6px; }
+.chart-legend { display: flex; gap: 14px; margin-bottom: 4px; }
+.chart-legend .li { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--ink-2); }
+.chart-legend .key { width: 14px; height: 2px; border-radius: 1px; }
+#pxchart { display: block; width: 100%; }
+.corr-list .row {
+  display: grid; grid-template-columns: 52px 1fr 44px; gap: 8px; align-items: center;
+  padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,0.05); cursor: pointer;
+}
+.corr-list .row:hover .tk { color: var(--accent); }
+.corr-list .tk { font-weight: 700; font-size: 11.5px; }
+.corr-list .bar-wrap { height: 8px; position: relative; background: var(--surface-3); border-radius: 2px; overflow: hidden; }
+.corr-list .bar { position: absolute; top: 0; bottom: 0; border-radius: 2px; }
+.corr-list .rv { text-align: right; font-size: 11px; font-weight: 700; }
+
+/* cascade table */
+.cascade-head { margin-bottom: 10px; }
+.cascade-head .big { font-size: 13px; font-weight: 700; }
+.cascade-head .sub { color: var(--ink-muted); font-size: 10.5px; margin-top: 2px; }
+.order-block { margin-bottom: 14px; }
+.order-block h4 {
+  font-size: 10px; letter-spacing: 1.4px; text-transform: uppercase; font-weight: 700;
+  display: flex; align-items: center; gap: 8px; margin-bottom: 6px; color: var(--ink-2);
+}
+.order-block h4 .n { color: var(--ink-muted); font-weight: 400; letter-spacing: 0; }
+table.cas { width: 100%; border-collapse: collapse; }
+table.cas th {
+  text-align: left; font-size: 9px; letter-spacing: 1px; color: var(--ink-muted);
+  text-transform: uppercase; font-weight: 600; padding: 3px 6px 5px; border-bottom: 1px solid var(--grid);
+}
+table.cas th:last-child, table.cas td:last-child { text-align: right; }
+table.cas td { padding: 5px 6px; font-size: 11px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+table.cas tr.body:hover { background: var(--surface-3); cursor: pointer; }
+table.cas .tk { font-weight: 700; }
+table.cas .path { color: var(--ink-muted); font-size: 10px; }
+table.cas .imp { font-weight: 700; }
+.imp.u { color: var(--up); } .imp.d { color: var(--down); }
+.ibar-wrap { height: 6px; background: var(--surface-3); border-radius: 2px; position: relative; overflow: hidden; margin-top: 3px; }
+.ibar { position: absolute; top: 0; bottom: 0; border-radius: 2px; }
+.empty-note { color: var(--ink-muted); font-size: 11.5px; padding: 20px 0; text-align: center; line-height: 1.6; }
+
+/* cascade summary + interpretation */
+.cas-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+.cas-tile { background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+.cas-tile .k { font-size: 8.5px; letter-spacing: 1px; color: var(--ink-muted); text-transform: uppercase; }
+.cas-tile .v { font-size: 17px; font-weight: 800; margin-top: 3px; }
+.cas-tile .v small { font-size: 10px; font-weight: 600; color: var(--ink-muted); letter-spacing: 0.3px; }
+.cas-read {
+  font-size: 11.5px; line-height: 1.55; color: var(--ink-2);
+  background: var(--accent-dim); border-left: 2px solid var(--accent);
+  border-radius: 0 5px 5px 0; padding: 9px 11px; margin-bottom: 14px;
+}
+.cas-read b { color: var(--ink); font-weight: 700; }
+.cas-read .up { color: var(--up); font-weight: 700; }
+.cas-read .dn { color: var(--down); font-weight: 700; }
+.conv { display: inline-flex; gap: 2px; margin-left: 6px; vertical-align: middle; }
+.conv i { width: 5px; height: 5px; background: var(--accent); transform: rotate(45deg); display: inline-block; border-radius: 1px; }
+th.conv-h { text-align: center !important; width: 34px; }
+td.conv-c { text-align: center; }
+
+/* options flow */
+.flow-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+.flow-top .k { font-size: 10px; letter-spacing: 1.4px; color: var(--ink-muted); text-transform: uppercase; }
+.flow-top .as-of { font-size: 10px; color: var(--ink-muted); margin-top: 3px; }
+.flow-refresh {
+  background: var(--surface-3); border: 1px solid var(--border); border-radius: 5px; color: var(--ink-2);
+  font-family: var(--font); font-size: 10px; letter-spacing: 0.6px; padding: 5px 9px; cursor: pointer; white-space: nowrap;
+}
+.flow-refresh:hover { color: var(--ink); border-color: rgba(255,255,255,0.25); }
+.pcr-card { background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin-bottom: 12px; }
+.pcr-card h3 { font-size: 10px; letter-spacing: 1.2px; color: var(--ink-muted); text-transform: uppercase; margin-bottom: 8px; display:flex; justify-content:space-between; }
+.pcr-card h3 .val { color: var(--ink); font-weight: 700; letter-spacing: 0; }
+.split-bar { height: 12px; border-radius: 3px; overflow: hidden; display: flex; background: var(--surface-3); }
+.split-bar .call { background: var(--div-pos); }
+.split-bar .put { background: var(--div-neg); }
+.split-key { display: flex; justify-content: space-between; margin-top: 5px; font-size: 10px; }
+.split-key .call-k { color: var(--div-pos); font-weight: 700; }
+.split-key .put-k { color: var(--div-neg); font-weight: 700; }
+.und-list { margin-bottom: 14px; }
+.und-list h3, .contracts h3 { font-size: 10px; letter-spacing: 1.4px; color: var(--ink-muted); text-transform: uppercase; margin-bottom: 7px; }
+.und-row { display: grid; grid-template-columns: 46px 1fr 40px; gap: 8px; align-items: center; padding: 4px 0; cursor: pointer; }
+.und-row:hover .und-tk { color: var(--accent); }
+.und-tk { font-weight: 700; font-size: 12px; }
+.und-bar { height: 9px; border-radius: 2px; overflow: hidden; display: flex; background: var(--surface-3); }
+.und-bar .c { background: var(--div-pos); } .und-bar .p { background: var(--div-neg); }
+.und-pcr { text-align: right; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+table.opt { width: 100%; border-collapse: collapse; }
+table.opt th { text-align: right; font-size: 8.5px; letter-spacing: 0.6px; color: var(--ink-muted); text-transform: uppercase; font-weight: 600; padding: 3px 5px 5px; border-bottom: 1px solid var(--grid); }
+table.opt th:first-child, table.opt td:first-child { text-align: left; }
+table.opt td { padding: 4px 5px; font-size: 10.5px; border-bottom: 1px solid rgba(255,255,255,0.05); font-variant-numeric: tabular-nums; }
+table.opt tr.body:hover { background: var(--surface-3); cursor: pointer; }
+.cp { display: inline-block; font-size: 8.5px; font-weight: 800; padding: 1px 4px; border-radius: 3px; letter-spacing: 0.5px; }
+.cp.C { color: var(--div-pos); background: rgba(57,135,229,0.15); }
+.cp.P { color: var(--div-neg); background: rgba(230,103,103,0.15); }
+.opt-strike { font-weight: 700; }
+.opt-exp { color: var(--ink-muted); font-size: 9.5px; }
+.zdte { color: var(--accent); font-weight: 700; }
+.flow-note { color: var(--ink-muted); font-size: 10px; line-height: 1.5; margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--grid); }
+
+/* matrix */
+#matrix-wrap { position: relative; }
+#matrix { display: block; width: 100%; image-rendering: pixelated; border: 1px solid var(--border); border-radius: 4px; cursor: crosshair; }
+.mx-scale { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 10px; color: var(--ink-2); }
+.mx-grad { flex: 1; height: 8px; border-radius: 4px; background: linear-gradient(90deg, var(--div-neg), var(--div-mid) 50%, var(--div-pos)); }
+.mx-note { color: var(--ink-muted); font-size: 10px; margin-top: 8px; line-height: 1.5; }
+
+/* footer */
+footer {
+  height: 26px; flex: 0 0 26px; display: flex; align-items: center; gap: 18px;
+  padding: 0 14px; background: var(--surface-1); border-top: 1px solid var(--border);
+  font-size: 10px; color: var(--ink-muted); letter-spacing: 0.6px;
+}
+footer .sep { flex: 1; }
+footer b { color: var(--ink-2); font-weight: 600; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--baseline); border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo"><div class="block"></div>CASCADE <small>MARKET EFFECT TERMINAL</small></div>
+  <div class="hdr-right">
+    <span class="badge" id="src-badge">MODEL CORE · 250D</span>
+    <button class="badge" id="live-toggle" title="Toggle live data feed">● CONNECTING…</button>
+    <span id="clock" class="num"></span>
+  </div>
+</header>
+
+<div class="tape-wrap"><div class="tape" id="tape"></div></div>
+
+<main>
+  <!-- left: universe -->
+  <section class="panel">
+    <div class="panel-title">Universe</div>
+    <input id="search" type="text" placeholder="Search ticker or name…" autocomplete="off">
+    <div class="chips" id="chips"></div>
+    <div id="companies"></div>
+  </section>
+
+  <!-- center: network -->
+  <section id="stage-wrap">
+    <svg id="stage"></svg>
+    <div class="toolbar">
+      <div class="tool-group">
+        <span class="tool-label">Shock</span>
+        <input type="range" id="shock" min="-10" max="10" step="0.5" value="-5">
+        <span id="shock-val" class="num">−5.0%</span>
+      </div>
+      <div class="tool-group">
+        <span class="tool-label">Depth</span>
+        <div class="seg" id="depth-seg">
+          <button data-d="1">1st</button><button data-d="2">2nd</button><button data-d="3" class="on">3rd</button><button data-d="4">4th</button><button data-d="5">5th</button>
+        </div>
+      </div>
+      <button class="tbtn" id="btn-clear">CLEAR</button>
+      <button class="tbtn" id="btn-reheat">RE-LAYOUT</button>
+      <button class="tbtn" id="btn-sync-corr" title="Rebuild the correlation network from 6mo live daily history">SYNC HISTORY</button>
+      <span class="badge" id="corr-status">CORRELATION MODEL SYNTHETIC</span>
+    </div>
+    <div class="legend" id="legend"></div>
+    <div class="order-key" id="order-key">
+      <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2"/></svg>1st order — direct</div>
+      <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="4 3"/></svg>2nd order — one hop</div>
+      <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="2 3"/></svg>3rd order — two hops</div>
+      <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="1 3"/></svg>4th order — three hops</div>
+      <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="0.6 3.4"/></svg>5th order — four hops</div>
+    </div>
+  </section>
+
+  <!-- right: detail -->
+  <section class="panel rpanel">
+    <div class="tabs">
+      <button class="on" data-tab="overview">Overview</button>
+      <button data-tab="cascade">Cascade</button>
+      <button data-tab="flow">Flow</button>
+      <button data-tab="matrix">Matrix</button>
+    </div>
+    <div class="tab-body">
+      <div class="tab-page on" id="tab-overview"></div>
+      <div class="tab-page" id="tab-cascade"></div>
+      <div class="tab-page" id="tab-flow"></div>
+      <div class="tab-page" id="tab-matrix">
+        <div class="panel-title" style="padding:0 0 8px" id="matrix-title">Cross-correlation · 250d daily returns</div>
+        <div id="matrix-wrap"><canvas id="matrix"></canvas></div>
+        <div class="mx-scale"><span class="num">−1.0</span><div class="mx-grad"></div><span class="num">+1.0</span></div>
+        <div class="mx-note">Rows grouped by sector. Hover a cell for the pair readout; click to select the row instrument. Blue = positive co-movement, red = inverse.</div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>NODES <b id="f-nodes" class="num">—</b></span>
+  <span>EDGES <b id="f-edges" class="num">—</b></span>
+  <span>MODEL <b>4-FACTOR + SUPPLY LINKS</b></span>
+  <span class="sep"></span>
+  <span>LIVE QUOTES DELAYED · CORRELATION MODEL <b id="f-corr-mode">SYNTHETIC</b> · NOT INVESTMENT ADVICE</span>
+</footer>
+
+<div id="tip"></div>
+
+<script>
+"use strict";
+/* ============================================================================
+   CASCADE — synthetic market universe, factor-model returns, real correlations,
+   force-directed network, 1st/2nd/3rd-order shock propagation.
+   ========================================================================== */
+
+/* ---------- seeded RNG ---------- */
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+const rand = mulberry32(20260713);
+function gauss(){let u=0,v=0;while(u===0)u=rand();while(v===0)v=rand();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v)}
+
+/* ---------- universe ---------- */
+const SECTORS = [
+  { id:"tech",     label:"Technology",     color:"var(--s-tech)",     hex:"#3987e5" },
+  { id:"semi",     label:"Semiconductors", color:"var(--s-semi)",     hex:"#199e70" },
+  { id:"fin",      label:"Financials",     color:"var(--s-fin)",      hex:"#c98500" },
+  { id:"energy",   label:"Energy",         color:"var(--s-energy)",   hex:"#008300" },
+  { id:"health",   label:"Healthcare",     color:"var(--s-health)",   hex:"#9085e9" },
+  { id:"consumer", label:"Consumer",       color:"var(--s-consumer)", hex:"#e66767" },
+  { id:"indus",    label:"Industrials",    color:"var(--s-indus)",    hex:"#d55181" },
+  { id:"macro",    label:"Markets / Macro",color:"var(--s-macro)",    hex:"#d95926" },
+];
+const SECTOR_BY_ID = Object.fromEntries(SECTORS.map(s=>[s.id,s]));
+
+// [ticker, name, sector, size(mkt-cap weight 1..5)]
+const UNIVERSE = [
+  ["AAPL","Apple","tech",5],["MSFT","Microsoft","tech",5],["GOOGL","Alphabet","tech",4],
+  ["META","Meta Platforms","tech",4],["ORCL","Oracle","tech",3],
+  ["NVDA","NVIDIA","semi",5],["TSM","TSMC","semi",4],["AMD","Advanced Micro","semi",3],
+  ["ASML","ASML Holding","semi",3],["MU","Micron","semi",2],
+  ["JPM","JPMorgan Chase","fin",4],["GS","Goldman Sachs","fin",3],["BAC","Bank of America","fin",3],
+  ["MS","Morgan Stanley","fin",3],["V","Visa","fin",4],
+  ["XOM","Exxon Mobil","energy",4],["CVX","Chevron","energy",3],["COP","ConocoPhillips","energy",3],
+  ["SLB","Schlumberger","energy",2],["OXY","Occidental","energy",2],
+  ["JNJ","Johnson & Johnson","health",4],["UNH","UnitedHealth","health",4],["LLY","Eli Lilly","health",4],
+  ["PFE","Pfizer","health",3],["MRK","Merck","health",3],
+  ["AMZN","Amazon","consumer",5],["TSLA","Tesla","consumer",4],["WMT","Walmart","consumer",4],
+  ["HD","Home Depot","consumer",3],["NKE","Nike","consumer",2],
+  ["BA","Boeing","indus",3],["CAT","Caterpillar","indus",3],["GE","GE Aerospace","indus",3],
+  ["UPS","United Parcel","indus",2],["LMT","Lockheed Martin","indus",3],
+  ["SPX","S&P 500 Index","macro",5],["NDX","Nasdaq 100","macro",4],["WTI","Crude Oil (WTI)","macro",3],
+  ["XAU","Gold Spot","macro",3],["US10Y","10-Yr Treasury Yield","macro",3],["DXY","US Dollar Index","macro",3],
+];
+
+/* ---------- factor-model return generation (250 trading days) ---------- */
+const DAYS = 250;
+function series(fn){ const a=new Float64Array(DAYS); for(let t=0;t<DAYS;t++) a[t]=fn(t); return a; }
+
+// core factors
+const F_mkt  = series(()=> 0.0004 + 0.009*gauss());
+const F_rate = series(()=> 0.02 *gauss());               // rates factor
+const F_oil  = series(()=> 0.018*gauss());               // oil factor
+const F_sect = {};                                        // per-sector residual factor
+for (const s of SECTORS) F_sect[s.id] = series(()=> 0.006*gauss());
+
+// exposures: [mkt, sector, rate, oil]
+const EXPOSURE = {
+  tech:     [1.15, 1.0, -0.12,  0.00],
+  semi:     [1.35, 1.1, -0.10,  0.00],
+  fin:      [0.95, 1.0,  0.22,  0.02],
+  energy:   [0.70, 0.9, -0.02,  0.55],
+  health:   [0.60, 1.0, -0.02,  0.00],
+  consumer: [1.05, 1.0, -0.08, -0.12],
+  indus:    [0.95, 1.0,  0.02, -0.18],
+};
+
+const nodes = UNIVERSE.map(([tk,name,sector,size],i)=>({ i, tk, name, sector, size }));
+const IDX = Object.fromEntries(nodes.map(n=>[n.tk,n.i]));
+
+const returns = nodes.map(n=>{
+  if (n.sector!=="macro"){
+    const [bm,bs,br,bo] = EXPOSURE[n.sector];
+    const beta = bm*(0.85+0.3*rand());
+    return series(t=> beta*F_mkt[t] + bs*F_sect[n.sector][t] + br*F_rate[t] + bo*F_oil[t] + 0.0085*gauss());
+  }
+  return null; // filled below
+});
+// macro instruments derive from the same factors so correlations are honest
+returns[IDX.SPX]   = series(t=>{ let s=0,w=0; for(const n of nodes){ if(n.sector!=="macro"){ s+=n.size*returns[n.i][t]; w+=n.size; } } return s/w + 0.0008*gauss(); });
+returns[IDX.NDX]   = series(t=>{ let s=0,w=0; for(const n of nodes){ if(n.sector==="tech"||n.sector==="semi"||n.tk==="AMZN"||n.tk==="TSLA"){ s+=n.size*returns[n.i][t]; w+=n.size; } } return s/w + 0.001*gauss(); });
+returns[IDX.WTI]   = series(t=> F_oil[t]*1.0 + 0.15*F_mkt[t] + 0.004*gauss());
+returns[IDX.XAU]   = series(t=> -0.25*F_rate[t] - 0.12*F_mkt[t] + 0.007*gauss());
+returns[IDX.US10Y] = series(t=> F_rate[t] + 0.004*gauss());
+returns[IDX.DXY]   = series(t=> 0.35*F_rate[t] - 0.15*F_oil[t] - 0.1*F_mkt[t] + 0.0035*gauss());
+
+// price paths
+const BASE_PX = { SPX:5900, NDX:21000, WTI:74, XAU:2650, US10Y:4.3, DXY:104 };
+const prices = nodes.map(n=>{
+  let p = BASE_PX[n.tk] ?? (40 + rand()*400);
+  const out = new Float64Array(DAYS+1); out[0]=p;
+  for(let t=0;t<DAYS;t++){ p*= (1+returns[n.i][t]); out[t+1]=p; }
+  return out;
+});
+const lastPx  = nodes.map(n=> prices[n.i][DAYS]);
+const dayChg  = nodes.map(n=> returns[n.i][DAYS-1]);
+const vol30   = nodes.map(n=>{ let m=0; const r=returns[n.i]; for(let t=DAYS-30;t<DAYS;t++)m+=r[t]; m/=30;
+  let v=0; for(let t=DAYS-30;t<DAYS;t++)v+=(r[t]-m)**2; return Math.sqrt(v/29)*Math.sqrt(252); });
+
+/* ---------- correlation matrix (Pearson, empirical) ---------- */
+const N = nodes.length;
+const mean = returns.map(r=>{ let s=0; for(let t=0;t<DAYS;t++)s+=r[t]; return s/DAYS; });
+const sd   = returns.map((r,i)=>{ let s=0; for(let t=0;t<DAYS;t++)s+=(r[t]-mean[i])**2; return Math.sqrt(s/DAYS); });
+let CORR = Array.from({length:N},()=>new Float64Array(N));
+for(let i=0;i<N;i++){ CORR[i][i]=1;
+  for(let j=i+1;j<N;j++){ let s=0; for(let t=0;t<DAYS;t++)s+=(returns[i][t]-mean[i])*(returns[j][t]-mean[j]);
+    const r=s/(DAYS*sd[i]*sd[j]); CORR[i][j]=r; CORR[j][i]=r; } }
+
+/* ---------- graph edges: supply/rate/fuel narrative links + top correlations ---------- */
+const LINKS = [ // [a, b, mechanism]
+  ["ASML","TSM","Lithography supply"],["TSM","NVDA","Foundry supply"],["TSM","AAPL","Foundry supply"],
+  ["TSM","AMD","Foundry supply"],["NVDA","MSFT","AI datacenter demand"],["NVDA","GOOGL","AI accelerator demand"],
+  ["NVDA","META","AI capex demand"],["MU","NVDA","HBM memory supply"],["AMD","MSFT","Server CPU supply"],
+  ["AAPL","NKE","Consumer discretionary pulse"],["AMZN","UPS","Parcel volume"],
+  ["WTI","XOM","Crude realization"],["WTI","CVX","Crude realization"],["WTI","COP","Crude realization"],
+  ["WTI","OXY","Crude realization"],["XOM","SLB","Oilfield capex"],
+  ["WTI","UPS","Fuel cost"],["WTI","BA","Airline fuel pass-through"],
+  ["US10Y","JPM","Net interest margin"],["US10Y","BAC","Net interest margin"],["US10Y","GS","Rates trading"],
+  ["US10Y","MS","Rates sensitivity"],["US10Y","XAU","Real-rate discount"],["US10Y","NDX","Duration discount"],
+  ["DXY","XAU","Dollar pricing"],["DXY","WTI","Dollar pricing"],
+  ["V","AMZN","Payments volume"],["JPM","V","Card issuance"],
+  ["CAT","XOM","Energy capex equipment"],["GE","BA","Engine supply"],["LMT","GE","Defense propulsion"],
+  ["WMT","UPS","Retail logistics"],["HD","CAT","Construction cycle"],["TSLA","MU","Auto silicon"],
+  ["SPX","JNJ","Index beta"],["SPX","UNH","Index beta"],["NDX","AAPL","Index weight"],
+  ["NDX","MSFT","Index weight"],["SPX","AMZN","Index weight"],["LLY","MRK","Pharma pipeline sentiment"],
+  ["PFE","JNJ","Pharma sector flows"],
+];
+const edgeKey=(a,b)=> a<b? a+"|"+b : b+"|"+a;
+
+/* Builds {edgeMap, edges, ADJ} from any N×N correlation matrix: curated LINKS
+   always transmit (mechanism/story is stable, only their r updates), plus
+   the strongest empirical correlations (top-2 per node, |r| ≥ 0.5) densify
+   the rest. Called at boot with the synthetic CORR, and again by
+   syncCorrelation() with a live one — one shared source of truth for edge
+   topology so the two paths can't drift apart. */
+function buildGraph(corr){
+  const edgeMap = new Map();
+  for (const [a,b,mech] of LINKS){
+    const i=IDX[a], j=IDX[b];
+    edgeMap.set(edgeKey(a,b), { a:i, b:j, r:corr[i][j], mech, link:true });
+  }
+  for (let i=0;i<N;i++){
+    const cand=[];
+    for(let j=0;j<N;j++) if(j!==i) cand.push([j, Math.abs(corr[i][j])]);
+    cand.sort((x,y)=>y[1]-x[1]);
+    let added=0;
+    for(const [j,ar] of cand){
+      if(ar<0.5 || added>=1) break;
+      const k=edgeKey(nodes[i].tk,nodes[j].tk);
+      if(!edgeMap.has(k)){ edgeMap.set(k,{a:i,b:j,r:corr[i][j],mech:"Return co-movement",link:false}); added++; }
+    }
+  }
+  const edges=[...edgeMap.values()];
+  const ADJ = Array.from({length:N},()=>[]);
+  edges.forEach((e,ei)=>{ ADJ[e.a].push({to:e.b,r:e.r,ei}); ADJ[e.b].push({to:e.a,r:e.r,ei}); });
+  return { edgeMap, edges, ADJ };
+}
+let { edgeMap, edges, ADJ } = buildGraph(CORR);
+
+/* ============================================================================
+   FORCE SIMULATION (custom, O(n²) fine at this scale)
+   ========================================================================== */
+const sim = nodes.map((n,i)=>{
+  const s=SECTORS.findIndex(s=>s.id===n.sector);
+  const ang = (s/SECTORS.length)*Math.PI*2 - Math.PI/2;
+  return { x: Math.cos(ang)*260 + gauss()*40, y: Math.sin(ang)*260 + gauss()*40,
+           vx:0, vy:0, fx:null, fy:null, r: 8 + n.size*2.6 };
+});
+let alpha = 1;
+function tick(){
+  if (alpha < 0.004) return;
+  alpha *= 0.992;
+  // repulsion
+  for(let i=0;i<N;i++) for(let j=i+1;j<N;j++){
+    const a=sim[i], b=sim[j];
+    let dx=b.x-a.x, dy=b.y-a.y, d2=dx*dx+dy*dy;
+    if(d2<1){dx=(rand()-0.5);dy=(rand()-0.5);d2=1;}
+    const d=Math.sqrt(d2), f = Math.min(3800/d2, 5.5)*alpha;
+    dx/=d; dy/=d;
+    a.vx-=dx*f; a.vy-=dy*f; b.vx+=dx*f; b.vy+=dy*f;
+  }
+  // springs
+  for(const e of edges){
+    const a=sim[e.a], b=sim[e.b];
+    const rest = 90 + (1-Math.abs(e.r))*110;
+    let dx=b.x-a.x, dy=b.y-a.y;
+    const d=Math.max(1,Math.hypot(dx,dy)), f=(d-rest)*0.012*alpha;
+    dx/=d; dy/=d;
+    a.vx+=dx*f*d*0.06; a.vy+=dy*f*d*0.06;
+    b.vx-=dx*f*d*0.06; b.vy-=dy*f*d*0.06;
+  }
+  // gravity + integrate
+  for(let i=0;i<N;i++){
+    const s=sim[i];
+    s.vx += -s.x*0.0022*alpha; s.vy += -s.y*0.0022*alpha;
+    s.vx*=0.86; s.vy*=0.86;
+    const vmax=6; s.vx=Math.max(-vmax,Math.min(vmax,s.vx)); s.vy=Math.max(-vmax,Math.min(vmax,s.vy));
+    if(s.fx!=null){ s.x=s.fx; s.y=s.fy; s.vx=0; s.vy=0; }
+    else { s.x+=s.vx; s.y+=s.vy; }
+  }
+  // collision resolution — labels need breathing room, so pad the radii
+  for(let pass=0;pass<2;pass++)
+  for(let i=0;i<N;i++) for(let j=i+1;j<N;j++){
+    const a=sim[i], b=sim[j];
+    const min=a.r+b.r+36;
+    let dx=b.x-a.x, dy=b.y-a.y, d=Math.hypot(dx,dy);
+    if(d>=min) continue;
+    if(d<0.01){ dx=rand()-0.5; dy=rand()-0.5; d=Math.hypot(dx,dy); }
+    const push=(min-d)/d*0.5;
+    if(a.fx==null){ a.x-=dx*push; a.y-=dy*push; }
+    if(b.fx==null){ b.x+=dx*push; b.y+=dy*push; }
+  }
+}
+
+/* ============================================================================
+   SVG NETWORK RENDER
+   ========================================================================== */
+const svg = document.getElementById("stage");
+const svgNS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent){ const e=document.createElementNS(svgNS,tag);
+  for(const k in attrs) e.setAttribute(k,attrs[k]); if(parent)parent.appendChild(e); return e; }
+
+const defs = el("defs",{},svg);
+const glow = el("filter",{id:"glow",x:"-80%",y:"-80%",width:"260%",height:"260%"},defs);
+el("feGaussianBlur",{stdDeviation:"3.2",result:"b"},glow);
+const fm = el("feMerge",{},glow); el("feMergeNode",{in:"b"},fm); el("feMergeNode",{in:"SourceGraphic"},fm);
+
+const world   = el("g",{},svg);
+const edgesG  = el("g",{},world);
+const ripG    = el("g",{},world);
+const nodesG  = el("g",{},world);
+
+let view = { x:0, y:0, k:1 };
+function applyView(){
+  const W=svg.clientWidth,H=svg.clientHeight;
+  world.setAttribute("transform",`translate(${W/2+view.x},${H/2+view.y}) scale(${view.k})`);
+}
+
+/* Rebuilds the SVG <line> elements from the current `edges` global. Called at
+   boot and again after a live-correlation sync — replaceChildren() drops the
+   old <line> nodes in one shot so re-syncing never leaks orphaned elements. */
+let edgeEls = [];
+function rebuildEdgeEls(){
+  edgesG.replaceChildren();
+  edgeEls = edges.map(e=>{
+    const l = el("line",{class:"edge"},edgesG);
+    const w = 0.7 + Math.abs(e.r)*2.2, o = 0.35 + Math.abs(e.r)*0.3;
+    // curated supply/rate/fuel-chain edges carry the narrative — keep them
+    // bold; auto-densified statistical edges recede so the graph reads as
+    // "story + light correlation fill" instead of a uniform hairball.
+    l.style.strokeWidth = (e.link? w : w*0.55)+"px";
+    l.style.strokeOpacity = e.link? o : o*0.35;
+    return l;
+  });
+}
+rebuildEdgeEls();
+
+const DASH = {1:"none", 2:"7,4", 3:"2,4", 4:"1.2,3.5", 5:"0.7,4"};
+const nodeEls = nodes.map((n,i)=>{
+  const s = sim[i];
+  const g = el("g",{class:"node"},nodesG);
+  const hex = SECTOR_BY_ID[n.sector].hex;
+  el("circle",{class:"halo", r:s.r+5, "stroke-width":2.5},g);
+  let body;
+  if(n.sector==="macro"){
+    const r=s.r*0.95;
+    body = el("path",{class:"body", d:`M 0 ${-r} L ${r} 0 L 0 ${r} L ${-r} 0 Z`, fill:hex},g);
+  } else {
+    body = el("circle",{class:"body", r:s.r, fill:hex},g);
+  }
+  body.style.stroke="rgba(0,0,0,0.35)"; body.style.strokeWidth="1";
+  const label = el("text",{y:-(s.r+6)},g); label.textContent=n.tk;
+  const chip  = el("text",{class:"impact-chip", y:s.r+13, opacity:0},g);
+  return { g, body, label, chip, halo:g.firstChild };
+});
+
+function renderFrame(){
+  tick();
+  for(let ei=0;ei<edges.length;ei++){
+    const e=edges[ei], a=sim[e.a], b=sim[e.b], L=edgeEls[ei];
+    L.setAttribute("x1",a.x);L.setAttribute("y1",a.y);L.setAttribute("x2",b.x);L.setAttribute("y2",b.y);
+  }
+  for(let i=0;i<N;i++) nodeEls[i].g.setAttribute("transform",`translate(${sim[i].x},${sim[i].y})`);
+  requestAnimationFrame(renderFrame);
+}
+
+/* ---------- pan / zoom / drag ---------- */
+let dragNode=-1, panning=false, px0=0, py0=0, moved=false;
+function toWorld(evt){
+  const W=svg.clientWidth,H=svg.clientHeight, r=svg.getBoundingClientRect();
+  return { x:(evt.clientX-r.left-W/2-view.x)/view.k, y:(evt.clientY-r.top-H/2-view.y)/view.k };
+}
+svg.addEventListener("pointerdown",evt=>{
+  moved=false;
+  const t = evt.target.closest? evt.target.closest("g.node") : null;
+  if(t){ dragNode = [...nodesG.children].indexOf(t);
+    const w=toWorld(evt); sim[dragNode].fx=w.x; sim[dragNode].fy=w.y; alpha=Math.max(alpha,0.25);
+  } else { panning=true; svg.classList.add("panning"); px0=evt.clientX-view.x; py0=evt.clientY-view.y; }
+  svg.setPointerCapture(evt.pointerId);
+});
+svg.addEventListener("pointermove",evt=>{
+  if(dragNode>=0){ moved=true; const w=toWorld(evt); sim[dragNode].fx=w.x; sim[dragNode].fy=w.y; alpha=Math.max(alpha,0.2); }
+  else if(panning){ moved=true; view.x=evt.clientX-px0; view.y=evt.clientY-py0; applyView(); }
+});
+svg.addEventListener("pointerup",evt=>{
+  if(dragNode>=0){ const i=dragNode; dragNode=-1;
+    sim[i].fx=null; sim[i].fy=null;
+    if(!moved) selectNode(i);
+  }
+  panning=false; svg.classList.remove("panning");
+});
+svg.addEventListener("wheel",evt=>{
+  evt.preventDefault();
+  const k0=view.k, k1=Math.max(0.3,Math.min(3.2, k0*(evt.deltaY<0?1.12:0.89)));
+  const W=svg.clientWidth,H=svg.clientHeight,r=svg.getBoundingClientRect();
+  const mx=evt.clientX-r.left-W/2, my=evt.clientY-r.top-H/2;
+  view.x = mx-(mx-view.x)*(k1/k0); view.y = my-(my-view.y)*(k1/k0); view.k=k1;
+  applyView();
+},{passive:false});
+
+/* ---------- tooltip ---------- */
+const tip=document.getElementById("tip");
+function tipRow(lbl,val,color){
+  const r=document.createElement("div"); r.className="t-row";
+  const l=document.createElement("span"); l.className="lbl"; l.textContent=lbl;
+  const v=document.createElement("span"); v.className="val num"; v.textContent=val;
+  if(color) v.style.color=color;
+  r.append(l,v); return r;
+}
+function showTip(evt, build){
+  tip._b = build;
+  tip.replaceChildren(); build(tip);
+  tip.style.display="block";
+  const pad=14, w=tip.offsetWidth, h=tip.offsetHeight;
+  let x=evt.clientX+pad, y=evt.clientY+pad;
+  if(x+w>innerWidth-8) x=evt.clientX-w-pad;
+  if(y+h>innerHeight-8) y=evt.clientY-h-pad;
+  tip.style.left=x+"px"; tip.style.top=y+"px";
+}
+function hideTip(){ tip.style.display="none"; }
+
+const fmtPct=(v,signed=true)=>(signed&&v>0?"+":"")+(v*100).toFixed(2)+"%";
+const fmtPx=(n,i)=> n.tk==="US10Y" ? lastPxAt(i).toFixed(2)+"%" :
+  lastPxAt(i).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
+const livePx = nodes.map(n=>prices[n.i][DAYS]); // mutated in place by live quote sync
+function lastPxAt(i){ return livePx[i]; }
+
+nodes.forEach((n,i)=>{
+  const g=nodeEls[i].g;
+  g.addEventListener("pointerenter",evt=>{
+    g.classList.add("hit"); nodeEls[i].halo.style.stroke=SECTOR_BY_ID[n.sector].hex;
+    showTip(evt,tp=>{
+      const head=document.createElement("div"); head.className="t-head";
+      const key=document.createElement("span"); key.className="t-key"; key.style.background=SECTOR_BY_ID[n.sector].hex;
+      const ti=document.createElement("span"); ti.className="t-title"; ti.textContent=n.tk;
+      head.append(key,ti); tp.append(head);
+      const sub=document.createElement("div"); sub.className="t-sub";
+      sub.textContent=n.name+" · "+SECTOR_BY_ID[n.sector].label; tp.append(sub);
+      tp.append(tipRow("Last", fmtPx(n,i)));
+      tp.append(tipRow("Day", fmtPct(dayChg[i]), dayChg[i]>=0?"var(--up)":"var(--down)"));
+      tp.append(tipRow("Vol (30d ann.)", (vol30[i]*100).toFixed(1)+"%"));
+      if(cascade && cascade.impact[i]!=null && i!==cascade.src && cascade.order[i]<=maxDepth){
+        const ORD={1:"1st",2:"2nd",3:"3rd",4:"4th",5:"5th"};
+        tp.append(tipRow("Cascade impact", fmtPct(cascade.impact[i]), cascade.impact[i]>=0?"var(--up)":"var(--down)"));
+        tp.append(tipRow("Order", (ORD[cascade.order[i]]||cascade.order[i])+" · "+cascade.order[i]+" hop"+(cascade.order[i]===1?"":"s")));
+        tp.append(tipRow("Reinforcing routes", String(cascade.reinforce[i]||1)));
+      }
+      tp.append(tipRow("Links", String(ADJ[i].length)));
+    });
+  });
+  g.addEventListener("pointermove",evt=>{ if(tip.style.display==="block" && tip._b) showTip(evt, tip._b); });
+  g.addEventListener("pointerleave",()=>{ g.classList.remove("hit"); hideTip(); });
+});
+
+/* ============================================================================
+   CASCADE PROPAGATION — signed best-path product with per-hop damping
+   ========================================================================== */
+let selected = -1;
+let cascade  = null;      // { src, impact[], order[], via[], usedEdges:Set }
+let shockPct = -5;
+let maxDepth = 3;
+const DAMP = 0.82;
+const MIN_EDGE = 0.28;
+
+function computeCascade(src){
+  const impact = new Array(N).fill(null);
+  const order  = new Array(N).fill(Infinity);
+  const via    = new Array(N).fill(null);   // parent node for path readout
+  const usedEdges = new Set();
+  const shock = shockPct/100;
+  impact[src]=shock; order[src]=0;
+  // Dijkstra-style: maximize |impact|; hop count capped at maxDepth
+  const best = new Array(N).fill(0); best[src]=Math.abs(shock);
+  const pq=[[src,Math.abs(shock),0]];
+  while(pq.length){
+    pq.sort((a,b)=>b[1]-a[1]);
+    const [u,mag,d]=pq.shift();
+    if(mag<best[u]-1e-12 || d>=maxDepth) continue;
+    for(const {to,r,ei} of ADJ[u]){
+      if(Math.abs(r)<MIN_EDGE && !edges[ei].link) continue; // curated links always transmit
+      const nm = mag*Math.abs(r)*DAMP;
+      if(nm>best[to]+1e-9 && to!==src){
+        best[to]=nm;
+        impact[to]=impact[u]*r*DAMP;
+        order[to]=d+1; via[to]=u;
+        pq.push([to,nm,d+1]);
+      }
+    }
+  }
+  // mark edges actually on winning paths
+  for(let v=0;v<N;v++){
+    if(via[v]==null) continue;
+    let cur=v;
+    while(via[cur]!=null){
+      const k=edgeKey(nodes[cur].tk,nodes[via[cur]].tk);
+      const e=edgeMap.get(k); if(e) usedEdges.add(edges.indexOf(e));
+      cur=via[cur];
+    }
+  }
+  // conviction: how many shallower neighbours transmit a same-signed shock into v
+  // (multiple independent reinforcing routes = higher-confidence read)
+  const reinforce = new Array(N).fill(0);
+  for(let v=0;v<N;v++){
+    if(impact[v]==null || v===src) continue;
+    const sgn = Math.sign(impact[v]);
+    for(const {to,r} of ADJ[v]){
+      if(impact[to]==null || Math.abs(r)<MIN_EDGE) continue;
+      if(order[to] < order[v] && Math.sign(impact[to]*r)===sgn) reinforce[v]++;
+    }
+  }
+  return { src, impact, order, via, usedEdges, reinforce };
+}
+
+function impactColor(v){ return v>=0 ? "var(--up)" : "var(--down)"; }
+
+function applyCascadeVisual(){
+  document.getElementById("order-key").classList.toggle("show", !!cascade);
+  for(let i=0;i<N;i++){
+    const ne=nodeEls[i];
+    if(!cascade){ ne.g.classList.remove("dim","sel"); ne.halo.style.opacity=0; ne.halo.removeAttribute("stroke-dasharray");
+      ne.chip.setAttribute("opacity",0); ne.body.removeAttribute("filter"); continue; }
+    const o=cascade.order[i];
+    const inC = o<=maxDepth && cascade.impact[i]!=null;
+    ne.g.classList.toggle("dim", !inC);
+    ne.g.classList.toggle("sel", i===cascade.src);
+    if(i===cascade.src){
+      ne.halo.style.opacity=1; ne.halo.style.stroke="var(--accent)"; ne.halo.removeAttribute("stroke-dasharray");
+      ne.body.setAttribute("filter","url(#glow)");
+      ne.chip.setAttribute("opacity",1); ne.chip.textContent=fmtPct(cascade.impact[i]);
+      ne.chip.style.fill = impactColor(cascade.impact[i]);
+    } else if(inC){
+      const col = cascade.impact[i]>=0 ? "#0ca30c" : "#e66767";
+      ne.halo.style.opacity=1; ne.halo.style.stroke=col;
+      ne.halo.style.transitionDelay = (o*0.35)+"s";
+      if(DASH[o] && DASH[o]!=="none") ne.halo.setAttribute("stroke-dasharray",DASH[o]);
+      else ne.halo.removeAttribute("stroke-dasharray");
+      ne.body.removeAttribute("filter");
+      ne.chip.setAttribute("opacity",1); ne.chip.textContent=fmtPct(cascade.impact[i]);
+      ne.chip.style.fill=col;
+    } else {
+      ne.halo.style.opacity=0; ne.chip.setAttribute("opacity",0); ne.body.removeAttribute("filter");
+    }
+  }
+  edges.forEach((e,ei)=>{
+    const L=edgeEls[ei];
+    if(!cascade){ L.classList.remove("dim","flow"); L.style.stroke=""; return; }
+    if(cascade.usedEdges.has(ei)){
+      L.classList.remove("dim"); L.classList.add("flow");
+      const child = (cascade.via[e.a]===e.b)? e.a : e.b;
+      L.style.stroke = cascade.impact[child]>=0 ? "#0ca30c" : "#e66767";
+      L.style.strokeOpacity = 0.9;
+    } else { L.classList.add("dim"); L.classList.remove("flow"); }
+  });
+}
+
+function fireRipples(src){
+  ripG.replaceChildren();
+  const s=sim[src];
+  for(let k=0;k<3;k++){
+    const dur=1.1+k*0.35;
+    setTimeout(()=>{
+      const c=el("circle",{class:"ripple", cx:sim[src].x, cy:sim[src].y, r:sim[src].r,"stroke-width":2},ripG);
+      const anim=el("animate",{attributeName:"r", from:sim[src].r, to:170+k*60, dur:dur+"s", begin:"indefinite", fill:"freeze"},c);
+      c.style.animation=`rippleAnim ${dur}s forwards`;
+      anim.beginElement();
+    }, k*300);
+  }
+  setTimeout(()=>ripG.replaceChildren(), 2600);
+}
+
+function selectNode(i){
+  selected=i;
+  cascade = computeCascade(i);
+  applyCascadeVisual();
+  fireRipples(i);
+  renderList();
+  renderOverview();
+  renderCascadePanel();
+  drawMatrix();
+}
+function clearSelection(){
+  selected=-1; cascade=null;
+  applyCascadeVisual(); renderList(); renderOverview(); renderCascadePanel(); drawMatrix();
+}
+
+/* ============================================================================
+   LEFT PANEL — universe list, search, sector filter
+   ========================================================================== */
+const activeSectors = new Set(SECTORS.map(s=>s.id));
+let query="";
+
+const chipsBox=document.getElementById("chips");
+SECTORS.forEach(s=>{
+  const c=document.createElement("button"); c.className="chip"; c.type="button";
+  const d=document.createElement("span"); d.className="dot"+(s.id==="macro"?" macro":""); d.style.background=s.hex;
+  c.append(d, document.createTextNode(s.label));
+  c.addEventListener("click",()=>{
+    if(activeSectors.has(s.id)&&activeSectors.size===1){ SECTORS.forEach(x=>activeSectors.add(x.id)); }
+    else if(activeSectors.has(s.id)) activeSectors.delete(s.id);
+    else activeSectors.add(s.id);
+    c.parentElement.querySelectorAll(".chip").forEach((el,k)=>el.classList.toggle("off",!activeSectors.has(SECTORS[k].id)));
+    renderList(); applyFilterVisual();
+  });
+  chipsBox.append(c);
+});
+function applyFilterVisual(){
+  nodes.forEach((n,i)=>{ nodeEls[i].g.style.display = activeSectors.has(n.sector)? "" : "none"; });
+  edges.forEach((e,ei)=>{ edgeEls[ei].style.display =
+    (activeSectors.has(nodes[e.a].sector)&&activeSectors.has(nodes[e.b].sector))? "" : "none"; });
+}
+
+document.getElementById("search").addEventListener("input",e=>{ query=e.target.value.trim().toLowerCase(); renderList(); });
+
+const listBox=document.getElementById("companies");
+function renderList(){
+  listBox.replaceChildren();
+  for(const n of nodes){
+    if(!activeSectors.has(n.sector)) continue;
+    if(query && !(n.tk.toLowerCase().includes(query)||n.name.toLowerCase().includes(query))) continue;
+    const row=document.createElement("div"); row.className="co-row"+(n.i===selected?" sel":"");
+    const d=document.createElement("span"); d.className="dot"+(n.sector==="macro"?" macro":"");
+    d.style.background=SECTOR_BY_ID[n.sector].hex;
+    const tk=document.createElement("span"); tk.className="tk"; tk.textContent=n.tk;
+    const nm=document.createElement("span"); nm.className="nm"; nm.textContent=n.name;
+    const ch=document.createElement("span"); ch.className="chg num"; ch.textContent=fmtPct(dayChg[n.i]);
+    ch.style.color = dayChg[n.i]>=0?"var(--up)":"var(--down)";
+    row.append(d,tk,nm,ch);
+    row.addEventListener("click",()=>selectNode(n.i));
+    listBox.append(row);
+  }
+}
+
+/* legend */
+const legend=document.getElementById("legend");
+SECTORS.forEach(s=>{
+  const li=document.createElement("div"); li.className="li";
+  const sw=document.createElement("span"); sw.className="sw"+(s.id==="macro"?" macro":""); sw.style.background=s.hex;
+  li.append(sw,document.createTextNode(s.label)); legend.append(li);
+});
+
+/* ============================================================================
+   RIGHT PANEL — overview / cascade / matrix
+   ========================================================================== */
+const tabs=document.querySelectorAll(".tabs button");
+tabs.forEach(b=>b.addEventListener("click",()=>{
+  tabs.forEach(x=>x.classList.toggle("on",x===b));
+  document.querySelectorAll(".tab-page").forEach(p=>p.classList.remove("on"));
+  document.getElementById("tab-"+b.dataset.tab).classList.add("on");
+  if(b.dataset.tab==="matrix") drawMatrix();
+  if(b.dataset.tab==="flow" && !flowLoaded && !flowLoading) fetchFlow();
+}));
+
+/* ----- overview ----- */
+function renderOverview(){
+  const box=document.getElementById("tab-overview");
+  box.replaceChildren();
+  if(selected<0){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="Select an instrument in the network or the universe list to load its overview, price history and correlation profile.";
+    box.append(e); return;
+  }
+  const n=nodes[selected], i=selected, hex=SECTOR_BY_ID[n.sector].hex;
+
+  const card=document.createElement("div"); card.className="co-card";
+  const tl=document.createElement("div"); tl.className="tk-line";
+  const tk=document.createElement("span"); tk.className="tk"; tk.textContent=n.tk; tk.style.color=hex;
+  const st=document.createElement("span"); st.className="sect"; st.textContent=SECTOR_BY_ID[n.sector].label;
+  tl.append(tk,st);
+  const nm=document.createElement("div"); nm.className="nm"; nm.textContent=n.name;
+  const hero=document.createElement("div"); hero.className="hero";
+  const px=document.createElement("span"); px.className="px num"; px.textContent=fmtPx(n,i);
+  const ch=document.createElement("span"); ch.className="chg num "+(dayChg[i]>=0?"u":"d");
+  ch.textContent=(dayChg[i]>=0?"▲ ":"▼ ")+fmtPct(dayChg[i],false).replace("-","");
+  hero.append(px,ch);
+  card.append(tl,nm,hero);
+  box.append(card);
+
+  const sg=document.createElement("div"); sg.className="stat-grid";
+  const stats=[
+    ["30d Vol (ann.)",(vol30[i]*100).toFixed(1)+"%"],
+    ["β vs SPX",(CORR[i][IDX.SPX]*sd[i]/sd[IDX.SPX]).toFixed(2)],
+    ["Links",String(ADJ[i].length)],
+  ];
+  for(const [k,v] of stats){
+    const s=document.createElement("div"); s.className="stat";
+    const kk=document.createElement("div"); kk.className="k"; kk.textContent=k;
+    const vv=document.createElement("div"); vv.className="v num"; vv.textContent=v;
+    s.append(kk,vv); sg.append(s);
+  }
+  box.append(sg);
+
+  // price chart card (indexed vs SPX, 120d)
+  const cc=document.createElement("div"); cc.className="chart-card";
+  const h=document.createElement("h3"); h.textContent="Price · 120d · indexed = 100";
+  const lg=document.createElement("div"); lg.className="chart-legend";
+  for(const [lbl,col] of [[n.tk,hex],["SPX","#898781"]]){
+    const li=document.createElement("div"); li.className="li";
+    const key=document.createElement("span"); key.className="key"; key.style.background=col;
+    li.append(key,document.createTextNode(lbl)); lg.append(li);
+  }
+  cc.append(h,lg);
+  cc.append(buildPriceChart(i));
+  box.append(cc);
+  if(liveOK) maybeLiveChart(i, cc);   // upgrade the sparkline to real 6mo history
+
+  // top correlations
+  const cl=document.createElement("div"); cl.className="chart-card corr-list";
+  const h2=document.createElement("h3"); h2.textContent="Strongest correlations";
+  cl.append(h2);
+  const pairs=[];
+  for(let j=0;j<N;j++) if(j!==i) pairs.push([j,CORR[i][j]]);
+  pairs.sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]));
+  for(const [j,r] of pairs.slice(0,8)){
+    const row=document.createElement("div"); row.className="row";
+    const t=document.createElement("span"); t.className="tk"; t.textContent=nodes[j].tk;
+    const bw=document.createElement("div"); bw.className="bar-wrap";
+    const b=document.createElement("div"); b.className="bar";
+    const half=50;
+    if(r>=0){ b.style.left=half+"%"; b.style.width=(Math.abs(r)*half)+"%"; b.style.background="var(--div-pos)"; }
+    else { b.style.right=half+"%"; b.style.width=(Math.abs(r)*half)+"%"; b.style.background="var(--div-neg)"; }
+    bw.append(b);
+    const rv=document.createElement("span"); rv.className="rv num"; rv.textContent=(r>0?"+":"")+r.toFixed(2);
+    rv.style.color = r>=0? "var(--div-pos)":"var(--div-neg)";
+    row.append(t,bw,rv);
+    row.addEventListener("click",()=>selectNode(j));
+    cl.append(row);
+  }
+  box.append(cl);
+}
+
+/* price chart with crosshair tooltip (per interaction spec).
+   Core consumes indexed(=100) series so the model history AND the live Yahoo
+   history share one drawing + crosshair path. times[] optional → date labels. */
+function buildPriceChartCore(A, B, hex, tkName, times){
+  const W=336,H=150,P={l:6,r:40,t:6,b:16}, days=A.length-1;
+  const wrap=document.createElement("div"); wrap.style.position="relative";
+  const s=document.createElementNS(svgNS,"svg");
+  s.setAttribute("viewBox",`0 0 ${W} ${H}`); s.id="pxchart"; wrap.append(s);
+
+  const vals = B? A.concat(B) : A;
+  const lo=Math.min(...vals)*0.995, hi=Math.max(...vals)*1.005;
+  const X=t=> P.l+(t/days)*(W-P.l-P.r);
+  const Y=v=> P.t+(1-(v-lo)/(hi-lo))*(H-P.t-P.b);
+
+  for(let g=0;g<4;g++){
+    const v=lo+(g/3)*(hi-lo), y=Y(v);
+    el("line",{x1:P.l,x2:W-P.r,y1:y,y2:y,stroke:"var(--grid)","stroke-width":1},s);
+    const t=el("text",{x:W-P.r+5,y:y+3,fill:"var(--ink-muted)","font-size":9,"font-family":"var(--font)"},s);
+    t.classList.add("num"); t.textContent=v.toFixed(0);
+  }
+  const path=(arr)=>arr.map((v,t)=>(t?"L":"M")+X(t).toFixed(1)+" "+Y(v).toFixed(1)).join(" ");
+  el("path",{d:path(A)+`L ${X(days)} ${H-P.b} L ${X(0)} ${H-P.b} Z`, fill:hex, opacity:0.08},s);
+  if(B) el("path",{d:path(B), fill:"none", stroke:"#898781","stroke-width":1.4, opacity:0.85},s);
+  el("path",{d:path(A), fill:"none", stroke:hex,"stroke-width":2},s);
+
+  const cross=el("line",{y1:P.t,y2:H-P.b,stroke:"var(--ink-muted)","stroke-width":1,"stroke-dasharray":"3,3",opacity:0},s);
+  const dotA=el("circle",{r:3,fill:hex,opacity:0},s);
+  const dotB=B? el("circle",{r:3,fill:"#898781",opacity:0},s) : null;
+  const hit=el("rect",{x:P.l,y:0,width:W-P.l-P.r,height:H,fill:"transparent"},s);
+  hit.style.cursor="crosshair";
+  hit.addEventListener("pointermove",evt=>{
+    const r=s.getBoundingClientRect(), sx=W/r.width;
+    const t=Math.max(0,Math.min(days,Math.round(((evt.clientX-r.left)*sx-P.l)/(W-P.l-P.r)*days)));
+    const x=X(t);
+    cross.setAttribute("x1",x);cross.setAttribute("x2",x);cross.setAttribute("opacity",1);
+    dotA.setAttribute("cx",x);dotA.setAttribute("cy",Y(A[t]));dotA.setAttribute("opacity",1);
+    if(dotB){ dotB.setAttribute("cx",x);dotB.setAttribute("cy",Y(B[t]));dotB.setAttribute("opacity",1); }
+    showTip(evt,tp=>{
+      const sub=document.createElement("div"); sub.className="t-sub";
+      sub.textContent = times ? new Date(times[t]*1000).toLocaleDateString("en-US",{month:"short",day:"numeric"}) : "T−"+(days-t)+"d";
+      tp.append(sub);
+      const mk=(lbl,val,col)=>{ const row=tipRow(lbl,val);
+        const key=document.createElement("span"); key.style.cssText=`display:inline-block;width:10px;height:2px;border-radius:1px;background:${col};margin-right:6px;vertical-align:middle`;
+        row.querySelector(".lbl").prepend(key); return row; };
+      tp.append(mk(tkName, A[t].toFixed(1), hex));
+      if(B) tp.append(mk("SPX", B[t].toFixed(1), "#898781"));
+    });
+  });
+  hit.addEventListener("pointerleave",()=>{ cross.setAttribute("opacity",0);dotA.setAttribute("opacity",0);if(dotB)dotB.setAttribute("opacity",0); hideTip(); });
+  return wrap;
+}
+function buildPriceChart(i){
+  const days=120;
+  const a0=prices[i][DAYS-days], b0=prices[IDX.SPX][DAYS-days];
+  const A=[],B=[];
+  for(let t=0;t<=days;t++){ A.push(prices[i][DAYS-days+t]/a0*100); B.push(prices[IDX.SPX][DAYS-days+t]/b0*100); }
+  return buildPriceChartCore(A,B,SECTOR_BY_ID[nodes[i].sector].hex, nodes[i].tk, null);
+}
+
+/* ----- cascade panel ----- */
+function renderCascadePanel(){
+  const box=document.getElementById("tab-cascade");
+  box.replaceChildren();
+  if(!cascade){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="Click any node to shock it and trace up to 5 orders of effect through the correlation network — direct hits, then the second-, third-, fourth- and fifth-order ripples. Adjust magnitude with the SHOCK slider and depth with the 1st–5th control.";
+    box.append(e); return;
+  }
+  const n=nodes[cascade.src];
+  const head=document.createElement("div"); head.className="cascade-head";
+  const big=document.createElement("div"); big.className="big";
+  big.textContent=`Shock: ${n.tk} ${fmtPct(shockPct/100)}`;
+  const sub=document.createElement("div"); sub.className="sub";
+  sub.textContent="Signed correlation paths · damping 0.82/hop · min |r| 0.28 · curated supply links always transmit";
+  head.append(big,sub); box.append(head);
+
+  // ---- affected set + headline metrics ----
+  const affected=[];
+  for(let v=0;v<N;v++) if(v!==cascade.src && cascade.impact[v]!=null && cascade.order[v]<=maxDepth) affected.push(v);
+  let wsum=0,wtot=0,maxOrd=0,topP=null,topN=null,highConv=0;
+  for(const v of affected){
+    wsum+=nodes[v].size*cascade.impact[v]; wtot+=nodes[v].size;
+    maxOrd=Math.max(maxOrd,cascade.order[v]);
+    if(cascade.impact[v]>0 && (topP===null||cascade.impact[v]>cascade.impact[topP])) topP=v;
+    if(cascade.impact[v]<0 && (topN===null||cascade.impact[v]<cascade.impact[topN])) topN=v;
+    if(cascade.reinforce[v]>=2) highConv++;
+  }
+  const net = wtot? wsum/wtot : 0;
+  const upN = affected.filter(v=>cascade.impact[v]>0).length;
+  const dnN = affected.filter(v=>cascade.impact[v]<0).length;
+
+  const sm=document.createElement("div"); sm.className="cas-summary";
+  const tile=(k,v,color,small)=>{
+    const t=document.createElement("div"); t.className="cas-tile";
+    const kk=document.createElement("div"); kk.className="k"; kk.textContent=k;
+    const vv=document.createElement("div"); vv.className="v num"; vv.textContent=v; if(color) vv.style.color=color;
+    if(small){ const s=document.createElement("small"); s.textContent=" "+small; vv.append(s); }
+    t.append(kk,vv); return t;
+  };
+  sm.append(
+    tile("Net market impact", fmtPct(net), net>=0?"var(--up)":"var(--down)", "cap-wtd"),
+    tile("Breadth", affected.length+" / "+(N-1), null, "names"),
+    tile("High-conviction", String(highConv), highConv>0?"var(--accent)":null, "≥2 routes"),
+    tile("Deepest reach", maxOrd?(maxOrd+" order"):"—", null, maxOrd?(maxOrd-1)+"-hop":"")
+  );
+  box.append(sm);
+
+  // ---- plain-English read ----
+  const read=document.createElement("div"); read.className="cas-read";
+  const strong=(txt,cls)=>{ const b=document.createElement(cls?"span":"b"); if(cls)b.className=cls; b.textContent=txt; return b; };
+  read.append(strong("A "+fmtPct(shockPct/100)+" move in "+n.tk),
+    document.createTextNode(" propagates to "+affected.length+" instruments. It "));
+  if(upN){ read.append(strong("lifts "+upN+(dnN?"":" of them"),"up"));
+    if(topP!=null) read.append(document.createTextNode(" (led by "), strong(nodes[topP].tk+" "+fmtPct(cascade.impact[topP])), document.createTextNode(")")); }
+  if(upN&&dnN) read.append(document.createTextNode(" and "));
+  if(dnN){ read.append(strong("pressures "+dnN,"dn"));
+    if(topN!=null) read.append(document.createTextNode(" (led by "), strong(nodes[topN].tk+" "+fmtPct(cascade.impact[topN])), document.createTextNode(")")); }
+  read.append(document.createTextNode("."));
+  if(highConv) read.append(document.createTextNode(" "), strong(highConv+" name"+(highConv===1?"":"s")),
+    document.createTextNode(" are reached through 2+ reinforcing routes — treat those as the higher-conviction reads, not the single-thread ones."));
+  box.append(read);
+
+  const names={1:"1st order — direct",2:"2nd order — one hop",3:"3rd order — two hops",
+               4:"4th order — three hops",5:"5th order — four hops"};
+  let maxAbs=0.0001;
+  for(const v of affected) maxAbs=Math.max(maxAbs,Math.abs(cascade.impact[v]));
+
+  for(let o=1;o<=maxDepth;o++){
+    const rows=[];
+    for(let v=0;v<N;v++) if(cascade.order[v]===o) rows.push(v);
+    rows.sort((a,b)=>Math.abs(cascade.impact[b])-Math.abs(cascade.impact[a]));
+    const blk=document.createElement("div"); blk.className="order-block";
+    const h=document.createElement("h4");
+    h.append(document.createTextNode(names[o]));
+    const cnt=document.createElement("span"); cnt.className="n"; cnt.textContent=rows.length+" affected";
+    h.append(cnt); blk.append(h);
+    if(!rows.length){
+      const e=document.createElement("div"); e.className="empty-note"; e.style.padding="6px 0";
+      e.textContent="No effects at this depth."; blk.append(e); box.append(blk); continue;
+    }
+    const tbl=document.createElement("table"); tbl.className="cas";
+    const thead=document.createElement("tr");
+    for(const t of ["Instrument","Transmission path","Est. impact"]){
+      const th=document.createElement("th"); th.textContent=t; thead.append(th);
+    }
+    tbl.append(thead);
+    for(const v of rows){
+      const tr=document.createElement("tr"); tr.className="body";
+      const td1=document.createElement("td");
+      const tk=document.createElement("span"); tk.className="tk"; tk.textContent=nodes[v].tk;
+      tk.style.color=SECTOR_BY_ID[nodes[v].sector].hex;
+      td1.append(tk);
+      if(cascade.reinforce[v]>=2){
+        const cv=document.createElement("span"); cv.className="conv";
+        cv.title=cascade.reinforce[v]+" reinforcing routes";
+        for(let d=0;d<Math.min(3,cascade.reinforce[v]);d++) cv.append(document.createElement("i"));
+        td1.append(cv);
+      }
+      const td2=document.createElement("td"); td2.className="path";
+      const parts=[]; let cur=v;
+      while(cur!=null&&cur!==cascade.src){ parts.unshift(nodes[cur].tk); cur=cascade.via[cur]; }
+      parts.unshift(n.tk);
+      td2.textContent=parts.join(" → ");
+      const td3=document.createElement("td");
+      const iv=document.createElement("span"); iv.className="imp num "+(cascade.impact[v]>=0?"u":"d");
+      iv.textContent=fmtPct(cascade.impact[v]);
+      const bw=document.createElement("div"); bw.className="ibar-wrap";
+      const b=document.createElement("div"); b.className="ibar";
+      b.style.width=(Math.abs(cascade.impact[v])/maxAbs*100)+"%";
+      b.style.right="0"; b.style.background=cascade.impact[v]>=0?"var(--up)":"var(--down)";
+      bw.append(b); td3.append(iv,bw);
+      tr.append(td1,td2,td3);
+      tr.addEventListener("click",()=>selectNode(v));
+      tbl.append(tr);
+    }
+    blk.append(tbl); box.append(blk);
+  }
+}
+
+/* ----- correlation matrix ----- */
+const mxCanvas=document.getElementById("matrix");
+const mxOrder=[]; // node indices grouped by sector
+for(const s of SECTORS) for(const n of nodes) if(n.sector===s.id) mxOrder.push(n.i);
+function divColor(r){
+  // blue (+) / red (−) through neutral midpoint, on dark surface
+  const mid=[0x38,0x38,0x35], pos=[0x39,0x87,0xe5], neg=[0xe6,0x67,0x67];
+  const t=Math.min(1,Math.abs(r)), c= r>=0? pos:neg;
+  const mix=(a,b)=>Math.round(a+(b-a)*t);
+  return `rgb(${mix(mid[0],c[0])},${mix(mid[1],c[1])},${mix(mid[2],c[2])})`;
+}
+function drawMatrix(){
+  const wrap=document.getElementById("matrix-wrap");
+  const size=wrap.clientWidth||344;
+  const dpr=window.devicePixelRatio||1;
+  mxCanvas.width=size*dpr; mxCanvas.height=size*dpr; mxCanvas.style.height=size+"px";
+  const ctx=mxCanvas.getContext("2d"); ctx.scale(dpr,dpr);
+  const strip=8, cell=(size-strip)/N;
+  ctx.fillStyle="#141413"; ctx.fillRect(0,0,size,size);
+  for(let y=0;y<N;y++){
+    const iy=mxOrder[y];
+    ctx.fillStyle=SECTOR_BY_ID[nodes[iy].sector].hex;
+    ctx.fillRect(0,strip+y*cell,strip-2,cell-0.5);
+    ctx.fillRect(strip+y*cell,0,cell-0.5,strip-2);
+    for(let x=0;x<N;x++){
+      const ix=mxOrder[x];
+      ctx.fillStyle=divColor(CORR[iy][ix]);
+      ctx.fillRect(strip+x*cell,strip+y*cell,cell-0.5,cell-0.5);
+    }
+  }
+  if(selected>=0){
+    const k=mxOrder.indexOf(selected);
+    ctx.strokeStyle="#fb8b1e"; ctx.lineWidth=1.5;
+    ctx.strokeRect(strip,strip+k*cell-0.5,size-strip-1,cell+0.5);
+  }
+}
+mxCanvas.addEventListener("pointermove",evt=>{
+  const r=mxCanvas.getBoundingClientRect(), size=r.width, strip=8, cell=(size-strip)/N;
+  const x=Math.floor((evt.clientX-r.left-strip)/cell), y=Math.floor((evt.clientY-r.top-strip)/cell);
+  if(x<0||y<0||x>=N||y>=N){ hideTip(); return; }
+  const ix=mxOrder[x], iy=mxOrder[y], rho=CORR[iy][ix];
+  showTip(evt,tp=>{
+    const ti=document.createElement("div"); ti.className="t-title";
+    ti.textContent=nodes[iy].tk+" × "+nodes[ix].tk; tp.append(ti);
+    const sub=document.createElement("div"); sub.className="t-sub";
+    sub.textContent=nodes[iy].name+" vs "+nodes[ix].name; tp.append(sub);
+    tp.append(tipRow("ρ (250d)",(rho>0?"+":"")+rho.toFixed(3), rho>=0?"var(--div-pos)":"var(--div-neg)"));
+  });
+});
+mxCanvas.addEventListener("pointerleave",hideTip);
+mxCanvas.addEventListener("click",evt=>{
+  const r=mxCanvas.getBoundingClientRect(), size=r.width, strip=8, cell=(size-strip)/N;
+  const y=Math.floor((evt.clientY-r.top-strip)/cell);
+  if(y>=0&&y<N) selectNode(mxOrder[y]);
+});
+
+/* ============================================================================
+   CONTROLS, TAPE, CLOCK, BOOT
+   ========================================================================== */
+const shockInput=document.getElementById("shock");
+const shockVal=document.getElementById("shock-val");
+shockInput.addEventListener("input",()=>{
+  shockPct=parseFloat(shockInput.value);
+  shockVal.textContent=(shockPct>0?"+":shockPct<0?"−":"")+Math.abs(shockPct).toFixed(1)+"%";
+  if(selected>=0){ cascade=computeCascade(selected); applyCascadeVisual(); renderCascadePanel(); }
+});
+document.getElementById("depth-seg").addEventListener("click",e=>{
+  const b=e.target.closest("button"); if(!b) return;
+  maxDepth=+b.dataset.d;
+  document.querySelectorAll("#depth-seg button").forEach(x=>x.classList.toggle("on",x===b));
+  if(selected>=0){ cascade=computeCascade(selected); applyCascadeVisual(); renderCascadePanel(); }
+});
+document.getElementById("btn-clear").addEventListener("click",clearSelection);
+document.getElementById("btn-reheat").addEventListener("click",()=>{ alpha=1; });
+
+/* ticker tape */
+const tape=document.getElementById("tape");
+function rebuildTape(){
+  const frag=document.createDocumentFragment();
+  const items=nodes.map(n=>{
+    const sp=document.createElement("span");
+    const b=document.createElement("b"); b.textContent=n.tk;
+    const v=document.createElement("span"); v.className="num "+(dayChg[n.i]>=0?"u":"d");
+    v.textContent=fmtPx(n,n.i)+" "+(dayChg[n.i]>=0?"▲":"▼")+Math.abs(dayChg[n.i]*100).toFixed(2)+"%";
+    sp.append(b,v); return sp;
+  });
+  for(const rep of [0,1]) for(const it of items) frag.append(it.cloneNode(true));
+  tape.replaceChildren(frag);
+}
+rebuildTape();
+
+/* clock */
+const clock=document.getElementById("clock");
+setInterval(()=>{ clock.textContent=new Date().toLocaleTimeString("en-GB")+" LOCAL"; },1000);
+clock.textContent=new Date().toLocaleTimeString("en-GB")+" LOCAL";
+
+/* footer stats */
+document.getElementById("f-nodes").textContent=N;
+document.getElementById("f-edges").textContent=edges.length;
+
+/* ============================================================================
+   LIVE DATA — Yahoo spark quotes + Yahoo history + CBOE options, via local proxy
+   (server.py). Degrades gracefully to the synthetic model when the proxy is off.
+   ========================================================================== */
+const YMAP = { SPX:"^GSPC", NDX:"^NDX", WTI:"CL=F", XAU:"GC=F", US10Y:"^TNX", DXY:"DX-Y.NYB" };
+const toY = tk => YMAP[tk] || tk;
+const fromY = {}; nodes.forEach(n=>{ fromY[toY(n.tk)] = n.i; });
+let liveMode = true, liveOK = false, liveTimer = null;
+
+const liveToggle = document.getElementById("live-toggle");
+const srcBadge   = document.getElementById("src-badge");
+function setLiveStatus(state, when){
+  liveToggle.classList.remove("live","off");
+  if(state==="live"){ liveToggle.textContent="● LIVE "+when; liveToggle.classList.add("live"); }
+  else if(state==="paused"){ liveToggle.textContent="❚❚ PAUSED"; liveToggle.classList.add("off"); }
+  else if(state==="connecting"){ liveToggle.textContent="● CONNECTING…"; }
+  else { liveToggle.textContent="○ OFFLINE · MODEL"; liveToggle.classList.add("off"); }
+}
+
+async function syncQuotes(){
+  if(!liveMode) return;
+  try{
+    const syms = nodes.map(n=>toY(n.tk));
+    const r = await fetch("/api/quotes?symbols="+encodeURIComponent(syms.join(",")));
+    const d = await r.json();
+    let hit=0;
+    for(const y in d){
+      const i = fromY[y]; if(i==null || !d[y] || d[y].price==null) continue;
+      livePx[i] = d[y].price; dayChg[i] = d[y].change; hit++;
+    }
+    if(!hit) throw new Error("no rows");
+    liveOK = true;
+    setLiveStatus("live", new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"}));
+    srcBadge.textContent = "YAHOO · CBOE · DELAYED";
+    renderList(); rebuildTape();
+    if(selected>=0) renderOverview();
+  }catch(e){
+    liveOK = false; setLiveStatus("offline"); srcBadge.textContent = "MODEL CORE · offline";
+  }
+}
+function startLive(){ liveMode=true; setLiveStatus("connecting"); syncQuotes();
+  clearInterval(liveTimer); liveTimer=setInterval(syncQuotes, 30000); }
+function stopLive(){ liveMode=false; clearInterval(liveTimer); setLiveStatus("paused");
+  srcBadge.textContent="MODEL CORE · paused"; }
+liveToggle.addEventListener("click", ()=> liveMode ? stopLive() : startLive());
+document.addEventListener("visibilitychange", ()=>{
+  clearInterval(liveTimer);
+  if(!document.hidden && liveMode){ syncQuotes(); liveTimer=setInterval(syncQuotes,30000); }
+});
+
+/* ---------- live correlation sync ---------- */
+/* Rebuilds CORR/edges/ADJ from real 6mo daily history via /api/correlation.
+   One-shot on click (not polled): a full sync is ~38 sequential Yahoo calls
+   paced ~0.6s apart server-side, so it's a deliberate ~25-40s action, not
+   something to run automatically every 30s like quotes. */
+let corrSyncing = false, corrTimer = null;
+const corrBtn = document.getElementById("btn-sync-corr");
+const corrStatus = document.getElementById("corr-status");
+
+function setCorrStatus(state, extra){
+  corrStatus.classList.remove("live","off");
+  if(state==="syncing"){ corrStatus.textContent = "SYNCING HISTORY… "+extra+"s"; }
+  else if(state==="live"){ corrStatus.textContent = "● LIVE CORR (6mo) · "+extra; corrStatus.classList.add("live"); }
+  else if(state==="error"){ corrStatus.textContent = "SYNC FAILED · "+extra; corrStatus.classList.add("off"); }
+  else { corrStatus.textContent = "CORRELATION MODEL SYNTHETIC"; }
+}
+
+async function syncCorrelation(){
+  if(corrSyncing) return;
+  corrSyncing = true; corrBtn.disabled = true;
+  let secs = 0;
+  setCorrStatus("syncing", secs);
+  corrTimer = setInterval(()=>{ secs++; setCorrStatus("syncing", secs); }, 1000);
+  try{
+    const syms = nodes.map(n=>toY(n.tk));
+    const r = await fetch("/api/correlation?symbols="+encodeURIComponent(syms.join(",")));
+    const d = await r.json();
+    if(d._error || !d.pairs) throw new Error(d._error || "bad response");
+    const next = CORR.map(row=>Float64Array.from(row));
+    let updated=0;
+    for(const [sa,sb,r2] of d.pairs){
+      const i=fromY[sa], j=fromY[sb];
+      if(i==null || j==null) continue;
+      next[i][j]=r2; next[j][i]=r2; updated++;
+    }
+    if(!updated) throw new Error("no overlapping pairs");
+    CORR = next;
+    ({ edgeMap, edges, ADJ } = buildGraph(CORR));
+    rebuildEdgeEls();
+    document.getElementById("f-edges").textContent = edges.length;
+    document.getElementById("f-corr-mode").textContent = "LIVE (6mo)";
+    document.getElementById("matrix-title").textContent = "Cross-correlation · 6mo daily returns · LIVE";
+    if(selected>=0){ cascade=computeCascade(selected); applyCascadeVisual(); renderCascadePanel(); }
+    drawMatrix();
+    const skipped = d.missing && d.missing.length ? ` · ${d.missing.length} symbols skipped (thin history)` : "";
+    setCorrStatus("live", new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"}) + skipped);
+  }catch(e){
+    setCorrStatus("error", "using model");
+  }finally{
+    clearInterval(corrTimer); corrSyncing=false; corrBtn.disabled=false;
+  }
+}
+corrBtn.addEventListener("click", syncCorrelation);
+
+/* real 6mo history for the selected instrument's sparkline */
+const histCache = new Map();
+function getHist(y){
+  if(!histCache.has(y))
+    histCache.set(y, fetch("/api/history?symbol="+encodeURIComponent(y)+"&range=6mo").then(r=>r.json()).catch(()=>null));
+  return histCache.get(y);
+}
+async function maybeLiveChart(i, card){
+  try{
+    const [a,b] = await Promise.all([getHist(toY(nodes[i].tk)), getHist("^GSPC")]);
+    if(selected!==i || !a || !a.c || a.c.length<20) return;      // stale-selection guard
+    const ac=a.c, bc=(b && b.c && b.c.length>=20)? b.c : null;
+    const m = bc? Math.min(ac.length,bc.length) : ac.length;
+    const idx = arr => { const base=arr[0]; return arr.map(v=>v/base*100); };
+    const As = ac.slice(ac.length-m), Bs = bc? bc.slice(bc.length-m) : null;
+    const times = (a.t||[]).slice((a.t||[]).length-m);
+    const chart = buildPriceChartCore(idx(As), Bs?idx(Bs):null,
+      SECTOR_BY_ID[nodes[i].sector].hex, nodes[i].tk, times.length===m?times:null);
+    const old = card.querySelector("#pxchart");
+    if(old && old.parentElement) old.parentElement.replaceWith(chart);
+    const h = card.querySelector("h3"); if(h) h.textContent = "Price · 6mo · indexed = 100 · LIVE";
+  }catch(e){ /* keep the model sparkline */ }
+}
+
+/* ============================================================================
+   OPTIONS FLOW — today's most ACTIVE contracts (CBOE delayed, volume-ranked)
+   ========================================================================== */
+let flowData=null, flowLoading=false, flowLoaded=false;
+const fmtVol = v => v>=1e6 ? (v/1e6).toFixed(2)+"M" : v>=1e3 ? (v/1e3).toFixed(1)+"K" : String(v);
+
+async function fetchFlow(){
+  if(flowLoading) return;
+  flowLoading=true; renderFlow();
+  try{ const r=await fetch("/api/options/active?top=30"); flowData=await r.json(); flowLoaded=true; }
+  catch(e){ flowData={_error:String(e)}; }
+  flowLoading=false; renderFlow();
+}
+
+function renderFlow(){
+  const box=document.getElementById("tab-flow"); box.replaceChildren();
+
+  const top=document.createElement("div"); top.className="flow-top";
+  const left=document.createElement("div");
+  const k=document.createElement("div"); k.className="k"; k.textContent="Most active options";
+  const ao=document.createElement("div"); ao.className="as-of";
+  ao.textContent = flowData && flowData.as_of ? ("CBOE delayed · as of "+flowData.as_of) : "CBOE delayed feed";
+  left.append(k,ao);
+  const rb=document.createElement("button"); rb.className="flow-refresh";
+  rb.textContent = flowLoading ? "LOADING…" : "↻ REFRESH";
+  rb.disabled = flowLoading; rb.addEventListener("click",()=>{ flowLoaded=false; fetchFlow(); });
+  top.append(left,rb); box.append(top);
+
+  if(flowLoading && !flowData){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="Fetching live option chains from CBOE — scanning the most option-liquid names…";
+    box.append(e); return;
+  }
+  if(!flowData || flowData._error){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent = "Options feed unavailable"+(flowData&&flowData._error?" ("+flowData._error+")":"")+". Is server.py running? Retry with ↻ Refresh.";
+    box.append(e); return;
+  }
+
+  // market put/call split
+  const tc=flowData.total_call||0, tp=flowData.total_put||0, tt=tc+tp||1;
+  const pc=document.createElement("div"); pc.className="pcr-card";
+  const h3=document.createElement("h3");
+  const lab=document.createElement("span"); lab.textContent="Market put / call";
+  const pv=document.createElement("span"); pv.className="val num";
+  pv.textContent = flowData.market_pcr!=null ? ("PCR "+flowData.market_pcr.toFixed(2)) : "—";
+  h3.append(lab,pv); pc.append(h3);
+  const sb=document.createElement("div"); sb.className="split-bar";
+  const cseg=document.createElement("div"); cseg.className="call"; cseg.style.width=(tc/tt*100)+"%";
+  const pseg=document.createElement("div"); pseg.className="put"; pseg.style.width=(tp/tt*100)+"%";
+  sb.append(cseg,pseg); pc.append(sb);
+  const sk=document.createElement("div"); sk.className="split-key";
+  const ck=document.createElement("span"); ck.className="call-k num"; ck.textContent="▲ Calls "+fmtVol(tc);
+  const pk=document.createElement("span"); pk.className="put-k num"; pk.textContent="Puts "+fmtVol(tp)+" ▼";
+  sk.append(ck,pk); pc.append(sk); box.append(pc);
+
+  // underlying leaderboard
+  const unds=(flowData.underlyings||[]).slice(0,10);
+  if(unds.length){
+    const ul=document.createElement("div"); ul.className="und-list";
+    const uh=document.createElement("h3"); uh.textContent="Busiest underlyings · call/put split"; ul.append(uh);
+    const maxTot=Math.max(...unds.map(u=>u.totalVol),1);
+    for(const u of unds){
+      const row=document.createElement("div"); row.className="und-row";
+      const tk=document.createElement("span"); tk.className="und-tk"; tk.textContent=u.underlying;
+      if(fromY[u.underlying]!=null) tk.style.color=SECTOR_BY_ID[nodes[fromY[u.underlying]].sector].hex;
+      const barWrap=document.createElement("div");
+      const bar=document.createElement("div"); bar.className="und-bar";
+      bar.style.width=(u.totalVol/maxTot*100)+"%";
+      const c=document.createElement("div"); c.className="c"; c.style.flexGrow=u.callVol||0;
+      const p=document.createElement("div"); p.className="p"; p.style.flexGrow=u.putVol||0;
+      bar.append(c,p); barWrap.append(bar);
+      const pcr=document.createElement("span"); pcr.className="und-pcr";
+      pcr.textContent = u.pcr!=null ? u.pcr.toFixed(2) : "—";
+      pcr.style.color = u.pcr!=null ? (u.pcr>1?"var(--div-neg)":"var(--div-pos)") : "var(--ink-muted)";
+      pcr.title="put/call ratio";
+      row.append(tk,barWrap,pcr);
+      row.title = u.underlying+" · "+fmtVol(u.totalVol)+" contracts";
+      if(fromY[u.underlying]!=null) row.addEventListener("click",()=>selectNode(fromY[u.underlying]));
+      ul.append(row);
+    }
+    box.append(ul);
+  }
+
+  // top contracts table
+  const cc=document.createElement("div"); cc.className="contracts";
+  const ch=document.createElement("h3"); ch.textContent="Top contracts by volume"; cc.append(ch);
+  const tbl=document.createElement("table"); tbl.className="opt";
+  const hr=document.createElement("tr");
+  for(const t of ["Contract","Exp","Vol","OI","IV"]){ const th=document.createElement("th"); th.textContent=t; hr.append(th); }
+  tbl.append(hr);
+  for(const o of (flowData.contracts||[])){
+    const tr=document.createElement("tr"); tr.className="body";
+    const td1=document.createElement("td");
+    const tk=document.createElement("span"); tk.className="opt-und"; tk.textContent=o.underlying+" ";
+    if(fromY[o.underlying]!=null) tk.style.color=SECTOR_BY_ID[nodes[fromY[o.underlying]].sector].hex;
+    tk.style.fontWeight="700";
+    const cp=document.createElement("span"); cp.className="cp "+o.type; cp.textContent=o.type;
+    const st=document.createElement("span"); st.className="opt-strike"; st.textContent=" "+o.strike.toFixed(o.strike>=100?0:1);
+    td1.append(tk,cp,st);
+    const td2=document.createElement("td");
+    if(o.dte===0){ const z=document.createElement("span"); z.className="zdte"; z.textContent="0DTE"; td2.append(z); }
+    else { const ex=document.createElement("span"); ex.className="opt-exp";
+      ex.textContent=o.expiry.slice(5)+" ·"+o.dte+"d"; td2.append(ex); }
+    const td3=document.createElement("td"); td3.textContent=fmtVol(o.volume);
+    const td4=document.createElement("td"); td4.textContent=fmtVol(o.oi);
+    const td5=document.createElement("td"); td5.textContent=o.iv?o.iv.toFixed(0)+"%":"—";
+    tr.append(td1,td2,td3,td4,td5);
+    if(fromY[o.underlying]!=null) tr.addEventListener("click",()=>selectNode(fromY[o.underlying]));
+    tbl.append(tr);
+  }
+  cc.append(tbl); box.append(cc);
+
+  const note=document.createElement("div"); note.className="flow-note";
+  note.textContent = (flowData.note||"")+" Volume counts contracts traded — it does not distinguish buyers from sellers, which requires a paid trade-side feed. PCR > 1 = more puts than calls.";
+  box.append(note);
+}
+
+/* boot — deep-linkable via ?sel=TICKER&tab=overview|cascade|flow|matrix&shock=-4&depth=2 */
+const qp = new URLSearchParams(location.search);
+if(qp.has("shock")){ const v=Math.max(-10,Math.min(10,parseFloat(qp.get("shock"))||-5));
+  shockInput.value=v; shockInput.dispatchEvent(new Event("input")); }
+if(qp.has("depth")){ const b=document.querySelector(`#depth-seg button[data-d="${qp.get("depth")}"]`); if(b) b.click(); }
+if(qp.has("tab")){ const b=document.querySelector(`.tabs button[data-tab="${qp.get("tab")}"]`); if(b) b.click(); }
+renderList(); renderOverview(); renderCascadePanel();
+applyView(); renderFrame();
+addEventListener("resize",()=>{ applyView(); if(document.getElementById("tab-matrix").classList.contains("on")) drawMatrix(); });
+drawMatrix();
+// default selection for a lively first paint
+const selTk=(qp.get("sel")||"NVDA").toUpperCase();
+setTimeout(()=>selectNode(IDX[selTk] ?? IDX.NVDA), 600);
+// connect to the live proxy (degrades to model if server.py isn't running)
+setLiveStatus("connecting");
+startLive();
+if(qp.get("tab")==="flow") fetchFlow();
+</script>
+</body>
+</html>
