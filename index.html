@@ -187,10 +187,10 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
 .node circle.body, .node path.body { transition: opacity 0.35s; }
 .node.dim { opacity: 0.13; }
 .node text {
-  font-family: var(--font); font-size: 9.5px; font-weight: 600; fill: var(--ink-2);
+  font-family: var(--font); font-size: 11px; font-weight: 600; fill: var(--ink-2);
   pointer-events: none; text-anchor: middle; paint-order: stroke; stroke: var(--page); stroke-width: 3px;
 }
-.node.sel text, .node.hit text { fill: var(--ink); font-size: 10.5px; }
+.node.sel text, .node.hit text { fill: var(--ink); font-size: 12.5px; }
 .node .halo { fill: none; opacity: 0; }
 .node.hit .halo { opacity: 1; }
 .ripple { fill: none; stroke: var(--accent); pointer-events: none; }
@@ -635,7 +635,7 @@ function tick(){
   // springs
   for(const e of edges){
     const a=sim[e.a], b=sim[e.b];
-    const rest = 90 + (1-Math.abs(e.r))*110;
+    const rest = 115 + (1-Math.abs(e.r))*130;
     let dx=b.x-a.x, dy=b.y-a.y;
     const d=Math.max(1,Math.hypot(dx,dy)), f=(d-rest)*0.012*alpha;
     dx/=d; dy/=d;
@@ -655,7 +655,7 @@ function tick(){
   for(let pass=0;pass<2;pass++)
   for(let i=0;i<N;i++) for(let j=i+1;j<N;j++){
     const a=sim[i], b=sim[j];
-    const min=a.r+b.r+36;
+    const min=a.r+b.r+58;
     let dx=b.x-a.x, dy=b.y-a.y, d=Math.hypot(dx,dy);
     if(d>=min) continue;
     if(d<0.01){ dx=rand()-0.5; dy=rand()-0.5; d=Math.hypot(dx,dy); }
@@ -926,6 +926,97 @@ function applyCascadeVisual(){
   });
 }
 
+/* ---------- radial cascade layout ----------
+   Free force layout leaves cascade paths tangled in whatever position the
+   sim happened to settle on. On selection, re-pin the src + affected nodes
+   (reusing the existing drag fx/fy mechanism) into concentric rings by hop
+   order, with each branch's angular slice weighted by its downstream node
+   count (tidy radial tree) so sibling branches never overlap. Unaffected
+   nodes stay under normal physics and get pushed clear by repulsion. */
+const RING_GAP = 138;
+let cascadePinned = new Set();
+let layoutAnim = null;
+
+function computeRadialTargets(){
+  const src = cascade.src;
+  const cx = sim[src].x, cy = sim[src].y;
+  const children = new Map();
+  for(let v=0; v<N; v++){
+    if(v===src || cascade.impact[v]==null || cascade.order[v]>maxDepth) continue;
+    const p = cascade.via[v]; if(p==null) continue;
+    if(!children.has(p)) children.set(p, []);
+    children.get(p).push(v);
+  }
+  for(const arr of children.values()) arr.sort((a,b)=>Math.abs(cascade.impact[b])-Math.abs(cascade.impact[a]));
+  const weight = new Map();
+  (function w(u){
+    const kids = children.get(u)||[];
+    if(!kids.length){ weight.set(u,1); return 1; }
+    let s=0; for(const c of kids) s+=w(c);
+    weight.set(u,s); return s;
+  })(src);
+  const targets = new Map([[src,{x:cx,y:cy}]]);
+  (function assign(u,a0,a1){
+    const kids = children.get(u)||[];
+    if(!kids.length) return;
+    const total = weight.get(u);
+    let a=a0;
+    for(const c of kids){
+      const span = (a1-a0)*(weight.get(c)/total);
+      const ang = a+span/2, r = cascade.order[c]*RING_GAP;
+      targets.set(c, { x: cx+Math.cos(ang)*r, y: cy+Math.sin(ang)*r });
+      assign(c, a, a+span);
+      a += span;
+    }
+  })(src, -Math.PI/2, Math.PI*1.5);
+  return targets;
+}
+
+function animateCascadeLayout(){
+  if(layoutAnim){ cancelAnimationFrame(layoutAnim); layoutAnim=null; }
+  const targets = computeRadialTargets();
+  const starts = new Map();
+  for(const i of targets.keys()) starts.set(i, { x:sim[i].x, y:sim[i].y });
+  for(const i of cascadePinned) if(!targets.has(i)){ sim[i].fx=null; sim[i].fy=null; }
+  cascadePinned = new Set(targets.keys());
+
+  // frame the new layout in view
+  const pad=85;
+  let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
+  for(const {x,y} of targets.values()){ minX=Math.min(minX,x); maxX=Math.max(maxX,x); minY=Math.min(minY,y); maxY=Math.max(maxY,y); }
+  const W=svg.clientWidth, H=svg.clientHeight;
+  const bw=Math.max(1,maxX-minX+pad*2), bh=Math.max(1,maxY-minY+pad*2);
+  const fitK = Math.max(0.3, Math.min(3.2, Math.min(W/bw, H/bh)));
+  const midX=(minX+maxX)/2, midY=(minY+maxY)/2;
+  const view0 = { x:view.x, y:view.y, k:view.k };
+  const view1 = { x:-midX*fitK, y:-midY*fitK, k:fitK };
+
+  const dur=650, t0=performance.now();
+  function step(now){
+    const t=Math.min(1,(now-t0)/dur), e=1-Math.pow(1-t,3);
+    for(const [i,tg] of targets){
+      const s0=starts.get(i);
+      sim[i].fx = s0.x + (tg.x-s0.x)*e;
+      sim[i].fy = s0.y + (tg.y-s0.y)*e;
+    }
+    view.x = view0.x + (view1.x-view0.x)*e;
+    view.y = view0.y + (view1.y-view0.y)*e;
+    view.k = view0.k + (view1.k-view0.k)*e;
+    applyView();
+    alpha = Math.max(alpha, 0.25);
+    if(t<1){ layoutAnim=requestAnimationFrame(step); }
+    else { layoutAnim=null; for(const [i,tg] of targets){ sim[i].fx=tg.x; sim[i].fy=tg.y; } }
+  }
+  layoutAnim=requestAnimationFrame(step);
+}
+
+function releaseCascadeLayout(){
+  if(layoutAnim){ cancelAnimationFrame(layoutAnim); layoutAnim=null; }
+  for(const i of cascadePinned){ sim[i].fx=null; sim[i].fy=null; }
+  cascadePinned = new Set();
+  alpha = Math.max(alpha, 0.5);
+}
+
 function fireRipples(src){
   ripG.replaceChildren();
   const s=sim[src];
@@ -945,6 +1036,7 @@ function selectNode(i){
   selected=i;
   cascade = computeCascade(i);
   applyCascadeVisual();
+  animateCascadeLayout();
   fireRipples(i);
   renderList();
   renderOverview();
@@ -953,7 +1045,9 @@ function selectNode(i){
 }
 function clearSelection(){
   selected=-1; cascade=null;
+  releaseCascadeLayout();
   applyCascadeVisual(); renderList(); renderOverview(); renderCascadePanel(); drawMatrix();
+  applySearchVisual();
 }
 
 /* ============================================================================
@@ -982,7 +1076,34 @@ function applyFilterVisual(){
     (activeSectors.has(nodes[e.a].sector)&&activeSectors.has(nodes[e.b].sector))? "" : "none"; });
 }
 
-document.getElementById("search").addEventListener("input",e=>{ query=e.target.value.trim().toLowerCase(); renderList(); });
+// live search match, dims non-matching nodes/edges on the stage as you type;
+// stands down while a cascade selection is active so it doesn't fight applyCascadeVisual
+function matchesQuery(n){ return n.tk.toLowerCase().includes(query) || n.name.toLowerCase().includes(query); }
+function applySearchVisual(){
+  if(selected>=0) return;
+  const active = query.length>0;
+  nodes.forEach((n,i)=> nodeEls[i].g.classList.toggle("dim", active && !matchesQuery(n)));
+  edges.forEach((e,ei)=> edgeEls[ei].classList.toggle("dim", active && !(matchesQuery(nodes[e.a])||matchesQuery(nodes[e.b]))));
+}
+
+const searchInput = document.getElementById("search");
+searchInput.addEventListener("input",e=>{ query=e.target.value.trim().toLowerCase(); renderList(); applySearchVisual(); });
+searchInput.addEventListener("keydown",e=>{
+  if(e.key==="Enter"){
+    if(!query) return;
+    const pool = nodes.filter(n=>activeSectors.has(n.sector));
+    const match = pool.find(n=>n.tk.toLowerCase()===query)
+      || pool.find(n=>n.tk.toLowerCase().startsWith(query))
+      || pool.find(matchesQuery);
+    if(!match) return;
+    searchInput.value=""; query=""; renderList(); applySearchVisual();
+    selectNode(match.i);
+    searchInput.blur();
+  } else if(e.key==="Escape"){
+    searchInput.value=""; query=""; renderList(); applySearchVisual();
+    searchInput.blur();
+  }
+});
 
 const listBox=document.getElementById("companies");
 function renderList(){
@@ -1350,7 +1471,7 @@ document.getElementById("depth-seg").addEventListener("click",e=>{
   const b=e.target.closest("button"); if(!b) return;
   maxDepth=+b.dataset.d;
   document.querySelectorAll("#depth-seg button").forEach(x=>x.classList.toggle("on",x===b));
-  if(selected>=0){ cascade=computeCascade(selected); applyCascadeVisual(); renderCascadePanel(); }
+  if(selected>=0){ cascade=computeCascade(selected); applyCascadeVisual(); animateCascadeLayout(); renderCascadePanel(); }
 });
 document.getElementById("btn-clear").addEventListener("click",clearSelection);
 document.getElementById("btn-reheat").addEventListener("click",()=>{ alpha=1; });
