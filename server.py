@@ -12,6 +12,9 @@ API-key headaches:
                sparkline on the selected instrument).
   * Correlation — pairwise Pearson correlation of daily returns, computed
                server-side from the same history endpoint above.
+  * Lookup   — Yahoo Finance search/autocomplete endpoint. Resolves any
+               ticker's name/sector/industry so the client can synthesize
+               it into the model on the fly, beyond the curated universe.
   * Options  — CBOE delayed option chains (cdn.cboe.com). Full chain with
                volume / open interest / IV / greeks. ~15-min delayed. This is
                "most ACTIVE" (by traded volume), not "most PURCHASED" — free
@@ -228,6 +231,39 @@ def get_correlation(symbols, rng="6mo"):
 
 
 # ---------------------------------------------------------------------------
+# lookup  (Yahoo's public search/autocomplete — no crumb/auth required, unlike
+# the v7 quote and quoteSummary endpoints which now 401 without a session.
+# Used by the client to resolve a ticker typed in search that isn't in the
+# curated 38-name universe, so it can synthesize a new node for any real
+# Nasdaq/NYSE symbol instead of being limited to the built-in list.)
+# ---------------------------------------------------------------------------
+def get_lookup(symbol):
+    key = f"lu:{symbol.upper()}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    url = (f"https://query1.finance.yahoo.com/v1/finance/search?q={urllib.parse.quote(symbol)}"
+           f"&quotesCount=8&newsCount=0")
+    out = {"symbol": symbol, "matches": []}
+    try:
+        data = json.loads(fetch_yahoo(url))
+        for q in data.get("quotes", []):
+            if q.get("quoteType") != "EQUITY":
+                continue
+            out["matches"].append({
+                "symbol": q.get("symbol"),
+                "name": q.get("longname") or q.get("shortname"),
+                "sector": q.get("sector"),
+                "industry": q.get("industry"),
+                "exchange": q.get("exchDisp"),
+            })
+    except Exception as e:  # noqa: BLE001
+        out["_error"] = str(e)
+    cache_put(key, out, ttl=3600)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # options  (CBOE delayed chains -> most active by volume)
 # ---------------------------------------------------------------------------
 _OCC = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
@@ -380,6 +416,9 @@ class Handler(BaseHTTPRequestHandler):
                 rng = (qs.get("range", ["6mo"])[0])
                 self._send_json(get_correlation(syms, rng) if len(syms) >= 2
                                  else {"_error": "need >=2 symbols"})
+            elif u.path == "/api/lookup":
+                sym = (qs.get("symbol", [""])[0])
+                self._send_json(get_lookup(sym) if sym else {"_error": "no symbol"})
             elif u.path == "/api/options/active":
                 syms = [s for s in (qs.get("symbols", [""])[0]).split(",") if s] or OPTION_SCAN
                 top = int(qs.get("top", ["25"])[0])

@@ -107,6 +107,9 @@ main { flex: 1; display: grid; grid-template-columns: 236px 1fr 380px; min-heigh
 }
 #search:focus { border-color: rgba(251,139,30,0.5); }
 #search::placeholder { color: var(--ink-muted); }
+#search-msg { min-height: 14px; margin: -2px 10px 6px; font-size: 10px; color: var(--ink-muted); }
+#search-msg.err { color: var(--down); }
+#search-msg.ok  { color: var(--up); }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 10px 8px; }
 .chip {
   font-size: 9.5px; letter-spacing: 0.6px; padding: 3px 7px; border-radius: 10px;
@@ -385,6 +388,7 @@ footer b { color: var(--ink-2); font-weight: 600; }
   <section class="panel">
     <div class="panel-title">Universe</div>
     <input id="search" type="text" placeholder="Search ticker or name…" autocomplete="off">
+    <div id="search-msg"></div>
     <div class="chips" id="chips"></div>
     <div id="companies"></div>
   </section>
@@ -551,7 +555,7 @@ const vol30   = nodes.map(n=>{ let m=0; const r=returns[n.i]; for(let t=DAYS-30;
   let v=0; for(let t=DAYS-30;t<DAYS;t++)v+=(r[t]-m)**2; return Math.sqrt(v/29)*Math.sqrt(252); });
 
 /* ---------- correlation matrix (Pearson, empirical) ---------- */
-const N = nodes.length;
+let N = nodes.length; // grows when a live-looked-up ticker is added (see addLiveNode)
 const mean = returns.map(r=>{ let s=0; for(let t=0;t<DAYS;t++)s+=r[t]; return s/DAYS; });
 const sd   = returns.map((r,i)=>{ let s=0; for(let t=0;t<DAYS;t++)s+=(r[t]-mean[i])**2; return Math.sqrt(s/DAYS); });
 let CORR = Array.from({length:N},()=>new Float64Array(N));
@@ -709,8 +713,7 @@ function rebuildEdgeEls(){
 rebuildEdgeEls();
 
 const DASH = {1:"none", 2:"7,4", 3:"2,4", 4:"1.2,3.5", 5:"0.7,4"};
-const nodeEls = nodes.map((n,i)=>{
-  const s = sim[i];
+function makeNodeEl(n, s){
   const g = el("g",{class:"node"},nodesG);
   const hex = SECTOR_BY_ID[n.sector].hex;
   el("circle",{class:"halo", r:s.r+5, "stroke-width":2.5},g);
@@ -725,7 +728,8 @@ const nodeEls = nodes.map((n,i)=>{
   const label = el("text",{y:-(s.r+6)},g); label.textContent=n.tk;
   const chip  = el("text",{class:"impact-chip", y:s.r+13, opacity:0},g);
   return { g, body, label, chip, halo:g.firstChild };
-});
+}
+const nodeEls = nodes.map((n,i)=> makeNodeEl(n, sim[i]));
 
 function renderFrame(){
   tick();
@@ -798,7 +802,7 @@ const fmtPx=(n,i)=> n.tk==="US10Y" ? lastPxAt(i).toFixed(2)+"%" :
 const livePx = nodes.map(n=>prices[n.i][DAYS]); // mutated in place by live quote sync
 function lastPxAt(i){ return livePx[i]; }
 
-nodes.forEach((n,i)=>{
+function wireNodeHover(n,i){
   const g=nodeEls[i].g;
   g.addEventListener("pointerenter",evt=>{
     g.classList.add("hit"); nodeEls[i].halo.style.stroke=SECTOR_BY_ID[n.sector].hex;
@@ -823,7 +827,8 @@ nodes.forEach((n,i)=>{
   });
   g.addEventListener("pointermove",evt=>{ if(tip.style.display==="block" && tip._b) showTip(evt, tip._b); });
   g.addEventListener("pointerleave",()=>{ g.classList.remove("hit"); hideTip(); });
-});
+}
+nodes.forEach(wireNodeHover);
 
 /* ============================================================================
    CASCADE PROPAGATION — signed best-path product with per-hop damping
@@ -1095,7 +1100,7 @@ searchInput.addEventListener("keydown",e=>{
     const match = pool.find(n=>n.tk.toLowerCase()===query)
       || pool.find(n=>n.tk.toLowerCase().startsWith(query))
       || pool.find(matchesQuery);
-    if(!match) return;
+    if(!match){ lookupAndAdd(query); return; }
     searchInput.value=""; query=""; renderList(); applySearchVisual();
     selectNode(match.i);
     searchInput.blur();
@@ -1104,6 +1109,124 @@ searchInput.addEventListener("keydown",e=>{
     searchInput.blur();
   }
 });
+
+/* ============================================================================
+   LIVE TICKER LOOKUP — the curated UNIVERSE only covers ~38 names, so a
+   search miss falls through to server.py's /api/lookup (Yahoo's search
+   endpoint), which returns a real sector/industry for any Nasdaq/NYSE
+   symbol. That sector is mapped onto one of our 7 factor buckets and the
+   ticker is synthesized into the same return-generating model as the boot
+   universe (see EXPOSURE above), then spliced into nodes/sim/CORR/edges so
+   it behaves exactly like a native name — cascade, matrix, drag, etc. all
+   just work because everything downstream re-reads N/nodes live rather
+   than assuming the boot-time set.
+   ========================================================================== */
+const searchMsg = document.getElementById("search-msg");
+function setSearchMsg(text, cls){ searchMsg.textContent=text||""; searchMsg.className=cls||""; }
+
+const YAHOO_SECTOR_BUCKET = {
+  "Technology": "tech",
+  "Communication Services": "tech",
+  "Financial Services": "fin",
+  "Financial": "fin",
+  "Real Estate": "fin",
+  "Healthcare": "health",
+  "Health Care": "health",
+  "Utilities": "health",           // defensive/low-beta, closest existing bucket
+  "Energy": "energy",
+  "Consumer Cyclical": "consumer",
+  "Consumer Defensive": "consumer",
+  "Consumer Discretionary": "consumer",
+  "Consumer Staples": "consumer",
+  "Industrials": "indus",
+  "Basic Materials": "indus",
+  "Materials": "indus",
+};
+function bucketFor(sector, industry){
+  if(industry && /semiconductor/i.test(industry)) return "semi";
+  return YAHOO_SECTOR_BUCKET[sector] || "consumer";
+}
+
+/* Splices a brand-new ticker into the running model. Returns its node index. */
+function addLiveNode(tk, name, sector){
+  if(IDX[tk]!=null) return IDX[tk];
+  const ni = N;
+  const [bm,bs,br,bo] = EXPOSURE[sector];
+  const beta = bm*(0.85+0.3*rand());
+  const rNew = series(t=> beta*F_mkt[t] + bs*F_sect[sector][t] + br*F_rate[t] + bo*F_oil[t] + 0.0085*gauss());
+  let m=0; for(let t=0;t<DAYS;t++) m+=rNew[t]; m/=DAYS;
+  let v=0; for(let t=0;t<DAYS;t++) v+=(rNew[t]-m)**2; const sdNew=Math.sqrt(v/DAYS);
+
+  // grow the correlation matrix by one row/col (Float64Array rows are fixed-length, so rebuild)
+  const next = Array.from({length:N+1},()=>new Float64Array(N+1));
+  for(let i=0;i<N;i++) for(let j=0;j<N;j++) next[i][j]=CORR[i][j];
+  for(let i=0;i<N;i++){
+    let s=0; for(let t=0;t<DAYS;t++) s+=(returns[i][t]-mean[i])*(rNew[t]-m);
+    const r = s/(DAYS*sd[i]*sdNew);
+    next[i][ni]=r; next[ni][i]=r;
+  }
+  next[ni][ni]=1;
+  CORR=next;
+
+  const n = { i:ni, tk, name, sector, size:2 };
+  nodes.push(n); IDX[tk]=ni;
+  returns.push(rNew); mean.push(m); sd.push(sdNew);
+  let p = 40+rand()*400;
+  const path = new Float64Array(DAYS+1); path[0]=p;
+  for(let t=0;t<DAYS;t++){ p*=(1+rNew[t]); path[t+1]=p; }
+  prices.push(path);
+  lastPx.push(path[DAYS]); dayChg.push(rNew[DAYS-1]);
+  let vm=0; for(let t=DAYS-30;t<DAYS;t++) vm+=rNew[t]; vm/=30;
+  let vv=0; for(let t=DAYS-30;t<DAYS;t++) vv+=(rNew[t]-vm)**2;
+  vol30.push(Math.sqrt(vv/29)*Math.sqrt(252));
+  livePx.push(path[DAYS]);
+  fromY[toY(tk)] = ni;
+  const s = SECTORS.findIndex(sc=>sc.id===sector);
+  const ang = (s/SECTORS.length)*Math.PI*2 - Math.PI/2;
+  sim.push({ x: Math.cos(ang)*260+gauss()*40, y: Math.sin(ang)*260+gauss()*40,
+             vx:0, vy:0, fx:null, fy:null, r: 8+n.size*2.6 });
+  N = nodes.length;
+
+  ({ edgeMap, edges, ADJ } = buildGraph(CORR));
+  rebuildEdgeEls();
+  nodeEls.push(makeNodeEl(n, sim[ni]));
+  wireNodeHover(n, ni);
+  applyFilterVisual();
+
+  const grp = SECTOR_BY_ID[sector].id;
+  let insertAt = mxOrder.length;
+  for(let k=0;k<mxOrder.length;k++) if(nodes[mxOrder[k]].sector===grp) insertAt=k+1;
+  mxOrder.splice(insertAt, 0, ni);
+
+  document.getElementById("f-nodes").textContent = N;
+  document.getElementById("f-edges").textContent = edges.length;
+  return ni;
+}
+
+let lookupInFlight = null;
+async function lookupAndAdd(raw){
+  const tkQuery = raw.trim().toUpperCase();
+  if(!tkQuery) return;
+  setSearchMsg("Looking up "+tkQuery+"…");
+  lookupInFlight = tkQuery;
+  try{
+    const r = await fetch("/api/lookup?symbol="+encodeURIComponent(tkQuery));
+    const d = await r.json();
+    if(lookupInFlight!==tkQuery) return; // superseded by a newer lookup
+    const matches = (d.matches||[]).filter(m=>m.symbol);
+    const hit = matches.find(m=>m.symbol.toUpperCase()===tkQuery) || matches[0];
+    if(!hit){ setSearchMsg("No match for '"+tkQuery+"'","err"); return; }
+    if(!hit.sector){ setSearchMsg(hit.symbol+" isn't an individual stock (ETF/index/other) — not supported","err"); return; }
+    const bucket = bucketFor(hit.sector, hit.industry);
+    const i = addLiveNode(hit.symbol, hit.name||hit.symbol, bucket);
+    setSearchMsg("Added "+hit.symbol+" · "+SECTOR_BY_ID[bucket].label,"ok");
+    searchInput.value=""; query=""; renderList(); applySearchVisual();
+    selectNode(i);
+    if(liveMode) syncQuotes();
+  }catch(e){
+    setSearchMsg("Live lookup needs the local server (run server.py) to search new tickers","err");
+  }
+}
 
 const listBox=document.getElementById("companies");
 function renderList(){
