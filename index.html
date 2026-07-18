@@ -416,10 +416,10 @@ footer b { color: var(--ink-2); font-weight: 600; }
     <div class="legend" id="legend"></div>
     <div class="order-key" id="order-key">
       <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2"/></svg>1st order — direct</div>
-      <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="4 3"/></svg>2nd order — one hop</div>
-      <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="2 3"/></svg>3rd order — two hops</div>
-      <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="1 3"/></svg>4th order — three hops</div>
-      <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="0.6 3.4"/></svg>5th order — four hops</div>
+      <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="6 3"/></svg>2nd order — one hop</div>
+      <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="3 3"/></svg>3rd order — two hops</div>
+      <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="1.6 4"/></svg>4th order — three hops</div>
+      <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="1 6"/></svg>5th order — four hops</div>
     </div>
   </section>
 
@@ -713,7 +713,7 @@ function rebuildEdgeEls(){
 }
 rebuildEdgeEls();
 
-const DASH = {1:"none", 2:"7,4", 3:"2,4", 4:"1.2,3.5", 5:"0.7,4"};
+const DASH = {1:"none", 2:"6,3", 3:"3,3", 4:"1.6,4", 5:"1,6"};
 function makeNodeEl(n, s){
   const g = el("g",{class:"node"},nodesG);
   const hex = SECTOR_BY_ID[n.sector].hex;
