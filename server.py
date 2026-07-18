@@ -45,6 +45,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 
+
+def is_within_dir(base, target):
+    """True if target is base itself or a path strictly inside it.
+
+    A plain `target.startswith(base)` also matches sibling directories whose
+    name happens to share base's prefix (e.g. base=".../cascade" would match
+    ".../cascade_evil/secret.txt") since it never checks for a separator
+    boundary. Compare against `base + os.sep` to close that gap.
+    """
+    return target == base or target.startswith(base + os.sep)
+
+
 # Underlyings scanned for the "most active options" board. Kept to the genuinely
 # option-liquid names (the real leaders) so a cold scan stays responsive.
 OPTION_SCAN = [
@@ -385,7 +397,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_file(self, path):
         full = os.path.normpath(os.path.join(BASE_DIR, path.lstrip("/")))
-        if not full.startswith(BASE_DIR) or not os.path.isfile(full):
+        if not is_within_dir(BASE_DIR, full) or not os.path.isfile(full):
             self.send_error(404)
             return
         ctype = ("text/html" if full.endswith(".html")
@@ -433,8 +445,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"_error": str(e)}, status=500)
 
     def log_message(self, fmt, *args):  # quieter console
-        if "/api/" in (args[0] if args else ""):
+        # args[0] isn't always the request line — send_error() logs via
+        # log_error("code %d, message %s", code, message), so args[0] can be
+        # an int. A bare `"/api/" in args[0]` then raises TypeError, which
+        # turns every 404 into a crashed, confusing 500.
+        if args and isinstance(args[0], str) and "/api/" in args[0]:
             return
+        super().log_message(fmt, *args)
 
 
 def main():
