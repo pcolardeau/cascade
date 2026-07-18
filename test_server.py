@@ -10,6 +10,7 @@ import json
 import os
 import time
 import unittest
+import urllib.parse
 
 import server
 
@@ -79,6 +80,23 @@ class ReturnsByTTests(unittest.TestCase):
 
     def test_missing_keys_default_empty(self):
         self.assertEqual(server._returns_by_t({}), {})
+
+
+class CboeChainUrlTests(unittest.TestCase):
+    def test_plain_symbol(self):
+        self.assertEqual(
+            server._cboe_chain_url("SPY"),
+            "https://cdn.cboe.com/api/global/delayed_quotes/options/SPY.json",
+        )
+
+    def test_path_segment_injection_is_escaped(self):
+        # Regression test: symbol is client-controlled via
+        # /api/options/active?symbols=... — a bare f-string interpolation
+        # (the pre-fix behavior) would let "/" and ".." pass straight into
+        # the URL path unescaped.
+        url = server._cboe_chain_url("../other/path")
+        self.assertNotIn("/../", url)
+        self.assertIn(urllib.parse.quote("../other/path", safe=""), url)
 
 
 class ParseChainTests(unittest.TestCase):

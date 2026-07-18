@@ -330,12 +330,22 @@ def _parse_chain(symbol, raw):
     return contracts, call_vol, put_vol
 
 
+def _cboe_chain_url(symbol):
+    # Every other Yahoo-facing URL builder in this file quotes its symbol
+    # (see _spark_chunk, get_history, get_lookup) — this one didn't, and
+    # `symbol` is client-controlled via /api/options/active?symbols=....
+    # safe="" also escapes "/", closing off path-segment injection
+    # (e.g. symbol="../other/path") that the default quote() would allow.
+    return (f"https://cdn.cboe.com/api/global/delayed_quotes/options/"
+            f"{urllib.parse.quote(symbol, safe='')}.json")
+
+
 def _fetch_chain(symbol):
     key = f"o:{symbol}"
     cached = cache_get(key)
     if cached is not None:
         return cached
-    url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{symbol}.json"
+    url = _cboe_chain_url(symbol)
     result = None
     try:
         raw = fetch(url, timeout=20)
