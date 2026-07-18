@@ -8,6 +8,7 @@ Run:  python test_server.py
 
 import json
 import os
+import time
 import unittest
 
 import server
@@ -129,6 +130,16 @@ class CacheTests(unittest.TestCase):
 
     def test_get_missing_key_returns_none(self):
         self.assertIsNone(server.cache_get("test:does-not-exist"))
+
+    def test_put_purges_previously_expired_entries(self):
+        # A negative-ttl entry would purge itself in the same call (its own
+        # expiry is already in the past), so use a short positive ttl and
+        # let real time pass to test the "purged on a LATER put" case.
+        server.cache_put("test:stale", {"v": 0}, ttl=0.01)
+        time.sleep(0.02)
+        self.assertIn("test:stale", server._cache)  # not yet purged — only checked lazily
+        server.cache_put("test:trigger-purge", {"v": 1}, ttl=60)
+        self.assertNotIn("test:stale", server._cache)
 
 
 if __name__ == "__main__":

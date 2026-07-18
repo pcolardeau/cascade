@@ -69,11 +69,11 @@ OPTION_SCAN = [
 # tiny TTL cache
 # ---------------------------------------------------------------------------
 _cache = {}
-_clock = threading.Lock()
+_cache_lock = threading.Lock()
 
 
 def cache_get(key):
-    with _clock:
+    with _cache_lock:
         hit = _cache.get(key)
         if hit and hit[0] > time.time():
             return hit[1]
@@ -81,8 +81,17 @@ def cache_get(key):
 
 
 def cache_put(key, value, ttl):
-    with _clock:
-        _cache[key] = (time.time() + ttl, value)
+    now = time.time()
+    with _cache_lock:
+        _cache[key] = (now + ttl, value)
+        # Opportunistic purge: cache_get only checks expiry lazily on read,
+        # so without this a long-running server accumulates every expired
+        # entry forever (worst case: get_lookup caching every ticker a user
+        # has ever searched). Piggyback the sweep on writes rather than
+        # running a timer thread.
+        expired = [k for k, (exp, _) in _cache.items() if exp <= now]
+        for k in expired:
+            del _cache[k]
 
 
 def fetch(url, timeout=15):
