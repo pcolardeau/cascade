@@ -183,12 +183,12 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
 
 /* node/edge svg styling */
 .edge { stroke: var(--baseline); fill: none; transition: stroke 0.3s, opacity 0.3s, stroke-width 0.3s; }
-.edge.dim { opacity: 0.06; }
+.edge.dim { opacity: 0.12; }
 .edge.flow { stroke-dasharray: 6 5; animation: flow 0.9s linear infinite; }
 @keyframes flow { to { stroke-dashoffset: -11; } }
 .node { cursor: pointer; }
 .node circle.body, .node path.body { transition: opacity 0.35s; }
-.node.dim { opacity: 0.13; }
+.node.dim { opacity: 0.26; }
 .node text {
   font-family: var(--font); font-size: 11px; font-weight: 600; fill: var(--ink-2);
   pointer-events: none; text-anchor: middle; paint-order: stroke; stroke: var(--page); stroke-width: 3px;
