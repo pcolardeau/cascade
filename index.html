@@ -305,6 +305,10 @@ table.cas .imp { font-weight: 700; }
 .cas-read b { color: var(--ink); font-weight: 700; }
 .cas-read .up { color: var(--up); font-weight: 700; }
 .cas-read .dn { color: var(--down); font-weight: 700; }
+.cmp-title {
+  font-size: 10px; letter-spacing: 1.4px; text-transform: uppercase; font-weight: 700;
+  margin: 4px 0 8px; color: var(--ink-2);
+}
 .conv { display: inline-flex; gap: 2px; margin-left: 6px; vertical-align: middle; }
 .conv i { width: 5px; height: 5px; background: var(--accent); transform: rotate(45deg); display: inline-block; border-radius: 1px; }
 th.conv-h { text-align: center !important; width: 34px; }
@@ -763,7 +767,7 @@ svg.addEventListener("pointermove",evt=>{
 svg.addEventListener("pointerup",evt=>{
   if(dragNode>=0){ const i=dragNode; dragNode=-1;
     sim[i].fx=null; sim[i].fy=null;
-    if(!moved) selectNode(i);
+    if(!moved) selectNode(i, {compare: evt.shiftKey});
   }
   panning=false; svg.classList.remove("panning");
 });
@@ -836,10 +840,18 @@ nodes.forEach(wireNodeHover);
    ========================================================================== */
 let selected = -1;
 let cascade  = null;      // { src, impact[], order[], via[], usedEdges:Set }
+let selectedB = -1;       // second shock source, scenario-compare mode
+let cascadeB  = null;
 let shockPct = -5;
 let maxDepth = 3;
 const DAMP = 0.82;
 const MIN_EDGE = 0.28;
+const CMP_A = "#4a9eff", CMP_B = "#c65fe0", CMP_CONFLICT = "#d9a021", CMP_BOTH_EDGE = "#c3c2b7";
+
+function recomputeCascades(){
+  if(selected>=0)  cascade  = computeCascade(selected);
+  if(selectedB>=0) cascadeB = computeCascade(selectedB);
+}
 
 function computeCascade(src){
   const impact = new Array(N).fill(null);
@@ -892,41 +904,87 @@ function computeCascade(src){
 
 function impactColor(v){ return v>=0 ? "var(--up)" : "var(--down)"; }
 
+function compareClass(i){
+  // null when i isn't reached by either cascade; otherwise one of the 4
+  // scenario-compare buckets (both sources always classify as their own src).
+  const inA = cascade  && cascade.impact[i]!=null  && cascade.order[i]<=maxDepth;
+  const inB = cascadeB && cascadeB.impact[i]!=null && cascadeB.order[i]<=maxDepth;
+  if(inA && inB) return Math.sign(cascade.impact[i])===Math.sign(cascadeB.impact[i]) ? "reinforcing" : "conflicting";
+  if(inA) return "a-only";
+  if(inB) return "b-only";
+  return null;
+}
+
 function applyCascadeVisual(){
-  document.getElementById("order-key").classList.toggle("show", !!cascade);
+  document.getElementById("order-key").classList.toggle("show", !!cascade && !cascadeB);
   for(let i=0;i<N;i++){
     const ne=nodeEls[i];
     if(!cascade){ ne.g.classList.remove("dim","sel"); ne.halo.style.opacity=0; ne.halo.removeAttribute("stroke-dasharray");
       ne.chip.setAttribute("opacity",0); ne.body.removeAttribute("filter"); continue; }
-    const o=cascade.order[i];
-    const inC = o<=maxDepth && cascade.impact[i]!=null;
-    ne.g.classList.toggle("dim", !inC);
-    ne.g.classList.toggle("sel", i===cascade.src);
-    if(i===cascade.src){
-      ne.halo.style.opacity=1; ne.halo.style.stroke="var(--accent)"; ne.halo.removeAttribute("stroke-dasharray");
-      ne.body.setAttribute("filter","url(#glow)");
-      ne.chip.setAttribute("opacity",1); ne.chip.textContent=fmtPct(cascade.impact[i]);
-      ne.chip.style.fill = impactColor(cascade.impact[i]);
-    } else if(inC){
-      const col = cascade.impact[i]>=0 ? "#0ca30c" : "#e66767";
-      ne.halo.style.opacity=1; ne.halo.style.stroke=col;
-      ne.halo.style.transitionDelay = (o*0.35)+"s";
-      if(DASH[o] && DASH[o]!=="none") ne.halo.setAttribute("stroke-dasharray",DASH[o]);
-      else ne.halo.removeAttribute("stroke-dasharray");
-      ne.body.removeAttribute("filter");
-      ne.chip.setAttribute("opacity",1); ne.chip.textContent=fmtPct(cascade.impact[i]);
-      ne.chip.style.fill=col;
-    } else {
-      ne.halo.style.opacity=0; ne.chip.setAttribute("opacity",0); ne.body.removeAttribute("filter");
+    if(!cascadeB){
+      // single-shock mode — unchanged from before scenario compare existed
+      const o=cascade.order[i];
+      const inC = o<=maxDepth && cascade.impact[i]!=null;
+      ne.g.classList.toggle("dim", !inC);
+      ne.g.classList.toggle("sel", i===cascade.src);
+      if(i===cascade.src){
+        ne.halo.style.opacity=1; ne.halo.style.stroke="var(--accent)"; ne.halo.removeAttribute("stroke-dasharray");
+        ne.body.setAttribute("filter","url(#glow)");
+        ne.chip.setAttribute("opacity",1); ne.chip.textContent=fmtPct(cascade.impact[i]);
+        ne.chip.style.fill = impactColor(cascade.impact[i]);
+      } else if(inC){
+        const col = cascade.impact[i]>=0 ? "#0ca30c" : "#e66767";
+        ne.halo.style.opacity=1; ne.halo.style.stroke=col;
+        ne.halo.style.transitionDelay = (o*0.35)+"s";
+        if(DASH[o] && DASH[o]!=="none") ne.halo.setAttribute("stroke-dasharray",DASH[o]);
+        else ne.halo.removeAttribute("stroke-dasharray");
+        ne.body.removeAttribute("filter");
+        ne.chip.setAttribute("opacity",1); ne.chip.textContent=fmtPct(cascade.impact[i]);
+        ne.chip.style.fill=col;
+      } else {
+        ne.halo.style.opacity=0; ne.chip.setAttribute("opacity",0); ne.body.removeAttribute("filter");
+      }
+      continue;
     }
+    // scenario-compare mode — two active sources, 4-way halo classification.
+    // Chips stay off here (the Compare table carries the numbers instead).
+    ne.chip.setAttribute("opacity",0);
+    if(i===cascade.src || i===cascadeB.src){
+      ne.g.classList.remove("dim"); ne.g.classList.add("sel");
+      ne.halo.style.opacity=1; ne.halo.removeAttribute("stroke-dasharray");
+      ne.halo.style.stroke = i===cascade.src ? CMP_A : CMP_B;
+      ne.body.setAttribute("filter","url(#glow)");
+      continue;
+    }
+    const cls = compareClass(i);
+    ne.g.classList.toggle("sel", false);
+    ne.g.classList.toggle("dim", !cls);
+    ne.body.removeAttribute("filter");
+    if(!cls){ ne.halo.style.opacity=0; continue; }
+    const o = Math.min(cascade.order[i], cascadeB.order[i]);
+    ne.halo.style.opacity=1;
+    ne.halo.style.stroke = cls==="reinforcing" ? (cascade.impact[i]>=0?"#0ca30c":"#e66767")
+                          : cls==="conflicting" ? CMP_CONFLICT
+                          : cls==="a-only" ? CMP_A : CMP_B;
+    if(DASH[o] && DASH[o]!=="none") ne.halo.setAttribute("stroke-dasharray",DASH[o]);
+    else ne.halo.removeAttribute("stroke-dasharray");
   }
   edges.forEach((e,ei)=>{
     const L=edgeEls[ei];
     if(!cascade){ L.classList.remove("dim","flow"); L.style.stroke=""; return; }
-    if(cascade.usedEdges.has(ei)){
+    if(!cascadeB){
+      if(cascade.usedEdges.has(ei)){
+        L.classList.remove("dim"); L.classList.add("flow");
+        const child = (cascade.via[e.a]===e.b)? e.a : e.b;
+        L.style.stroke = cascade.impact[child]>=0 ? "#0ca30c" : "#e66767";
+        L.style.strokeOpacity = 0.9;
+      } else { L.classList.add("dim"); L.classList.remove("flow"); }
+      return;
+    }
+    const inA = cascade.usedEdges.has(ei), inB = cascadeB.usedEdges.has(ei);
+    if(inA || inB){
       L.classList.remove("dim"); L.classList.add("flow");
-      const child = (cascade.via[e.a]===e.b)? e.a : e.b;
-      L.style.stroke = cascade.impact[child]>=0 ? "#0ca30c" : "#e66767";
+      L.style.stroke = (inA && inB) ? CMP_BOTH_EDGE : (inA ? CMP_A : CMP_B);
       L.style.strokeOpacity = 0.9;
     } else { L.classList.add("dim"); L.classList.remove("flow"); }
   });
@@ -1038,9 +1096,20 @@ function fireRipples(src){
   setTimeout(()=>ripG.replaceChildren(), 2600);
 }
 
-function selectNode(i){
+function selectNode(i, opts={}){
+  if(opts.compare && selected>=0 && i!==selected){
+    // shift-click a second node: toggle it as the scenario-compare source
+    // instead of replacing the primary selection. Layout stays put — only
+    // the primary shock re-centers the radial layout.
+    selectedB = (i===selectedB) ? -1 : i;
+    cascadeB = selectedB>=0 ? computeCascade(selectedB) : null;
+    applyCascadeVisual();
+    renderCascadePanel();
+    return;
+  }
   selected=i;
   cascade = computeCascade(i);
+  selectedB=-1; cascadeB=null;   // a fresh primary selection always drops compare
   applyCascadeVisual();
   animateCascadeLayout();
   fireRipples(i);
@@ -1051,6 +1120,7 @@ function selectNode(i){
 }
 function clearSelection(){
   selected=-1; cascade=null;
+  selectedB=-1; cascadeB=null;
   releaseCascadeLayout();
   applyCascadeVisual(); renderList(); renderOverview(); renderCascadePanel(); drawMatrix();
   applySearchVisual();
@@ -1523,6 +1593,77 @@ function renderCascadePanel(){
     }
     blk.append(tbl); box.append(blk);
   }
+  renderComparePanel(box);
+}
+
+function renderComparePanel(box){
+  if(!cascadeB){
+    const hint=document.createElement("div"); hint.className="empty-note"; hint.style.padding="10px 0 0";
+    hint.textContent="Shift-click another node to shock it too and compare the two cascades.";
+    box.append(hint); return;
+  }
+  const nA=nodes[cascade.src], nB=nodes[cascadeB.src];
+  const h=document.createElement("h4"); h.className="cmp-title";
+  h.textContent=`vs ${nB.tk} ${fmtPct(shockPct/100)} — scenario compare`;
+  box.append(h);
+
+  const rows=[];
+  for(let v=0;v<N;v++){
+    if(v===cascade.src || v===cascadeB.src) continue;
+    const cls=compareClass(v);
+    if(cls) rows.push({v,cls});
+  }
+  const rank={reinforcing:0,conflicting:1,"a-only":2,"b-only":3};
+  rows.sort((x,y)=> rank[x.cls]-rank[y.cls] ||
+    Math.abs(cascadeB.impact[y.v] ?? cascade.impact[y.v] ?? 0) - Math.abs(cascadeB.impact[x.v] ?? cascade.impact[x.v] ?? 0));
+
+  const nReinf=rows.filter(r=>r.cls==="reinforcing").length;
+  const nConf=rows.filter(r=>r.cls==="conflicting").length;
+  const sm=document.createElement("div"); sm.className="cas-summary";
+  const tile=(k,v,color)=>{ const t=document.createElement("div"); t.className="cas-tile";
+    const kk=document.createElement("div"); kk.className="k"; kk.textContent=k;
+    const vv=document.createElement("div"); vv.className="v num"; vv.textContent=v; if(color) vv.style.color=color;
+    t.append(kk,vv); return t; };
+  sm.append(
+    tile("Reinforcing", String(nReinf), "var(--up)"),
+    tile("Conflicting", String(nConf), CMP_CONFLICT),
+    tile(nA.tk+"-only", String(rows.filter(r=>r.cls==="a-only").length), CMP_A),
+    tile(nB.tk+"-only", String(rows.filter(r=>r.cls==="b-only").length), CMP_B)
+  );
+  box.append(sm);
+
+  if(!rows.length){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="No overlapping or divergent effects at this depth."; box.append(e); return;
+  }
+
+  const tbl=document.createElement("table"); tbl.className="cas";
+  const thead=document.createElement("tr");
+  for(const t of ["Instrument", nA.tk, nB.tk, "Read"]){ const th=document.createElement("th"); th.textContent=t; thead.append(th); }
+  tbl.append(thead);
+  const labels={reinforcing:"reinforcing",conflicting:"conflicting","a-only":nA.tk+" only","b-only":nB.tk+" only"};
+  const labelColor={reinforcing:null,conflicting:CMP_CONFLICT,"a-only":CMP_A,"b-only":CMP_B};
+  for(const {v,cls} of rows){
+    const tr=document.createElement("tr"); tr.className="body";
+    const td1=document.createElement("td");
+    const tk=document.createElement("span"); tk.className="tk"; tk.textContent=nodes[v].tk;
+    tk.style.color=SECTOR_BY_ID[nodes[v].sector].hex; td1.append(tk);
+    const td2=document.createElement("td"); td2.className="num";
+    const aHas = cascade.impact[v]!=null && cascade.order[v]<=maxDepth;
+    td2.textContent = aHas ? fmtPct(cascade.impact[v]) : "—";
+    if(aHas) td2.style.color = cascade.impact[v]>=0?"var(--up)":"var(--down)";
+    const td3=document.createElement("td"); td3.className="num";
+    const bHas = cascadeB.impact[v]!=null && cascadeB.order[v]<=maxDepth;
+    td3.textContent = bHas ? fmtPct(cascadeB.impact[v]) : "—";
+    if(bHas) td3.style.color = cascadeB.impact[v]>=0?"var(--up)":"var(--down)";
+    const td4=document.createElement("td");
+    td4.textContent=labels[cls];
+    if(labelColor[cls]) td4.style.color=labelColor[cls];
+    tr.append(td1,td2,td3,td4);
+    tr.addEventListener("click",()=>selectNode(v));
+    tbl.append(tr);
+  }
+  box.append(tbl);
 }
 
 /* ----- correlation matrix ----- */
@@ -1589,13 +1730,13 @@ const shockVal=document.getElementById("shock-val");
 shockInput.addEventListener("input",()=>{
   shockPct=parseFloat(shockInput.value);
   shockVal.textContent=(shockPct>0?"+":shockPct<0?"−":"")+Math.abs(shockPct).toFixed(1)+"%";
-  if(selected>=0){ cascade=computeCascade(selected); applyCascadeVisual(); renderCascadePanel(); }
+  if(selected>=0){ recomputeCascades(); applyCascadeVisual(); renderCascadePanel(); }
 });
 document.getElementById("depth-seg").addEventListener("click",e=>{
   const b=e.target.closest("button"); if(!b) return;
   maxDepth=+b.dataset.d;
   document.querySelectorAll("#depth-seg button").forEach(x=>x.classList.toggle("on",x===b));
-  if(selected>=0){ cascade=computeCascade(selected); applyCascadeVisual(); animateCascadeLayout(); renderCascadePanel(); }
+  if(selected>=0){ recomputeCascades(); applyCascadeVisual(); animateCascadeLayout(); renderCascadePanel(); }
 });
 document.getElementById("btn-clear").addEventListener("click",clearSelection);
 document.getElementById("btn-reheat").addEventListener("click",()=>{ alpha=1; });
@@ -1717,7 +1858,7 @@ async function syncCorrelation(){
     document.getElementById("f-edges").textContent = edges.length;
     document.getElementById("f-corr-mode").textContent = "LIVE (6mo)";
     document.getElementById("matrix-title").textContent = "Cross-correlation · 6mo daily returns · LIVE";
-    if(selected>=0){ cascade=computeCascade(selected); applyCascadeVisual(); renderCascadePanel(); }
+    if(selected>=0){ recomputeCascades(); applyCascadeVisual(); renderCascadePanel(); }
     drawMatrix();
     const skipped = d.missing && d.missing.length ? ` · ${d.missing.length} symbols skipped (thin history)` : "";
     setCorrStatus("live", new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"}) + skipped);
@@ -1871,7 +2012,8 @@ function renderFlow(){
   box.append(note);
 }
 
-/* boot — deep-linkable via ?sel=TICKER&tab=overview|cascade|flow|matrix&shock=-4&depth=2 */
+/* boot — deep-linkable via ?sel=TICKER&sel2=TICKER&tab=overview|cascade|flow|matrix&shock=-4&depth=2
+   sel2 is optional: a second shock source that puts the app straight into scenario-compare mode. */
 const qp = new URLSearchParams(location.search);
 if(qp.has("shock")){ const v=Math.max(-10,Math.min(10,parseFloat(qp.get("shock"))||-5));
   shockInput.value=v; shockInput.dispatchEvent(new Event("input")); }
@@ -1883,7 +2025,11 @@ addEventListener("resize",()=>{ applyView(); if(document.getElementById("tab-mat
 drawMatrix();
 // default selection for a lively first paint
 const selTk=(qp.get("sel")||"NVDA").toUpperCase();
-setTimeout(()=>selectNode(IDX[selTk] ?? IDX.NVDA), 600);
+const sel2Tk=qp.get("sel2")?qp.get("sel2").toUpperCase():null;
+setTimeout(()=>{
+  selectNode(IDX[selTk] ?? IDX.NVDA);
+  if(sel2Tk!=null && IDX[sel2Tk]!=null) selectNode(IDX[sel2Tk], {compare:true});
+}, 600);
 // connect to the live proxy (degrades to model if server.py isn't running)
 setLiveStatus("connecting");
 startLive();

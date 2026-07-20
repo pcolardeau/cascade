@@ -42,13 +42,19 @@ default) so the app still loads instantly and works offline.
   macro refs like WTI / US10Y / DXY / Gold / SPX). Drag, pan, zoom. Click a node
   to **shock** it and watch effects ripple outward by order (solid → sparse-dashed
   halos). The **Shock** slider sets magnitude; **Depth** picks 1st–5th order.
+  **Shift-click** a second node to shock it too — the network switches to
+  **scenario compare**: blue/magenta halos mark each source's own reach,
+  green/red mark names both cascades push the same direction (reinforcing),
+  amber marks names they disagree on (conflicting).
 - **Right panel** — *Overview* (live price, β, top correlations, live sparkline);
   *Cascade* (net impact, breadth, **conviction** from reinforcing paths, plain-
-  English read, per-order transmission tables); *Flow* (today's most active
-  options — market put/call, busiest underlyings, top contracts); *Matrix*
-  (sector-grouped correlation heatmap).
+  English read, per-order transmission tables, and — once a second source is
+  shocked — a scenario-compare table diffing both cascades name by name);
+  *Flow* (today's most active options — market put/call, busiest underlyings,
+  top contracts); *Matrix* (sector-grouped correlation heatmap).
 
-Deep-linkable: `?sel=WTI&tab=cascade&shock=6&depth=4`.
+Deep-linkable: `?sel=WTI&sel2=US10Y&tab=cascade&shock=6&depth=4` (`sel2` is
+optional — set it to boot straight into scenario compare).
 
 ## Honest limitations
 
@@ -64,7 +70,6 @@ Deep-linkable: `?sel=WTI&tab=cascade&shock=6&depth=4`.
 
 ## Roadmap
 
-- Multi-shock / scenario compare (shock two names, diff the cascades).
 - Optional paid options-flow provider for real buy/sell classification (cost
   decision, not yet planned).
 
