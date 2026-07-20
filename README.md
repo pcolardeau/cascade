@@ -6,7 +6,7 @@ with a live shock-propagation model and a live **options-flow** board.
 
 Runs entirely on your machine, in any browser.
 
-![terminal](.) <!-- screenshots live in your scratchpad; drop one here if you like -->
+![terminal](screenshot.png)
 
 ## Run it
 
@@ -28,10 +28,13 @@ mode (no live data) because the browser can't reach the feeds directly. Run
 | Quotes (price / day change) | Yahoo Finance `spark` | ~15-min delayed; refreshes every 30 s |
 | Selected-name sparkline | Yahoo Finance `chart` (6 mo daily) | real history, indexed vs SPX |
 | Options flow (most active) | **CBOE** delayed option chains | volume / OI / IV, ~15-min delayed |
-| Correlation network + shock cascade | **synthetic** 4-factor model (seeded) | see *Roadmap* |
+| Correlation network + shock cascade | **synthetic** 4-factor model (seeded) by default; **live** Pearson correlations (6 mo daily history) one click away via **Sync History** | `/api/correlation`, cached 15 min |
 
 The header pill shows the live status; click it to pause/resume the feed. If
 `server.py` isn't running the UI degrades gracefully to the synthetic model.
+**Sync History** replaces the seeded network with correlations computed from
+real historical returns for the current universe — it's opt-in (not the
+default) so the app still loads instantly and works offline.
 
 ## The three views
 
@@ -54,17 +57,16 @@ Deep-linkable: `?sel=WTI&tab=cascade&shock=6&depth=4`.
 - **"Most active", not "most purchased."** Volume counts contracts traded; it does
   **not** classify buyers vs sellers. True buy/sell "unusual options" flow needs a
   paid trade-side feed (e.g. Unusual Whales). Don't read call volume as "bullish."
-- **Correlations are synthetic.** The network structure is a coherent factor model,
-  not computed from live history — yet (see Roadmap).
+- **Correlations are synthetic by default.** The network loads as a coherent
+  seeded factor model; click **Sync History** to rebuild it from real 6-month
+  daily returns instead.
 - **Not investment advice.** This is an analysis/visualization tool.
 
 ## Roadmap
 
-- Rebuild the correlation matrix and cascade edges from **live daily history**
-  (one batched fetch of ~6-12 mo bars for the whole universe) so the network is
-  fully live end-to-end, with a "Sync history" button.
 - Multi-shock / scenario compare (shock two names, diff the cascades).
-- Optional paid options-flow provider for real buy/sell classification.
+- Optional paid options-flow provider for real buy/sell classification (cost
+  decision, not yet planned).
 
 ## Files
 
