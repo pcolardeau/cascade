@@ -569,6 +569,10 @@ for(let i=0;i<N;i++){ CORR[i][i]=1;
 
 /* ---------- graph edges: supply/rate/fuel narrative links + top correlations ---------- */
 const LINKS = [ // [a, b, mechanism]
+  // entries below can name tickers outside the boot UNIVERSE (e.g. names
+  // only reachable via live search) — buildGraph() skips them until both
+  // sides exist in a given session rather than erroring.
+  ["NVDA","NBIS","NVIDIA ~10% equity stake"],
   ["ASML","TSM","Lithography supply"],["TSM","NVDA","Foundry supply"],["TSM","AAPL","Foundry supply"],
   ["TSM","AMD","Foundry supply"],["NVDA","MSFT","AI datacenter demand"],["NVDA","GOOGL","AI accelerator demand"],
   ["NVDA","META","AI capex demand"],["MU","NVDA","HBM memory supply"],["AMD","MSFT","Server CPU supply"],
@@ -599,6 +603,7 @@ function buildGraph(corr){
   const edgeMap = new Map();
   for (const [a,b,mech] of LINKS){
     const i=IDX[a], j=IDX[b];
+    if(i==null || j==null) continue; // one side not added yet this session — skip, don't crash
     edgeMap.set(edgeKey(a,b), { a:i, b:j, r:corr[i][j], mech, link:true });
   }
   for (let i=0;i<N;i++){
