@@ -579,23 +579,67 @@ const LINKS = [ // [a, b, mechanism, rOverride?]
   // link describes. Set rOverride when the real relationship is known to
   // be stronger (or weaker) than that generic number.
   ["NVDA","NBIS","NVIDIA ~10% equity stake", 0.75],
-  ["ASML","TSM","Lithography supply"],["TSM","NVDA","Foundry supply"],["TSM","AAPL","Foundry supply"],
-  ["TSM","AMD","Foundry supply"],["NVDA","MSFT","AI datacenter demand"],["NVDA","GOOGL","AI accelerator demand"],
-  ["NVDA","META","AI capex demand"],["MU","NVDA","HBM memory supply"],["AMD","MSFT","Server CPU supply"],
-  ["SKHY","NVDA","HBM memory supply"],["SKHY","AMD","HBM memory supply"],
-  ["AAPL","NKE","Consumer discretionary pulse"],["AMZN","UPS","Parcel volume"],
-  ["WTI","XOM","Crude realization"],["WTI","CVX","Crude realization"],["WTI","COP","Crude realization"],
-  ["WTI","OXY","Crude realization"],["XOM","SLB","Oilfield capex"],
-  ["WTI","UPS","Fuel cost"],["WTI","BA","Airline fuel pass-through"],
-  ["US10Y","JPM","Net interest margin"],["US10Y","BAC","Net interest margin"],["US10Y","GS","Rates trading"],
-  ["US10Y","MS","Rates sensitivity"],["US10Y","XAU","Real-rate discount"],["US10Y","NDX","Duration discount"],
-  ["DXY","XAU","Dollar pricing"],["DXY","WTI","Dollar pricing"],
-  ["V","AMZN","Payments volume"],["JPM","V","Card issuance"],
-  ["CAT","XOM","Energy capex equipment"],["GE","BA","Engine supply"],["LMT","GE","Defense propulsion"],
-  ["WMT","UPS","Retail logistics"],["HD","CAT","Construction cycle"],["TSLA","MU","Auto silicon"],
-  ["SPX","JNJ","Index beta"],["SPX","UNH","Index beta"],["NDX","AAPL","Index weight"],
-  ["NDX","MSFT","Index weight"],["SPX","AMZN","Index weight"],["LLY","MRK","Pharma pipeline sentiment"],
-  ["PFE","JNJ","Pharma sector flows"],
+
+  // semiconductor supply chain — direct, revenue-scale dependencies
+  ["ASML","TSM","Lithography supply", 0.70],
+  ["TSM","NVDA","Foundry supply", 0.65],
+  ["TSM","AAPL","Foundry supply", 0.60],
+  ["TSM","AMD","Foundry supply", 0.55],
+  ["MU","NVDA","HBM memory supply", 0.55],
+  ["SKHY","NVDA","HBM memory supply", 0.65],
+  ["SKHY","AMD","HBM memory supply", 0.45],
+
+  // AI capex — hyperscaler/customer demand for NVDA/AMD silicon
+  ["NVDA","MSFT","AI datacenter demand", 0.60],
+  ["NVDA","GOOGL","AI accelerator demand", 0.50],
+  ["NVDA","META","AI capex demand", 0.60],
+  ["AMD","MSFT","Server CPU supply", 0.40],
+
+  // consumer / logistics
+  ["AAPL","NKE","Consumer discretionary pulse", 0.35],
+  ["AMZN","UPS","Parcel volume", 0.45],
+
+  // energy — crude-price revenue realization (E&P) vs. fuel-cost exposure (consumers of it)
+  ["WTI","XOM","Crude realization", 0.75],
+  ["WTI","CVX","Crude realization", 0.75],
+  ["WTI","COP","Crude realization", 0.80],
+  ["WTI","OXY","Crude realization", 0.80],
+  ["XOM","SLB","Oilfield capex", 0.45],
+  ["WTI","UPS","Fuel cost", -0.30],
+  ["WTI","BA","Airline fuel pass-through", -0.20],
+
+  // rates — bank net interest margin (positive) vs. discount-rate sensitivity (negative)
+  ["US10Y","JPM","Net interest margin", 0.40],
+  ["US10Y","BAC","Net interest margin", 0.40],
+  ["US10Y","GS","Rates trading", 0.30],
+  ["US10Y","MS","Rates sensitivity", 0.30],
+  ["US10Y","XAU","Real-rate discount", -0.45],
+  ["US10Y","NDX","Duration discount", -0.40],
+
+  // dollar — inverse to dollar-priced commodities
+  ["DXY","XAU","Dollar pricing", -0.55],
+  ["DXY","WTI","Dollar pricing", -0.35],
+
+  // payments / industrials / healthcare — moderate, sector-adjacent ties
+  ["V","AMZN","Payments volume", 0.35],
+  ["JPM","V","Card issuance", 0.35],
+  ["CAT","XOM","Energy capex equipment", 0.35],
+  ["GE","BA","Engine supply", 0.55],
+  ["LMT","GE","Defense propulsion", 0.35],
+  ["WMT","UPS","Retail logistics", 0.30],
+  ["HD","CAT","Construction cycle", 0.40],
+  ["TSLA","MU","Auto silicon", 0.25],
+  ["LLY","MRK","Pharma pipeline sentiment", 0.35],
+  ["PFE","JNJ","Pharma sector flows", 0.35],
+
+  // index composition — mechanically strong: SPX/NDX are cap-weighted averages
+  // that already include these names, so the statistical r is already accurate;
+  // overridden anyway so every curated link is deliberate, not model-luck.
+  ["SPX","JNJ","Index beta", 0.45],
+  ["SPX","UNH","Index beta", 0.45],
+  ["NDX","AAPL","Index weight", 0.70],
+  ["NDX","MSFT","Index weight", 0.70],
+  ["SPX","AMZN","Index weight", 0.60],
 ];
 const edgeKey=(a,b)=> a<b? a+"|"+b : b+"|"+a;
 
