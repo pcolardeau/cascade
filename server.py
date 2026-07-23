@@ -34,6 +34,7 @@ import datetime as dt
 import json
 import os
 import re
+import sys
 import threading
 import time
 import urllib.error
@@ -65,6 +66,11 @@ OPTION_SCAN = [
     "COIN", "PLTR", "SMCI",
 ]
 
+# Hard cap on how many symbols a single API request may fan out to, so a
+# crafted ?symbols=... list can't trigger an unbounded burst of outbound
+# requests to Yahoo / CBOE (resource-exhaustion / amplification guard).
+MAX_API_SYMBOLS = 60
+
 # ---------------------------------------------------------------------------
 # tiny TTL cache
 # ---------------------------------------------------------------------------
@@ -95,6 +101,18 @@ def cache_put(key, value, ttl):
 
 
 def fetch(url, timeout=15):
+    """Fetch raw bytes from a URL with a user agent header.
+
+    Args:
+        url (str): The URL to fetch.
+        timeout (int): Request timeout in seconds. Defaults to 15.
+
+    Returns:
+        bytes: The raw response body.
+
+    Raises:
+        urllib.error.URLError: If the request fails.
+    """
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
@@ -107,6 +125,22 @@ _yahoo_last = [0.0]
 
 
 def fetch_yahoo(url, timeout=15, gap=0.6):
+    """Fetch from Yahoo Finance with rate-limiting and automatic retry.
+
+    Yahoo throttles rapid requests with 400 errors, so this serializes calls
+    with a minimum inter-call gap, measured from completion (not start).
+
+    Args:
+        url (str): The Yahoo Finance URL to fetch.
+        timeout (int): Request timeout in seconds. Defaults to 15.
+        gap (float): Minimum seconds between calls. Defaults to 0.6.
+
+    Returns:
+        bytes: The raw response body.
+
+    Raises:
+        urllib.error.HTTPError: If the request fails after retry.
+    """
     # Serialize Yahoo calls with a real gap measured from the previous call's
     # COMPLETION (fetches take ~0.5s, so a start-time gap would never actually
     # space them out — back-to-back requests are what trip the 400).
@@ -154,7 +188,18 @@ def _spark_chunk(chunk):
 
 
 def get_quotes(symbols):
-    key = "q:" + ",".join(symbols)
+    """Fetch latest quotes for multiple symbols from Yahoo Finance.
+
+    Args:
+        symbols (list): List of stock symbols (e.g., ['AAPL', 'MSFT']).
+
+    Returns:
+        dict: Map {symbol: {price, prevClose, change}} or {_error: message} on failure.
+    """
+    symbols = symbols[:MAX_API_SYMBOLS]  # bound outbound fan-out per request
+    # Sort for the cache key so ?symbols=AAPL,MSFT and ?symbols=MSFT,AAPL share
+    # one entry (the result is a symbol-keyed map, so order is irrelevant).
+    key = "q:" + ",".join(sorted(symbols))
     cached = cache_get(key)
     if cached is not None:
         return cached
@@ -177,6 +222,15 @@ def get_quotes(symbols):
 # history  (Yahoo chart, daily bars)
 # ---------------------------------------------------------------------------
 def get_history(symbol, rng="6mo"):
+    """Fetch daily closing prices for a symbol over a time range.
+
+    Args:
+        symbol (str): Stock symbol.
+        rng (str): Time range (e.g., '6mo', '1y', '5y'). Defaults to '6mo'.
+
+    Returns:
+        dict: {t: [timestamps], c: [closes]} or {_error: message} on failure.
+    """
     key = f"h:{symbol}:{rng}"
     cached = cache_get(key)
     if cached is not None:
@@ -193,8 +247,10 @@ def get_history(symbol, rng="6mo"):
             if c is not None:
                 out["t"].append(t)
                 out["c"].append(round(c, 4))
-    except Exception as e:  # noqa: BLE001
-        out["_error"] = str(e)
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+        out["_error"] = f"Failed to parse history data: {e}"
+    except (urllib.error.URLError, IOError) as e:
+        out["_error"] = f"Network error fetching history: {e}"
     cache_put(key, out, ttl=900)
     return out
 
@@ -220,6 +276,16 @@ def _pearson(xs, ys):
 
 
 def get_correlation(symbols, rng="6mo"):
+    """Compute pairwise Pearson correlation of daily returns.
+
+    Args:
+        symbols (list): List of stock symbols to correlate.
+        rng (str): Time range for historical data. Defaults to '6mo'.
+
+    Returns:
+        dict: {symbols, pairs: [[sym1, sym2, r], ...], missing, range, asOf}.
+    """
+    symbols = symbols[:MAX_API_SYMBOLS]  # bound history fan-out and O(n^2) pairing
     key = "corr:" + ",".join(sorted(symbols)) + f":{rng}"
     cached = cache_get(key)
     if cached is not None:
@@ -259,6 +325,14 @@ def get_correlation(symbols, rng="6mo"):
 # Nasdaq/NYSE symbol instead of being limited to the built-in list.)
 # ---------------------------------------------------------------------------
 def get_lookup(symbol):
+    """Search for equity matches by partial symbol/name from Yahoo Finance.
+
+    Args:
+        symbol (str): Partial symbol or company name to search.
+
+    Returns:
+        dict: {symbol, matches: [{symbol, name, sector, industry, exchange}, ...]} or {_error: message}.
+    """
     key = f"lu:{symbol.upper()}"
     cached = cache_get(key)
     if cached is not None:
@@ -278,8 +352,10 @@ def get_lookup(symbol):
                 "industry": q.get("industry"),
                 "exchange": q.get("exchDisp"),
             })
-    except Exception as e:  # noqa: BLE001
-        out["_error"] = str(e)
+    except json.JSONDecodeError as e:
+        out["_error"] = f"Failed to parse search results: {e}"
+    except (urllib.error.URLError, IOError) as e:
+        out["_error"] = f"Network error fetching lookup: {e}"
     cache_put(key, out, ttl=3600)
     return out
 
@@ -288,6 +364,33 @@ def get_lookup(symbol):
 # options  (CBOE delayed chains -> most active by volume)
 # ---------------------------------------------------------------------------
 _OCC = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
+
+
+def _parse_occ_symbol(occ_str):
+    """Parse OCC symbol string into components.
+
+    OCC format: ROOTYYMMDDCSTRIKE8 (e.g., AAPL240119C00150000)
+    - ROOT: stock root symbol
+    - YYMMDD: expiry date
+    - C/P: call or put
+    - STRIKE8: strike price * 1000 (8 digits)
+
+    Args:
+        occ_str (str): OCC option symbol.
+
+    Returns:
+        tuple: (root, expiry_date, call_or_put, strike) or None if invalid.
+    """
+    m = _OCC.match(occ_str)
+    if not m:
+        return None
+    root, ymd, cp, strike8 = m.groups()
+    try:
+        exp = dt.datetime.strptime(ymd, "%y%m%d").date()
+        strike = int(strike8) / 1000.0
+        return (root, exp, cp, strike)
+    except ValueError:
+        return None
 
 
 def _parse_chain(symbol, raw):
@@ -300,15 +403,10 @@ def _parse_chain(symbol, raw):
         vol = o.get("volume") or 0
         if not vol:
             continue
-        m = _OCC.match(o.get("option", ""))
-        if not m:
+        parsed = _parse_occ_symbol(o.get("option", ""))
+        if not parsed:
             continue
-        root, ymd, cp, strike8 = m.groups()
-        try:
-            exp = dt.datetime.strptime(ymd, "%y%m%d").date()
-        except ValueError:
-            continue
-        strike = int(strike8) / 1000.0
+        root, exp, cp, strike = parsed
         dte = (exp - dt.date.today()).days
         if cp == "C":
             call_vol += vol
@@ -353,22 +451,33 @@ def _fetch_chain(symbol):
         ts = json.loads(raw).get("timestamp")
         contracts, cv, pv = _parse_chain(symbol, raw)
         result = {"contracts": contracts, "call_vol": cv, "put_vol": pv, "ts": ts}
-    except Exception:  # noqa: BLE001 — a dead symbol shouldn't kill the board
+    except (urllib.error.URLError, IOError, json.JSONDecodeError, KeyError, ValueError):
+        # Dead symbol or parsing error shouldn't kill the board; return empty result
         result = {"contracts": [], "call_vol": 0.0, "put_vol": 0.0, "ts": None}
     cache_put(key, result, ttl=300)
     return result
 
 
 def get_active_options(symbols, top=25):
-    key = "oa:" + ",".join(symbols) + f":{top}"
+    """Fetch most-active option contracts across underlyings (CBOE, ~15-min delayed).
+
+    Args:
+        symbols (list): List of stock symbols to scan. Defaults to OPTION_SCAN if empty.
+        top (int): Number of top contracts to return, sorted by volume. Defaults to 25.
+
+    Returns:
+        dict: {as_of, delayed, market_pcr, total_call, total_put, underlyings, contracts, note}.
+    """
+    symbols = symbols[:MAX_API_SYMBOLS]  # bound outbound CBOE fan-out per request
+    key = "oa:" + ",".join(sorted(symbols)) + f":{top}"
     cached = cache_get(key)
     if cached is not None:
         return cached
     all_contracts = []
     unders = {}
     as_of = None
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        for sym, res in zip(symbols, ex.map(_fetch_chain, symbols)):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        for sym, res in zip(symbols, executor.map(_fetch_chain, symbols)):
             all_contracts.extend(res["contracts"])
             tot = res["call_vol"] + res["put_vol"]
             if tot > 0:
@@ -388,7 +497,7 @@ def get_active_options(symbols, top=25):
         "as_of": as_of,
         "delayed": True,
         "note": "Most ACTIVE by traded volume (CBOE, ~15-min delayed). Not buy/sell classified.",
-        "market_pcr": round(total_put / total_call, 2) if total_call else None,
+        "market_pcr": round(total_put / max(total_call, 0.0001), 2) if total_call else None,
         "total_call": total_call,
         "total_put": total_put,
         "underlyings": board,
@@ -432,36 +541,42 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        u = urllib.parse.urlparse(self.path)
-        qs = urllib.parse.parse_qs(u.query)
+        parsed_url = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed_url.query)
         try:
-            if u.path == "/api/quotes":
-                syms = [s for s in (qs.get("symbols", [""])[0]).split(",") if s]
+            if parsed_url.path == "/api/quotes":
+                syms = [s for s in (query.get("symbols", [""])[0]).split(",") if s]
                 self._send_json(get_quotes(syms) if syms else {})
-            elif u.path == "/api/history":
-                sym = (qs.get("symbol", [""])[0])
-                rng = (qs.get("range", ["6mo"])[0])
+            elif parsed_url.path == "/api/history":
+                sym = (query.get("symbol", [""])[0])
+                rng = (query.get("range", ["6mo"])[0])
                 self._send_json(get_history(sym, rng) if sym else {"_error": "no symbol"})
-            elif u.path == "/api/correlation":
-                syms = [s for s in (qs.get("symbols", [""])[0]).split(",") if s]
-                rng = (qs.get("range", ["6mo"])[0])
+            elif parsed_url.path == "/api/correlation":
+                syms = [s for s in (query.get("symbols", [""])[0]).split(",") if s]
+                rng = (query.get("range", ["6mo"])[0])
                 self._send_json(get_correlation(syms, rng) if len(syms) >= 2
                                  else {"_error": "need >=2 symbols"})
-            elif u.path == "/api/lookup":
-                sym = (qs.get("symbol", [""])[0])
+            elif parsed_url.path == "/api/lookup":
+                sym = (query.get("symbol", [""])[0])
                 self._send_json(get_lookup(sym) if sym else {"_error": "no symbol"})
-            elif u.path == "/api/options/active":
-                syms = [s for s in (qs.get("symbols", [""])[0]).split(",") if s] or OPTION_SCAN
-                top = int(qs.get("top", ["25"])[0])
+            elif parsed_url.path == "/api/options/active":
+                syms = [s for s in (query.get("symbols", [""])[0]).split(",") if s] or OPTION_SCAN
+                top = int(query.get("top", ["25"])[0])
                 self._send_json(get_active_options(syms, top))
-            elif u.path in ("/", ""):
+            elif parsed_url.path in ("/", ""):
                 self._send_file("index.html")
             else:
-                self._send_file(u.path)
+                self._send_file(parsed_url.path)
         except BrokenPipeError:
             pass
-        except Exception as e:  # noqa: BLE001
-            self._send_json({"_error": str(e)}, status=500)
+        except ValueError as e:
+            self._send_json({"_error": f"Invalid parameter: {e}"}, status=400)
+        except (FileNotFoundError, OSError) as e:
+            self._send_json({"_error": f"File error: {e}"}, status=500)
+        except Exception as e:
+            # Catch remaining errors to prevent server crash; log to stderr
+            print(f"[server error] Unhandled exception: {e}", file=sys.stderr)
+            self._send_json({"_error": "Internal server error"}, status=500)
 
     def log_message(self, fmt, *args):  # quieter console
         # args[0] isn't always the request line — send_error() logs via
@@ -474,10 +589,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=8474)
-    ap.add_argument("--host", default="127.0.0.1")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8474)
+    parser.add_argument("--host", default="127.0.0.1")
+    args = parser.parse_args()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"CASCADE proxy on http://{args.host}:{args.port}  (Ctrl+C to stop)")
     print(f"  static : {BASE_DIR}")
