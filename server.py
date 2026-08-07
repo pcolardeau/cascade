@@ -58,6 +58,21 @@ def is_within_dir(base, target):
     return target == base or target.startswith(base + os.sep)
 
 
+def has_hidden_component(base, target):
+    """True if any path segment of `target`, relative to `base`, starts with a dot.
+
+    Extracted out of Handler._send_file so it's a plain function testable
+    without spinning up a real HTTP request -- BASE_DIR (a git checkout) also
+    contains .git/, and other tooling drops dotfiles like .env next to
+    server.py, none of which should be servable just because they happen to
+    live under the static root.
+    """
+    rel = os.path.relpath(target, base)
+    if rel == os.curdir:  # target IS base -- relpath returns "." here, not a real component
+        return False
+    return any(part.startswith(".") for part in rel.split(os.sep))
+
+
 # Underlyings scanned for the "most active options" board. Kept to the genuinely
 # option-liquid names (the real leaders) so a cold scan stays responsive.
 OPTION_SCAN = [
@@ -293,18 +308,18 @@ def get_correlation(symbols, rng="6mo"):
     # Sequential, like get_quotes — reuses get_history's own Yahoo pacing
     # (fetch_yahoo) and its 900s cache, so a repeat sync within 15min of a
     # quote/chart fetch for the same symbol costs nothing extra.
-    rmap, missing = {}, []
+    returns_by_symbol, missing = {}, []
     for sym in symbols:
         r = _returns_by_t(get_history(sym, rng))
         if len(r) < 20:
             missing.append(sym)
-        rmap[sym] = r
+        returns_by_symbol[sym] = r
     # Pairwise date-intersection: a gappy or newly-listed symbol only
     # degrades its own edges, not the whole matrix's common window.
     pairs = []
     for i in range(len(symbols)):
         for j in range(i + 1, len(symbols)):
-            si, sj = rmap[symbols[i]], rmap[symbols[j]]
+            si, sj = returns_by_symbol[symbols[i]], returns_by_symbol[symbols[j]]
             common = sorted(set(si) & set(sj))
             if len(common) < 20:
                 continue
@@ -331,7 +346,8 @@ def get_lookup(symbol):
         symbol (str): Partial symbol or company name to search.
 
     Returns:
-        dict: {symbol, matches: [{symbol, name, sector, industry, exchange}, ...]} or {_error: message}.
+        dict: {symbol, matches: [{symbol, name, sector, industry, exchange}, ...]}
+            or {_error: message}.
     """
     key = f"lu:{symbol.upper()}"
     cached = cache_get(key)
@@ -342,15 +358,15 @@ def get_lookup(symbol):
     out = {"symbol": symbol, "matches": []}
     try:
         data = json.loads(fetch_yahoo(url))
-        for q in data.get("quotes", []):
-            if q.get("quoteType") != "EQUITY":
+        for quote in data.get("quotes", []):
+            if quote.get("quoteType") != "EQUITY":
                 continue
             out["matches"].append({
-                "symbol": q.get("symbol"),
-                "name": q.get("longname") or q.get("shortname"),
-                "sector": q.get("sector"),
-                "industry": q.get("industry"),
-                "exchange": q.get("exchDisp"),
+                "symbol": quote.get("symbol"),
+                "name": quote.get("longname") or quote.get("shortname"),
+                "sector": quote.get("sector"),
+                "industry": quote.get("industry"),
+                "exchange": quote.get("exchDisp"),
             })
     except json.JSONDecodeError as e:
         out["_error"] = f"Failed to parse search results: {e}"
@@ -399,15 +415,16 @@ def _parse_chain(symbol, raw):
     call_vol = put_vol = 0.0
     data = json.loads(raw)
     body = data.get("data") or {}
-    for o in body.get("options", []):
-        vol = o.get("volume") or 0
+    today = dt.date.today()  # one call per chain, not once per contract (chains run 100s of rows)
+    for opt in body.get("options", []):
+        vol = opt.get("volume") or 0
         if not vol:
             continue
-        parsed = _parse_occ_symbol(o.get("option", ""))
+        parsed = _parse_occ_symbol(opt.get("option", ""))
         if not parsed:
             continue
         root, exp, cp, strike = parsed
-        dte = (exp - dt.date.today()).days
+        dte = (exp - today).days
         if cp == "C":
             call_vol += vol
         else:
@@ -419,11 +436,11 @@ def _parse_chain(symbol, raw):
             "expiry": exp.isoformat(),
             "dte": dte,
             "volume": int(vol),
-            "oi": int(o.get("open_interest") or 0),
-            "last": o.get("last_trade_price"),
-            "iv": round((o.get("iv") or 0) * 100, 1),
-            "bid": o.get("bid"),
-            "ask": o.get("ask"),
+            "oi": int(opt.get("open_interest") or 0),
+            "last": opt.get("last_trade_price"),
+            "iv": round((opt.get("iv") or 0) * 100, 1),
+            "bid": opt.get("bid"),
+            "ask": opt.get("ask"),
         })
     return contracts, call_vol, put_vol
 
@@ -449,8 +466,8 @@ def _fetch_chain(symbol):
         raw = fetch(url, timeout=20)
         # capture the feed's own timestamp for the "as of" line
         ts = json.loads(raw).get("timestamp")
-        contracts, cv, pv = _parse_chain(symbol, raw)
-        result = {"contracts": contracts, "call_vol": cv, "put_vol": pv, "ts": ts}
+        contracts, call_vol, put_vol = _parse_chain(symbol, raw)
+        result = {"contracts": contracts, "call_vol": call_vol, "put_vol": put_vol, "ts": ts}
     except (urllib.error.URLError, IOError, json.JSONDecodeError, KeyError, ValueError):
         # Dead symbol or parsing error shouldn't kill the board; return empty result
         result = {"contracts": [], "call_vol": 0.0, "put_vol": 0.0, "ts": None}
@@ -469,19 +486,25 @@ def get_active_options(symbols, top=25):
         dict: {as_of, delayed, market_pcr, total_call, total_put, underlyings, contracts, note}.
     """
     symbols = symbols[:MAX_API_SYMBOLS]  # bound outbound CBOE fan-out per request
+    # A negative top is not "no limit" or an error -- Python's `list[:top]`
+    # silently interprets it as "drop the last |top| items", which for
+    # top=-1 returns nearly the whole board while the caller asked for "the
+    # most active contracts" and got something unrelated to that count back.
+    # Clamp to a real count so the contract is "at most `top` results," full stop.
+    top = max(top, 0)
     key = "oa:" + ",".join(sorted(symbols)) + f":{top}"
     cached = cache_get(key)
     if cached is not None:
         return cached
     all_contracts = []
-    unders = {}
+    underlying_stats = {}
     as_of = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         for sym, res in zip(symbols, executor.map(_fetch_chain, symbols)):
             all_contracts.extend(res["contracts"])
             tot = res["call_vol"] + res["put_vol"]
             if tot > 0:
-                unders[sym] = {
+                underlying_stats[sym] = {
                     "underlying": sym,
                     "callVol": int(res["call_vol"]),
                     "putVol": int(res["put_vol"]),
@@ -490,7 +513,7 @@ def get_active_options(symbols, top=25):
                 }
             as_of = as_of or res["ts"]
     all_contracts.sort(key=lambda c: c["volume"], reverse=True)
-    board = sorted(unders.values(), key=lambda u: u["totalVol"], reverse=True)
+    board = sorted(underlying_stats.values(), key=lambda u: u["totalVol"], reverse=True)
     total_call = sum(u["callVol"] for u in board)
     total_put = sum(u["putVol"] for u in board)
     out = {
@@ -525,6 +548,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_file(self, path):
         full = os.path.normpath(os.path.join(BASE_DIR, path.lstrip("/")))
+        # BASE_DIR is the project directory itself (server.py's own folder), which
+        # for a git checkout also contains .git/ -- the containment check below
+        # only proves a path stays under BASE_DIR, not that it's meant to be
+        # public. Without this, GET /.git/config (or /.git/HEAD, /.env, etc.)
+        # passes containment and isfile cleanly and would hand back the repo's
+        # full history / any dotfile secrets over plain HTTP.
+        if has_hidden_component(BASE_DIR, full):
+            self.send_error(404)
+            return
         if not is_within_dir(BASE_DIR, full) or not os.path.isfile(full):
             self.send_error(404)
             return
@@ -540,29 +572,73 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    @staticmethod
+    def _qparam(query, name, default=""):
+        """Return the first value of a urllib.parse.parse_qs() query param, or `default`.
+
+        Every query param in this handler comes back from parse_qs() as a
+        list (it supports repeated keys, which none of these endpoints use),
+        so every call site was repeating the same `query.get(name, [default])[0]`
+        shape. Centralizing it here means that shape is defined once instead
+        of six times, and a future param that DOES need repeated-key handling
+        has one obvious place to special-case.
+        """
+        return query.get(name, [default])[0]
+
+    @staticmethod
+    def _qsymbols(query, default=()):
+        """Parse a comma-separated `symbols` query param into a clean list.
+
+        Filters out empty entries so a trailing comma or an empty param
+        value (?symbols=) doesn't produce a spurious "" ticker.
+        """
+        raw = Handler._qparam(query, "symbols")
+        syms = [s for s in raw.split(",") if s]
+        return syms if syms else list(default)
+
+    def _api_quotes(self, query):
+        syms = self._qsymbols(query)
+        return get_quotes(syms) if syms else {}
+
+    def _api_history(self, query):
+        sym = self._qparam(query, "symbol")
+        rng = self._qparam(query, "range", "6mo")
+        return get_history(sym, rng) if sym else {"_error": "no symbol"}
+
+    def _api_correlation(self, query):
+        syms = self._qsymbols(query)
+        rng = self._qparam(query, "range", "6mo")
+        return (get_correlation(syms, rng) if len(syms) >= 2
+                else {"_error": "need >=2 symbols"})
+
+    def _api_lookup(self, query):
+        sym = self._qparam(query, "symbol")
+        return get_lookup(sym) if sym else {"_error": "no symbol"}
+
+    def _api_options_active(self, query):
+        syms = self._qsymbols(query, default=OPTION_SCAN)
+        top = int(self._qparam(query, "top", "25"))
+        return get_active_options(syms, top)
+
+    # path -> (self, query) -> response-dict. Keeps do_GET itself pure routing:
+    # "which endpoint is this" is separated from "how is its response computed",
+    # so a new endpoint adds one table row and one small method instead of
+    # another branch in a growing if/elif chain that used to mix both concerns.
+    _API_ROUTES = {
+        "/api/quotes": _api_quotes,
+        "/api/history": _api_history,
+        "/api/correlation": _api_correlation,
+        "/api/lookup": _api_lookup,
+        "/api/options/active": _api_options_active,
+    }
+
     def do_GET(self):
         parsed_url = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed_url.query)
         try:
-            if parsed_url.path == "/api/quotes":
-                syms = [s for s in (query.get("symbols", [""])[0]).split(",") if s]
-                self._send_json(get_quotes(syms) if syms else {})
-            elif parsed_url.path == "/api/history":
-                sym = (query.get("symbol", [""])[0])
-                rng = (query.get("range", ["6mo"])[0])
-                self._send_json(get_history(sym, rng) if sym else {"_error": "no symbol"})
-            elif parsed_url.path == "/api/correlation":
-                syms = [s for s in (query.get("symbols", [""])[0]).split(",") if s]
-                rng = (query.get("range", ["6mo"])[0])
-                self._send_json(get_correlation(syms, rng) if len(syms) >= 2
-                                 else {"_error": "need >=2 symbols"})
-            elif parsed_url.path == "/api/lookup":
-                sym = (query.get("symbol", [""])[0])
-                self._send_json(get_lookup(sym) if sym else {"_error": "no symbol"})
-            elif parsed_url.path == "/api/options/active":
-                syms = [s for s in (query.get("symbols", [""])[0]).split(",") if s] or OPTION_SCAN
-                top = int(query.get("top", ["25"])[0])
-                self._send_json(get_active_options(syms, top))
+            handler = self._API_ROUTES.get(parsed_url.path)
+            if handler is not None:
+                self._send_json(handler(self, query))
             elif parsed_url.path in ("/", ""):
                 self._send_file("index.html")
             else:
@@ -593,7 +669,18 @@ def main():
     parser.add_argument("--port", type=int, default=8474)
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as e:
+        # The common case here is "Address already in use" (another cascade
+        # instance, or anything else, already holds the port) -- binding
+        # happens in the constructor, so an unguarded call surfaces as a raw
+        # traceback pointing at socket internals instead of telling the user
+        # what to actually do about it.
+        print(f"Could not start server on {args.host}:{args.port}: {e}", file=sys.stderr)
+        print(f"  Is another instance already running? "
+              f"Try: python server.py --port {args.port + 1}", file=sys.stderr)
+        sys.exit(1)
     print(f"CASCADE proxy on http://{args.host}:{args.port}  (Ctrl+C to stop)")
     print(f"  static : {BASE_DIR}")
     print(f"  quotes : Yahoo spark   |  options : CBOE delayed  |  data is DELAYED")
