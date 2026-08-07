@@ -93,6 +93,10 @@ button.badge:hover { border-color: rgba(255,255,255,0.28); }
 
 /* ================= layout ================= */
 main { flex: 1; display: grid; grid-template-columns: 236px 1fr 560px; min-height: 0; }
+/* Snipe is a dense 13-column table, not a narrow info panel — when it's the
+   active tab, shrink the network graph down to a strip and let the table
+   claim the rest of the window so wide contract rows never need to scroll. */
+main.snipe-active { grid-template-columns: 236px minmax(200px, 300px) minmax(760px, 1fr); }
 .panel { background: var(--surface-1); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
 .panel-title {
   font-size: 10px; letter-spacing: 1.6px; color: var(--ink-muted);
@@ -1400,6 +1404,7 @@ tabs.forEach(b=>b.addEventListener("click",()=>{
   tabs.forEach(x=>x.classList.toggle("on",x===b));
   document.querySelectorAll(".tab-page").forEach(p=>p.classList.remove("on"));
   document.getElementById("tab-"+b.dataset.tab).classList.add("on");
+  document.querySelector("main").classList.toggle("snipe-active", b.dataset.tab==="snipe");
   if(b.dataset.tab==="matrix") drawMatrix();
   if(b.dataset.tab==="flow" && !flowLoaded && !flowLoading) fetchFlow();
   if(b.dataset.tab==="snipe" && !snipeLoaded && !snipeLoading) fetchSnipe();
@@ -2202,7 +2207,10 @@ setTimeout(()=>{
 setLiveStatus("connecting");
 startLive();
 if(qp.get("tab")==="flow") fetchFlow();
-if(qp.get("tab")==="snipe") fetchSnipe();
+if(qp.get("tab")==="snipe"){
+  document.querySelector("main").classList.add("snipe-active");
+  fetchSnipe();
+}
 </script>
 </body>
 </html>
