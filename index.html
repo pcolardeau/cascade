@@ -365,6 +365,10 @@ table.opt tr.body:hover { background: var(--surface-3); cursor: pointer; }
 .snipe-tier.A { color: var(--up); border-color: var(--up); background: rgba(12,163,12,0.14); }
 .snipe-tier.B { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
 .snipe-tier.C { color: var(--down); border-color: var(--down); background: rgba(230,103,103,0.15); }
+.snipe-score { font-weight: 800; }
+.snipe-score.hi { color: var(--up); }
+.snipe-score.mid { color: var(--accent); }
+.snipe-score.lo { color: var(--down); }
 
 /* matrix */
 #matrix-wrap { position: relative; }
@@ -2135,10 +2139,10 @@ function renderSnipe(){
     box.append(e);
   } else {
     const cc=document.createElement("div"); cc.className="contracts";
-    const ch=document.createElement("h3"); ch.textContent="Candidates · tier A first, tightest spread first"; cc.append(ch);
+    const ch=document.createElement("h3"); ch.textContent="Candidates · ranked by Snipe Score (probability + banked flat-P&L + tight spread)"; cc.append(ch);
     const tbl=document.createElement("table"); tbl.className="opt";
     const hr=document.createElement("tr");
-    for(const t of ["Ticker","Type","Strike","Δ","Spread%","Bid/Ask","Cost $","Breakeven","Cushion%","P&L Down","P&L Flat","P&L Up","Tier"]){
+    for(const t of ["Ticker","Type","Score","Strike","Δ","Spread%","Bid/Ask","Cost $","Breakeven","Cushion%","P&L Down","P&L Flat","P&L Up","Tier"]){
       const th=document.createElement("th"); th.textContent=t; hr.append(th);
     }
     tbl.append(hr);
@@ -2152,6 +2156,12 @@ function renderSnipe(){
 
       const td2=document.createElement("td");
       const cp=document.createElement("span"); cp.className="cp "+o.type; cp.textContent=o.type; td2.append(cp);
+
+      const tdScore=document.createElement("td"); tdScore.className="num";
+      const scoreBand = o.score>=70?"hi":o.score>=40?"mid":"lo";
+      const scoreSpan=document.createElement("span"); scoreSpan.className="snipe-score "+scoreBand;
+      scoreSpan.textContent = o.score!=null ? o.score.toFixed(0) : "—";
+      tdScore.append(scoreSpan);
 
       const td3=document.createElement("td"); td3.className="num"; td3.textContent=o.strike.toFixed(o.strike>=100?0:2);
       const td4=document.createElement("td"); td4.className="num"; td4.textContent=o.delta!=null?o.delta.toFixed(2):"—";
@@ -2173,7 +2183,7 @@ function renderSnipe(){
       const tier=document.createElement("span"); tier.className="snipe-tier "+o.tier; tier.textContent=o.tier;
       td13.append(tier);
 
-      tr.append(td1,td2,td3,td4,td5,td6,td7,td8,td9,td10,td11,td12,td13);
+      tr.append(td1,td2,tdScore,td3,td4,td5,td6,td7,td8,td9,td10,td11,td12,td13);
       if(fromY[o.underlying]!=null) tr.addEventListener("click",()=>selectNode(fromY[o.underlying]));
       tbl.append(tr);
     }

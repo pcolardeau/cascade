@@ -572,6 +572,53 @@ def _itm_scan_tier(spread_pct, delta, moneyness_pct):
     return "B"
 
 
+# Snipe Score weights/ranges -- named here so they're one place to retune
+# instead of magic numbers buried in the scoring formula.
+_SCORE_PROB_WEIGHT = 0.40     # how much "will this finish ITM" (delta) counts
+_SCORE_BANKED_WEIGHT = 0.35   # how much "already profitable if flat" counts
+_SCORE_COST_WEIGHT = 0.25     # how much "tight spread" counts
+_SCORE_DELTA_FLOOR = 0.70     # |delta| at/below this scores 0 on probability
+_SCORE_DELTA_CEIL = 1.00      # |delta| at/above this scores 1 on probability
+_SCORE_FLAT_PNL_FLOOR = -0.10  # flat P&L% at/below this scores 0 on "banked"
+_SCORE_FLAT_PNL_CEIL = 0.05    # flat P&L% at/above this scores 1 on "banked"
+_SCORE_SPREAD_CEIL = 0.20      # spread% at/above this scores 0 on cost
+
+
+def _clamp01(x):
+    return max(0.0, min(1.0, x))
+
+
+def _itm_scan_score(delta, spread_pct, flat_pnl_pct):
+    """0-100 "Snipe Score" -- ranks contracts by how likely they are to hand
+    back a small, repeatable profit, NOT by raw dollar payoff or moneyness
+    alone. The strategy's own goal is "high probability of cashing even a
+    small profit," so the score is built from exactly those three signals:
+
+      - probability (40%): |delta|, the market's own estimate of finishing
+        ITM, scaled from 0.70 (score 0) to 1.00 (score 1). This is what makes
+        wins repeatable instead of a coin flip.
+      - banked profit (35%): the FLAT-scenario P&L% (spot doesn't move at
+        all). This is the single best "cashing even a small profit" signal --
+        it answers "am I already at or near breakeven without betting on any
+        move," scaled from -10% (score 0) to +5% (score 1).
+      - cost efficiency (25%): spread_pct, inverted and scaled 0%->1,
+        20%->0. A wide bid/ask is paid TWICE (entry and exit) and can turn a
+        contract that looks profitable on paper into a net loser in practice.
+
+    Each sub-score is clamped to [0,1] before weighting, so one extreme input
+    (e.g. a very negative flat P&L on a thin, expensive contract) can't drag
+    the total negative or let a single factor swamp the other two.
+    """
+    prob = _clamp01((abs(delta or 0) - _SCORE_DELTA_FLOOR) /
+                     (_SCORE_DELTA_CEIL - _SCORE_DELTA_FLOOR))
+    banked = _clamp01((flat_pnl_pct - _SCORE_FLAT_PNL_FLOOR) /
+                       (_SCORE_FLAT_PNL_CEIL - _SCORE_FLAT_PNL_FLOOR))
+    cost = _clamp01(1 - (spread_pct if spread_pct is not None else 1.0) / _SCORE_SPREAD_CEIL)
+    return round(100 * (_SCORE_PROB_WEIGHT * prob +
+                         _SCORE_BANKED_WEIGHT * banked +
+                         _SCORE_COST_WEIGHT * cost), 1)
+
+
 def get_itm_scan(symbols=None, down_pct=-0.005, flat_pct=0.0, up_pct=0.005, top=20):
     """Scan SNIPE_SCAN underlyings for 0DTE deep-ITM "sniping" candidates.
 
@@ -654,6 +701,8 @@ def get_itm_scan(symbols=None, down_pct=-0.005, flat_pct=0.0, up_pct=0.005, top=
                     "pnl_pct": round(pnl_dollars / contract_cost, 4),
                 }
 
+            score = _itm_scan_score(delta, spread_pct, scenario_out["flat"]["pnl_pct"])
+
             all_contracts.append({
                 "underlying": c.get("underlying"),
                 "type": typ,
@@ -671,6 +720,7 @@ def get_itm_scan(symbols=None, down_pct=-0.005, flat_pct=0.0, up_pct=0.005, top=
                 "spread_pct": round(spread_pct, 4) if spread_pct is not None else None,
                 "moneyness_pct": round(moneyness_pct, 4),
                 "tier": tier,
+                "score": score,
                 "contract_cost": round(contract_cost, 2),
                 "max_loss": round(contract_cost, 2),  # 1 long contract: max loss == entry cost
                 "breakeven": round(breakeven, 4),
@@ -678,13 +728,19 @@ def get_itm_scan(symbols=None, down_pct=-0.005, flat_pct=0.0, up_pct=0.005, top=
                 "scenarios": scenario_out,
             })
 
-    # Tier A first, then tightest spread first within/across tiers.
-    all_contracts.sort(key=lambda c: (c["tier"] != "A", c["spread_pct"]))
+    # Ranked by Snipe Score (highest first) -- see _itm_scan_score for what
+    # that rewards: high probability of finishing ITM, already profitable
+    # (or close to it) if the underlying just sits still, and a spread tight
+    # enough not to eat the edge on entry+exit. This replaces a plain
+    # "tier then spread" sort with something that actually targets the
+    # strategy's goal (small, repeatable wins) rather than just liquidity.
+    all_contracts.sort(key=lambda c: c["score"], reverse=True)
     out = {
         "as_of": as_of,
         "delayed": True,
-        "note": ("CBOE delayed ~15min. Screening tool, not a trade recommendation. "
-                 "No trades are placed automatically."),
+        "note": ("CBOE delayed ~15min. Ranked by Snipe Score (probability + "
+                 "banked flat-scenario profit + spread cost). Screening tool, "
+                 "not a trade recommendation. No trades are placed automatically."),
         "contracts": all_contracts[:top],
     }
     cache_put(key, out, ttl=90)

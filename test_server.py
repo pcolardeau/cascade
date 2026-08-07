@@ -728,6 +728,56 @@ class ItmScanTierTests(unittest.TestCase):
         self.assertEqual(server._itm_scan_tier(0.20, 0.9, 0.05), "A")
 
 
+class ItmScanScoreTests(unittest.TestCase):
+    """Tests for _itm_scan_score(), the Snipe board's ranking metric.
+
+    Score = 40% probability (|delta|, 0.70->1.00) + 35% banked profit (flat
+    P&L%, -10%->+5%) + 25% cost efficiency (spread%, inverted, 0%->20%),
+    each sub-score clamped to [0,1] before weighting.
+    """
+    def test_perfect_inputs_score_100(self):
+        self.assertEqual(server._itm_scan_score(delta=1.0, spread_pct=0.0, flat_pnl_pct=0.05), 100.0)
+
+    def test_worst_inputs_score_0(self):
+        self.assertEqual(server._itm_scan_score(delta=0.70, spread_pct=0.20, flat_pnl_pct=-0.10), 0.0)
+
+    def test_beyond_range_inputs_still_clamp_to_0_or_100(self):
+        """Inputs past the modeled range in either direction (e.g. a delta
+        above 1.0, which CBOE shouldn't send but the function must still
+        handle) must clamp, not extrapolate past 0/100."""
+        self.assertEqual(server._itm_scan_score(delta=1.5, spread_pct=-0.10, flat_pnl_pct=0.20), 100.0)
+        self.assertEqual(server._itm_scan_score(delta=0.60, spread_pct=0.50, flat_pnl_pct=-0.50), 0.0)
+
+    def test_missing_delta_scores_as_zero_probability(self):
+        self.assertEqual(
+            server._itm_scan_score(delta=None, spread_pct=0.05, flat_pnl_pct=0.0),
+            server._itm_scan_score(delta=0.0, spread_pct=0.05, flat_pnl_pct=0.0),
+        )
+
+    def test_missing_spread_scores_as_worst_case_cost(self):
+        """A None spread can't be measured and must NOT be silently rewarded
+        as if it were free -- score it as the worst-case (ceiling) spread."""
+        self.assertEqual(
+            server._itm_scan_score(delta=0.9, spread_pct=None, flat_pnl_pct=0.0),
+            server._itm_scan_score(delta=0.9, spread_pct=0.20, flat_pnl_pct=0.0),
+        )
+
+    def test_higher_delta_scores_higher_all_else_equal(self):
+        lo = server._itm_scan_score(delta=0.80, spread_pct=0.05, flat_pnl_pct=0.0)
+        hi = server._itm_scan_score(delta=0.95, spread_pct=0.05, flat_pnl_pct=0.0)
+        self.assertGreater(hi, lo)
+
+    def test_higher_flat_pnl_scores_higher_all_else_equal(self):
+        lo = server._itm_scan_score(delta=0.90, spread_pct=0.05, flat_pnl_pct=-0.08)
+        hi = server._itm_scan_score(delta=0.90, spread_pct=0.05, flat_pnl_pct=0.02)
+        self.assertGreater(hi, lo)
+
+    def test_tighter_spread_scores_higher_all_else_equal(self):
+        wide = server._itm_scan_score(delta=0.90, spread_pct=0.15, flat_pnl_pct=0.0)
+        tight = server._itm_scan_score(delta=0.90, spread_pct=0.02, flat_pnl_pct=0.0)
+        self.assertGreater(tight, wide)
+
+
 def _snipe_contract(**overrides):
     """Build one CBOE-shaped 0DTE contract dict for get_itm_scan() tests,
     with sane ITM-call defaults that individual tests override."""
@@ -801,14 +851,26 @@ class GetItmScanTests(NetworkFreeTestCase):
         out = server.get_itm_scan(["SPY"])
         self.assertEqual(out["contracts"], [])
 
-    def test_tier_a_sorts_before_tier_b_regardless_of_spread(self):
-        """Sort is tier-A-first, then spread ascending -- a tighter-spread
-        tier-B contract must still rank behind a wider-spread tier-A one."""
-        tier_b = _snipe_contract(strike=497.0, bid=2.9, ask=3.0, delta=0.5)  # tight spread, low delta/moneyness -> B
-        tier_a = _snipe_contract(strike=480.0, bid=19.0, ask=21.0, delta=0.95)  # wider spread, high delta -> A
-        self._patch(500.0, [tier_b, tier_a])
+    def test_ranked_by_score_descending(self):
+        """Sort key is the Snipe Score (probability + banked flat P&L + cost
+        efficiency), not raw tier-then-spread. A low-delta contract with a
+        tight spread must still rank BEHIND a high-delta one with a wider
+        spread, because probability carries the heaviest weight (40%) --
+        same scenario the old tier-then-spread sort covered, re-asserted
+        against the score field instead of the tier field."""
+        low_delta_tight_spread = _snipe_contract(strike=497.0, bid=2.9, ask=3.0, delta=0.5)
+        high_delta_wider_spread = _snipe_contract(strike=480.0, bid=19.0, ask=21.0, delta=0.95)
+        self._patch(500.0, [low_delta_tight_spread, high_delta_wider_spread])
         out = server.get_itm_scan(["SPY"])
-        self.assertEqual([c["tier"] for c in out["contracts"]], ["A", "B"])
+        scores = [c["score"] for c in out["contracts"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertEqual(out["contracts"][0]["delta"], 0.95)
+
+    def test_contract_includes_score_field(self):
+        self._patch(500.0, [_snipe_contract()])
+        out = server.get_itm_scan(["SPY"])
+        self.assertIn("score", out["contracts"][0])
+        self.assertIsInstance(out["contracts"][0]["score"], float)
 
     def test_top_limits_total_contracts_returned(self):
         contracts = [_snipe_contract(strike=490.0 - i) for i in range(5)]
