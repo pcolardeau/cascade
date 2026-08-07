@@ -19,6 +19,12 @@ API-key headaches:
                volume / open interest / IV / greeks. ~15-min delayed. This is
                "most ACTIVE" (by traded volume), not "most PURCHASED" — free
                feeds do not classify buy vs sell trade side.
+  * Snipe    — 0DTE deep-ITM screening board (SPY/QQQ/IWM) built on the same
+               CBOE chain data: filters to same-day-expiry, in-the-money
+               contracts with a live bid/ask and scores each one's spread,
+               moneyness/delta tier, and a 1-contract execution model
+               (breakeven, P&L at a few spot-move scenarios). Screening tool
+               only — it never places or simulates placing an order.
 
 Run:  python server.py                (defaults to port 8474)
       python server.py --port 9000
@@ -80,6 +86,18 @@ OPTION_SCAN = [
     "GOOGL", "MU", "JPM", "BAC", "XOM", "UNH", "LLY", "BA", "WMT", "GE", "AVGO",
     "COIN", "PLTR", "SMCI",
 ]
+
+# Underlyings scanned for the "Snipe" 0DTE deep-ITM board. Deliberately a
+# small, dedicated list rather than reusing OPTION_SCAN: SPY/QQQ/IWM are the
+# names that reliably list same-day expiries every trading day. SPX was
+# evaluated and deliberately left out -- CBOE's delayed-quotes endpoint 403s
+# on plain "SPX" and requires the undocumented "_SPX" alias to resolve, that
+# alias reports its underlying as "^SPX" (not "SPX", which would need its own
+# Yahoo-quote symbol mapping for spot price), and a live probe of that chain
+# found zero same-day-expiry contracts despite being fetched on a Friday
+# (SPX's own M/W/F 0DTE cadence), so plumbing it in couldn't even be verified
+# end-to-end. Add it later if CBOE's index-option support turns out sturdier.
+SNIPE_SCAN = ["SPY", "QQQ", "IWM"]
 
 # Hard cap on how many symbols a single API request may fan out to, so a
 # crafted ?symbols=... list can't trigger an unbounded burst of outbound
@@ -441,6 +459,8 @@ def _parse_chain(symbol, raw):
             "iv": round((opt.get("iv") or 0) * 100, 1),
             "bid": opt.get("bid"),
             "ask": opt.get("ask"),
+            "delta": opt.get("delta"),  # signed: negative for puts, kept as-is (not abs'd)
+            "theta": opt.get("theta"),
         })
     return contracts, call_vol, put_vol
 
@@ -527,6 +547,147 @@ def get_active_options(symbols, top=25):
         "contracts": all_contracts[:top],
     }
     cache_put(key, out, ttl=120)
+    return out
+
+
+def _itm_scan_tier(spread_pct, delta, moneyness_pct):
+    """Classify one 0DTE deep-ITM contract into the Snipe board's A/B/C tier.
+
+    C: spread_pct > 20% -- the bid/ask gap alone can eat the whole edge on a
+       small test trade, regardless of how deep ITM the contract is.
+    A: everything else that's either high-confidence by delta (>=0.85, i.e.
+       priced by the market as very likely to expire ITM) OR far enough ITM
+       by raw moneyness (>=0.8%) to use as a fallback probability proxy.
+       The fallback exists because an earlier web-scrape prototype of this
+       same strategy sometimes reported delta==0 on very-deep-ITM contracts
+       (a site artifact, not a real 0 delta) -- CBOE's own feed shouldn't
+       have that problem, but the belt-and-suspenders check costs nothing.
+    B: everything remaining (tradeable spread, but neither signal clears
+       the tier-A bar).
+    """
+    if spread_pct is None or spread_pct > 0.20:
+        return "C"
+    if abs(delta or 0) >= 0.85 or moneyness_pct >= 0.008:
+        return "A"
+    return "B"
+
+
+def get_itm_scan(symbols=None, down_pct=-0.005, flat_pct=0.0, up_pct=0.005, top=20):
+    """Scan SNIPE_SCAN underlyings for 0DTE deep-ITM "sniping" candidates.
+
+    For each same-day-expiry, in-the-money contract with a real two-sided
+    market, compute the CBOE-delayed screening metrics (spread, moneyness,
+    tier) and a simple 1-contract execution model (entry at ask, breakeven,
+    P&L at three spot-move scenarios). This is a screening/analysis tool --
+    it never places or simulates placing an order.
+
+    Args:
+        symbols (list): Underlyings to scan. Defaults to SNIPE_SCAN.
+        down_pct, flat_pct, up_pct (float): Spot-move scenarios to price P&L
+            at, e.g. -0.005 = -0.5%. Exposed as params so the UI can later
+            let a user tune them; defaults model a quiet 0DTE session.
+        top (int): Max contracts to return across all symbols, ranked
+            tier-A-first then by spread ascending. Defaults to 20.
+
+    Returns:
+        dict: {as_of, delayed, note, contracts}.
+    """
+    if symbols is None:
+        symbols = SNIPE_SCAN
+    symbols = symbols[:MAX_API_SYMBOLS]  # bound outbound fan-out per request
+    top = max(top, 0)  # see get_active_options' identical guard: top=-1 must mean 0, not "all but last"
+    key = ("itm:" + ",".join(sorted(symbols)) +
+           f":{top}:{down_pct}:{flat_pct}:{up_pct}")
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    quotes = get_quotes(symbols)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        chains = dict(zip(symbols, executor.map(_fetch_chain, symbols)))
+
+    scenarios = (("down", down_pct), ("flat", flat_pct), ("up", up_pct))
+    all_contracts = []
+    as_of = None
+    for sym in symbols:
+        res = chains.get(sym) or {}
+        as_of = as_of or res.get("ts")
+        spot = (quotes.get(sym) or {}).get("price")
+        if not spot:
+            continue  # can't score moneyness/breakeven/P&L without a spot price
+        for c in res.get("contracts", []):
+            if c.get("dte") != 0:
+                continue
+            strike, typ = c.get("strike"), c.get("type")
+            is_itm = (typ == "C" and strike < spot) or (typ == "P" and strike > spot)
+            if not is_itm:
+                continue
+            bid, ask = c.get("bid"), c.get("ask")
+            if bid is None or ask is None or bid <= 0 or ask <= 0:
+                continue  # spread math needs a real two-sided market
+
+            mid = (bid + ask) / 2
+            spread_pct = (ask - bid) / mid if mid else None
+            moneyness_pct = ((spot - strike) / spot if typ == "C"
+                              else (strike - spot) / spot)
+            delta = c.get("delta")
+            tier = _itm_scan_tier(spread_pct, delta, moneyness_pct)
+
+            contract_cost = ask * 100
+            if typ == "C":
+                breakeven = strike + ask
+                breakeven_cushion_pct = (spot - breakeven) / spot
+            else:
+                breakeven = strike - ask
+                breakeven_cushion_pct = (breakeven - spot) / spot
+
+            scenario_out = {}
+            for name, move_pct in scenarios:
+                scenario_price = spot * (1 + move_pct)
+                intrinsic = (max(0.0, scenario_price - strike) if typ == "C"
+                             else max(0.0, strike - scenario_price))
+                pnl_dollars = (intrinsic - ask) * 100
+                scenario_out[name] = {
+                    "move_pct": move_pct,
+                    "scenario_price": round(scenario_price, 2),
+                    "pnl_dollars": round(pnl_dollars, 2),
+                    "pnl_pct": round(pnl_dollars / contract_cost, 4),
+                }
+
+            all_contracts.append({
+                "underlying": c.get("underlying"),
+                "type": typ,
+                "strike": strike,
+                "expiry": c.get("expiry"),
+                "dte": c.get("dte"),
+                "bid": bid,
+                "ask": ask,
+                "volume": c.get("volume"),
+                "oi": c.get("oi"),
+                "iv": c.get("iv"),
+                "delta": delta,
+                "spot": spot,
+                "mid": round(mid, 4),
+                "spread_pct": round(spread_pct, 4) if spread_pct is not None else None,
+                "moneyness_pct": round(moneyness_pct, 4),
+                "tier": tier,
+                "contract_cost": round(contract_cost, 2),
+                "max_loss": round(contract_cost, 2),  # 1 long contract: max loss == entry cost
+                "breakeven": round(breakeven, 4),
+                "breakeven_cushion_pct": round(breakeven_cushion_pct, 4),
+                "scenarios": scenario_out,
+            })
+
+    # Tier A first, then tightest spread first within/across tiers.
+    all_contracts.sort(key=lambda c: (c["tier"] != "A", c["spread_pct"]))
+    out = {
+        "as_of": as_of,
+        "delayed": True,
+        "note": ("CBOE delayed ~15min. Screening tool, not a trade recommendation. "
+                 "No trades are placed automatically."),
+        "contracts": all_contracts[:top],
+    }
+    cache_put(key, out, ttl=90)
     return out
 
 
@@ -620,6 +781,14 @@ class Handler(BaseHTTPRequestHandler):
         top = int(self._qparam(query, "top", "25"))
         return get_active_options(syms, top)
 
+    def _api_options_itm_scan(self, query):
+        syms = self._qsymbols(query, default=SNIPE_SCAN)
+        top = int(self._qparam(query, "top", "20"))
+        down = float(self._qparam(query, "down", "-0.005"))
+        flat = float(self._qparam(query, "flat", "0.0"))
+        up = float(self._qparam(query, "up", "0.005"))
+        return get_itm_scan(syms, down, flat, up, top)
+
     # path -> (self, query) -> response-dict. Keeps do_GET itself pure routing:
     # "which endpoint is this" is separated from "how is its response computed",
     # so a new endpoint adds one table row and one small method instead of
@@ -630,6 +799,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/correlation": _api_correlation,
         "/api/lookup": _api_lookup,
         "/api/options/active": _api_options_active,
+        "/api/options/itm-scan": _api_options_itm_scan,
     }
 
     def do_GET(self):

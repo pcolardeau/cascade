@@ -353,6 +353,15 @@ table.opt tr.body:hover { background: var(--surface-3); cursor: pointer; }
 .zdte { color: var(--accent); font-weight: 700; }
 .flow-note { color: var(--ink-muted); font-size: 10px; line-height: 1.5; margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--grid); }
 
+/* snipe (0DTE deep-ITM scan) */
+.snipe-tier {
+  display: inline-block; font-size: 9px; font-weight: 800; padding: 1px 6px; border-radius: 3px;
+  letter-spacing: 0.4px; border: 1px solid; text-align: center;
+}
+.snipe-tier.A { color: var(--up); border-color: var(--up); background: rgba(12,163,12,0.14); }
+.snipe-tier.B { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+.snipe-tier.C { color: var(--down); border-color: var(--down); background: rgba(230,103,103,0.15); }
+
 /* matrix */
 #matrix-wrap { position: relative; }
 #matrix { display: block; width: 100%; image-rendering: pixelated; border: 1px solid var(--border); border-radius: 4px; cursor: crosshair; }
@@ -434,11 +443,13 @@ footer b { color: var(--ink-2); font-weight: 600; }
       <button data-tab="cascade">Cascade</button>
       <button data-tab="flow">Flow</button>
       <button data-tab="matrix">Matrix</button>
+      <button data-tab="snipe">Snipe</button>
     </div>
     <div class="tab-body">
       <div class="tab-page on" id="tab-overview"></div>
       <div class="tab-page" id="tab-cascade"></div>
       <div class="tab-page" id="tab-flow"></div>
+      <div class="tab-page" id="tab-snipe"></div>
       <div class="tab-page" id="tab-matrix">
         <div class="panel-title" style="padding:0 0 8px" id="matrix-title">Cross-correlation · 250d daily returns</div>
         <div id="matrix-wrap"><canvas id="matrix"></canvas></div>
@@ -1391,6 +1402,7 @@ tabs.forEach(b=>b.addEventListener("click",()=>{
   document.getElementById("tab-"+b.dataset.tab).classList.add("on");
   if(b.dataset.tab==="matrix") drawMatrix();
   if(b.dataset.tab==="flow" && !flowLoaded && !flowLoading) fetchFlow();
+  if(b.dataset.tab==="snipe" && !snipeLoaded && !snipeLoading) fetchSnipe();
 }));
 
 /* ----- overview ----- */
@@ -2067,7 +2079,108 @@ function renderFlow(){
   box.append(note);
 }
 
-/* boot — deep-linkable via ?sel=TICKER&sel2=TICKER&tab=overview|cascade|flow|matrix&shock=-4&depth=2
+/* ============================================================================
+   SNIPE — 0DTE deep-ITM scanner + execution model (CBOE delayed chains)
+   Mirrors the Flow tab's fetch/render/refresh pattern exactly (same cadence,
+   same empty/loading states, same table conventions) against the new
+   /api/options/itm-scan endpoint. Read-only screening tool: it only ever
+   displays numbers computed server-side, never places or simulates an order.
+   ========================================================================== */
+let snipeData=null, snipeLoading=false, snipeLoaded=false;
+const fmtUsd = v => (v==null ? "—" : (v<0?"-":"")+"$"+Math.abs(v).toFixed(2));
+const fmtPct1 = v => v==null ? "—" : (v*100).toFixed(1)+"%";
+
+async function fetchSnipe(){
+  if(snipeLoading) return;
+  snipeLoading=true; renderSnipe();
+  try{ const r=await fetch("/api/options/itm-scan?top=20"); snipeData=await r.json(); snipeLoaded=true; }
+  catch(e){ snipeData={_error:String(e)}; }
+  snipeLoading=false; renderSnipe();
+}
+
+function renderSnipe(){
+  const box=document.getElementById("tab-snipe"); box.replaceChildren();
+
+  const top=document.createElement("div"); top.className="flow-top";
+  const left=document.createElement("div");
+  const k=document.createElement("div"); k.className="k"; k.textContent="0DTE deep-ITM snipe scan";
+  const ao=document.createElement("div"); ao.className="as-of";
+  ao.textContent = snipeData && snipeData.as_of ? ("CBOE delayed · as of "+snipeData.as_of) : "CBOE delayed feed · SPY / QQQ / IWM";
+  left.append(k,ao);
+  const rb=document.createElement("button"); rb.className="flow-refresh";
+  rb.textContent = snipeLoading ? "LOADING…" : "↻ REFRESH";
+  rb.disabled = snipeLoading; rb.addEventListener("click",()=>{ snipeLoaded=false; fetchSnipe(); });
+  top.append(left,rb); box.append(top);
+
+  if(snipeLoading && !snipeData){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="Scanning SPY / QQQ / IWM 0DTE chains for in-the-money candidates…";
+    box.append(e); return;
+  }
+  if(!snipeData || snipeData._error){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent = "Snipe feed unavailable"+(snipeData&&snipeData._error?" ("+snipeData._error+")":"")+". Is server.py running? Retry with ↻ Refresh.";
+    box.append(e); return;
+  }
+
+  const contracts = snipeData.contracts||[];
+  if(!contracts.length){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="No 0DTE in-the-money contracts with a live two-sided market right now — try again closer to the open, or refresh later in the session.";
+    box.append(e);
+  } else {
+    const cc=document.createElement("div"); cc.className="contracts";
+    const ch=document.createElement("h3"); ch.textContent="Candidates · tier A first, tightest spread first"; cc.append(ch);
+    const tbl=document.createElement("table"); tbl.className="opt";
+    const hr=document.createElement("tr");
+    for(const t of ["Ticker","Type","Strike","Δ","Spread%","Bid/Ask","Cost $","Breakeven","Cushion%","P&L Down","P&L Flat","P&L Up","Tier"]){
+      const th=document.createElement("th"); th.textContent=t; hr.append(th);
+    }
+    tbl.append(hr);
+    for(const o of contracts){
+      const tr=document.createElement("tr"); tr.className="body";
+
+      const td1=document.createElement("td");
+      const tk=document.createElement("span"); tk.className="opt-und"; tk.textContent=o.underlying;
+      if(fromY[o.underlying]!=null) tk.style.color=SECTOR_BY_ID[nodes[fromY[o.underlying]].sector].hex;
+      tk.style.fontWeight="700"; td1.append(tk);
+
+      const td2=document.createElement("td");
+      const cp=document.createElement("span"); cp.className="cp "+o.type; cp.textContent=o.type; td2.append(cp);
+
+      const td3=document.createElement("td"); td3.className="num"; td3.textContent=o.strike.toFixed(o.strike>=100?0:2);
+      const td4=document.createElement("td"); td4.className="num"; td4.textContent=o.delta!=null?o.delta.toFixed(2):"—";
+      const td5=document.createElement("td"); td5.className="num"; td5.textContent=fmtPct1(o.spread_pct);
+      const td6=document.createElement("td"); td6.className="num"; td6.textContent=o.bid.toFixed(2)+" / "+o.ask.toFixed(2);
+      const td7=document.createElement("td"); td7.className="num"; td7.textContent=fmtUsd(o.contract_cost);
+      const td8=document.createElement("td"); td8.className="num"; td8.textContent=o.breakeven.toFixed(2);
+      const td9=document.createElement("td"); td9.className="num"; td9.textContent=fmtPct1(o.breakeven_cushion_pct);
+
+      const sc = o.scenarios||{};
+      const td10=document.createElement("td"); td10.className="num"; td10.textContent=sc.down?fmtUsd(sc.down.pnl_dollars):"—";
+      td10.style.color = sc.down && sc.down.pnl_dollars<0 ? "var(--down)" : "var(--up)";
+      const td11=document.createElement("td"); td11.className="num"; td11.textContent=sc.flat?fmtUsd(sc.flat.pnl_dollars):"—";
+      td11.style.color = sc.flat && sc.flat.pnl_dollars<0 ? "var(--down)" : "var(--up)";
+      const td12=document.createElement("td"); td12.className="num"; td12.textContent=sc.up?fmtUsd(sc.up.pnl_dollars):"—";
+      td12.style.color = sc.up && sc.up.pnl_dollars<0 ? "var(--down)" : "var(--up)";
+
+      const td13=document.createElement("td"); td13.className="num";
+      const tier=document.createElement("span"); tier.className="snipe-tier "+o.tier; tier.textContent=o.tier;
+      td13.append(tier);
+
+      tr.append(td1,td2,td3,td4,td5,td6,td7,td8,td9,td10,td11,td12,td13);
+      if(fromY[o.underlying]!=null) tr.addEventListener("click",()=>selectNode(fromY[o.underlying]));
+      tbl.append(tr);
+    }
+    cc.append(tbl); box.append(cc);
+  }
+
+  const note=document.createElement("div"); note.className="flow-note";
+  note.textContent = "Screening tool, not a trade recommendation. CBOE delayed ~15min. No trades are placed automatically.";
+  box.append(note);
+}
+
+/* boot — deep-linkable via ?sel=TICKER&sel2=TICKER&tab=overview|cascade|flow|matrix|snipe&shock=-4&depth=2
    sel2 is optional: a second shock source that puts the app straight into scenario-compare mode. */
 const qp = new URLSearchParams(location.search);
 if(qp.has("shock")){ const v=Math.max(-10,Math.min(10,parseFloat(qp.get("shock"))||-5));
@@ -2089,6 +2202,7 @@ setTimeout(()=>{
 setLiveStatus("connecting");
 startLive();
 if(qp.get("tab")==="flow") fetchFlow();
+if(qp.get("tab")==="snipe") fetchSnipe();
 </script>
 </body>
 </html>

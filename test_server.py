@@ -233,6 +233,7 @@ class ApiRoutesTests(unittest.TestCase):
             "/api/correlation": server.Handler._api_correlation,
             "/api/lookup": server.Handler._api_lookup,
             "/api/options/active": server.Handler._api_options_active,
+            "/api/options/itm-scan": server.Handler._api_options_itm_scan,
         }
         self.assertEqual(server.Handler._API_ROUTES, expected)
 
@@ -670,6 +671,156 @@ class UrlInjectionTests(NetworkFreeTestCase):
         query = urllib.parse.urlparse(captured["url"]).query
         self.assertIn("AAA%2CXYZ", query)
         self.assertNotIn("symbols=AAA,XYZ", query)
+
+
+class ParseChainDeltaThetaTests(unittest.TestCase):
+    """Tests that _parse_chain() surfaces delta/theta -- added for the Snipe
+    0DTE scan, which tiers contracts by delta and needs a signed value
+    (CBOE reports puts with a negative delta; that sign must survive).
+    """
+    def test_delta_and_theta_passed_through(self):
+        raw = _wrap_chain_json([{"option": "SPY260117C00500000", "volume": 10,
+                                 "bid": 1.9, "ask": 2.1, "delta": 0.87, "theta": -0.05}])
+        contract = server._parse_chain("SPY", raw)[0][0]
+        self.assertEqual(contract["delta"], 0.87)
+        self.assertEqual(contract["theta"], -0.05)
+
+    def test_put_delta_keeps_negative_sign(self):
+        raw = _wrap_chain_json([{"option": "SPY260117P00480000", "volume": 10,
+                                 "bid": 1.9, "ask": 2.1, "delta": -0.92}])
+        contract = server._parse_chain("SPY", raw)[0][0]
+        self.assertEqual(contract["delta"], -0.92)
+
+    def test_missing_delta_is_none_not_crash(self):
+        raw = _wrap_chain_json([{"option": "SPY260117C00500000", "volume": 10,
+                                 "bid": 1.9, "ask": 2.1}])
+        contract = server._parse_chain("SPY", raw)[0][0]
+        self.assertIsNone(contract["delta"])
+
+
+class ItmScanTierTests(unittest.TestCase):
+    """Tests for _itm_scan_tier(), the Snipe board's A/B/C classification.
+
+    Mirrors the tiering rules 1:1: C beats everything on a wide spread; A is
+    reachable either via a high delta or, as a belt-and-suspenders fallback,
+    via raw moneyness (in case delta reports as 0 the way an earlier
+    web-scrape prototype's source occasionally did on deep-ITM contracts).
+    """
+    def test_wide_spread_is_tier_c_even_with_high_delta(self):
+        self.assertEqual(server._itm_scan_tier(0.25, 0.99, 0.05), "C")
+
+    def test_none_spread_is_tier_c(self):
+        self.assertEqual(server._itm_scan_tier(None, 0.99, 0.05), "C")
+
+    def test_high_delta_is_tier_a(self):
+        self.assertEqual(server._itm_scan_tier(0.05, 0.90, 0.001), "A")
+
+    def test_zero_delta_falls_back_to_moneyness_for_tier_a(self):
+        """Regression guard for the known site artifact: delta==0 on a very
+        deep-ITM contract must not silently demote it out of tier A."""
+        self.assertEqual(server._itm_scan_tier(0.05, 0.0, 0.02), "A")
+
+    def test_low_delta_and_low_moneyness_is_tier_b(self):
+        self.assertEqual(server._itm_scan_tier(0.05, 0.5, 0.003), "B")
+
+    def test_spread_exactly_20pct_is_not_tier_c(self):
+        """Boundary check: the rule is '> 20%', so exactly 20% stays tier A/B."""
+        self.assertEqual(server._itm_scan_tier(0.20, 0.9, 0.05), "A")
+
+
+def _snipe_contract(**overrides):
+    """Build one CBOE-shaped 0DTE contract dict for get_itm_scan() tests,
+    with sane ITM-call defaults that individual tests override."""
+    base = {
+        "underlying": "SPY", "type": "C", "strike": 495.0, "expiry": "2026-08-07",
+        "dte": 0, "volume": 100, "oi": 500, "last": 5.0, "iv": 20.0,
+        "bid": 4.9, "ask": 5.1, "delta": 0.9, "theta": -0.05,
+    }
+    base.update(overrides)
+    return base
+
+
+class GetItmScanTests(NetworkFreeTestCase):
+    """Tests get_itm_scan()'s filtering, execution-model math, and ordering.
+
+    get_quotes and _fetch_chain are both monkeypatched so this stays
+    network-free, matching the pattern GetActiveOptionsTopClampTests uses
+    for the sibling /api/options/active endpoint.
+    """
+    def _patch(self, spot, contracts):
+        self.patch_server("get_quotes", lambda syms: {"SPY": {"price": spot}})
+        self.patch_server("_fetch_chain", lambda symbol: {
+            "contracts": contracts, "call_vol": 0.0, "put_vol": 0.0, "ts": 1700000000,
+        })
+
+    def test_execution_model_math(self):
+        """breakeven/cost/scenario P&L match the spec formulas exactly for a
+        single deep-ITM call: spot 500, strike 495, ask 5.1."""
+        self._patch(500.0, [_snipe_contract()])
+        out = server.get_itm_scan(["SPY"])
+        self.assertEqual(len(out["contracts"]), 1)
+        c = out["contracts"][0]
+        self.assertEqual(c["contract_cost"], 510.0)
+        self.assertEqual(c["max_loss"], 510.0)
+        self.assertAlmostEqual(c["breakeven"], 500.1)
+        flat = c["scenarios"]["flat"]
+        self.assertEqual(flat["scenario_price"], 500.0)
+        self.assertAlmostEqual(flat["pnl_dollars"], -10.0)
+        self.assertAlmostEqual(flat["pnl_pct"], -10.0 / 510.0, places=4)
+        up = c["scenarios"]["up"]
+        self.assertAlmostEqual(up["scenario_price"], 502.5)
+        self.assertAlmostEqual(up["pnl_dollars"], 240.0)
+
+    def test_otm_call_is_excluded(self):
+        """A call struck above spot is not in-the-money and must be dropped."""
+        self._patch(500.0, [_snipe_contract(strike=505.0)])
+        out = server.get_itm_scan(["SPY"])
+        self.assertEqual(out["contracts"], [])
+
+    def test_non_zero_dte_is_excluded(self):
+        """Only same-day expiries (dte==0) belong on a 0DTE scan."""
+        self._patch(500.0, [_snipe_contract(dte=1)])
+        out = server.get_itm_scan(["SPY"])
+        self.assertEqual(out["contracts"], [])
+
+    def test_zero_bid_is_excluded(self):
+        """A zero/missing bid means no real two-sided market -- spread math
+        would be meaningless, so the contract must be skipped."""
+        self._patch(500.0, [_snipe_contract(bid=0)])
+        out = server.get_itm_scan(["SPY"])
+        self.assertEqual(out["contracts"], [])
+
+    def test_missing_spot_price_excludes_symbol(self):
+        """No spot price (e.g. Yahoo lookup failed) means moneyness/breakeven
+        can't be computed, so that underlying contributes nothing rather
+        than crashing the whole scan."""
+        self.patch_server("get_quotes", lambda syms: {})
+        self.patch_server("_fetch_chain", lambda symbol: {
+            "contracts": [_snipe_contract()], "call_vol": 0.0, "put_vol": 0.0, "ts": None,
+        })
+        out = server.get_itm_scan(["SPY"])
+        self.assertEqual(out["contracts"], [])
+
+    def test_tier_a_sorts_before_tier_b_regardless_of_spread(self):
+        """Sort is tier-A-first, then spread ascending -- a tighter-spread
+        tier-B contract must still rank behind a wider-spread tier-A one."""
+        tier_b = _snipe_contract(strike=497.0, bid=2.9, ask=3.0, delta=0.5)  # tight spread, low delta/moneyness -> B
+        tier_a = _snipe_contract(strike=480.0, bid=19.0, ask=21.0, delta=0.95)  # wider spread, high delta -> A
+        self._patch(500.0, [tier_b, tier_a])
+        out = server.get_itm_scan(["SPY"])
+        self.assertEqual([c["tier"] for c in out["contracts"]], ["A", "B"])
+
+    def test_top_limits_total_contracts_returned(self):
+        contracts = [_snipe_contract(strike=490.0 - i) for i in range(5)]
+        self._patch(500.0, contracts)
+        out = server.get_itm_scan(["SPY"], top=2)
+        self.assertEqual(len(out["contracts"]), 2)
+
+    def test_note_and_delayed_flag_present(self):
+        self._patch(500.0, [_snipe_contract()])
+        out = server.get_itm_scan(["SPY"])
+        self.assertTrue(out["delayed"])
+        self.assertIn("Screening tool", out["note"])
 
 
 if __name__ == "__main__":
