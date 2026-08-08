@@ -370,6 +370,19 @@ table.opt tr.body:hover { background: var(--surface-3); cursor: pointer; }
 .snipe-score.mid { color: var(--accent); }
 .snipe-score.lo { color: var(--down); }
 
+/* snipe log (forward paper-trading track record, bottom of the Snipe tab) */
+.snipe-log-section { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--grid); }
+.snipe-log-section h3 { font-size: 10px; letter-spacing: 1.4px; color: var(--ink-muted); text-transform: uppercase; margin-bottom: 10px; }
+.snipe-log-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
+.snipe-log-summary .v.pos { color: var(--up); }
+.snipe-log-summary .v.neg { color: var(--down); }
+.snipe-log-status {
+  display: inline-block; font-size: 9px; font-weight: 800; padding: 1px 6px; border-radius: 3px;
+  letter-spacing: 0.4px; border: 1px solid; text-align: center;
+}
+.snipe-log-status.open { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+.snipe-log-status.closed { color: var(--ink-2); border-color: var(--border); background: var(--surface-3); }
+
 /* matrix */
 #matrix-wrap { position: relative; }
 #matrix { display: block; width: 100%; image-rendering: pixelated; border: 1px solid var(--border); border-radius: 4px; cursor: crosshair; }
@@ -1411,7 +1424,10 @@ tabs.forEach(b=>b.addEventListener("click",()=>{
   document.querySelector("main").classList.toggle("snipe-active", b.dataset.tab==="snipe");
   if(b.dataset.tab==="matrix") drawMatrix();
   if(b.dataset.tab==="flow" && !flowLoaded && !flowLoading) fetchFlow();
-  if(b.dataset.tab==="snipe" && !snipeLoaded && !snipeLoading) fetchSnipe();
+  if(b.dataset.tab==="snipe"){
+    if(!snipeLoaded && !snipeLoading) fetchSnipe();
+    if(!snipeLogLoaded && !snipeLogLoading) fetchSnipeLog();
+  }
 }));
 
 /* ----- overview ----- */
@@ -2096,6 +2112,7 @@ function renderFlow(){
    displays numbers computed server-side, never places or simulates an order.
    ========================================================================== */
 let snipeData=null, snipeLoading=false, snipeLoaded=false;
+let snipeLogData=null, snipeLogLoading=false, snipeLogLoaded=false, snipeSnapshotInFlight=false;
 const fmtUsd = v => (v==null ? "—" : (v<0?"-":"")+"$"+Math.abs(v).toFixed(2));
 const fmtPct1 = v => v==null ? "—" : (v*100).toFixed(1)+"%";
 
@@ -2105,6 +2122,28 @@ async function fetchSnipe(){
   try{ const r=await fetch("/api/options/itm-scan?top=20"); snipeData=await r.json(); snipeLoaded=true; }
   catch(e){ snipeData={_error:String(e)}; }
   snipeLoading=false; renderSnipe();
+}
+
+/* Snipe Log — forward paper-trading track record for the Snipe board's own
+   top pick, settled at the NEXT day's real close (never a backtest, never a
+   real trade). Its own fetch/render pair, but rendered as a sub-section
+   inside renderSnipe() (see renderSnipeLogSection below) rather than a
+   separate tab -- it's the same feature, just a second view onto it. */
+async function fetchSnipeLog(){
+  if(snipeLogLoading) return;
+  snipeLogLoading=true; renderSnipe();
+  try{ const r=await fetch("/api/snipe-log"); snipeLogData=await r.json(); snipeLogLoaded=true; }
+  catch(e){ snipeLogData={_error:String(e)}; }
+  snipeLogLoading=false; renderSnipe();
+}
+
+async function doSnipeSnapshot(){
+  if(snipeSnapshotInFlight) return;
+  snipeSnapshotInFlight=true; renderSnipe();
+  try{ await fetch("/api/snipe-log/snapshot", {method:"POST"}); }
+  catch(e){ /* surfaced through the refetch below via snipeLogData._error if it truly failed */ }
+  snipeSnapshotInFlight=false;
+  await fetchSnipeLog();
 }
 
 function renderSnipe(){
@@ -2193,6 +2232,123 @@ function renderSnipe(){
   const note=document.createElement("div"); note.className="flow-note";
   note.textContent = "Screening tool, not a trade recommendation. CBOE delayed ~15min. No trades are placed automatically.";
   box.append(note);
+
+  renderSnipeLogSection(box);
+}
+
+/* Snipe Log sub-section, appended to the bottom of the Snipe tab (not its
+   own top-level tab -- same feature, same fetch cadence). Renders the
+   summary strip + entries table from snipeLogData, or an appropriate
+   loading/error/empty state, plus the manual "snapshot now" button. */
+function renderSnipeLogSection(box){
+  const sec=document.createElement("div"); sec.className="snipe-log-section";
+  const sh=document.createElement("h3"); sh.textContent="Snipe Log — forward paper-trading track record"; sec.append(sh);
+
+  const top=document.createElement("div"); top.className="flow-top";
+  const left=document.createElement("div");
+  const k=document.createElement("div"); k.className="k"; k.textContent="Top pick logged daily · settled at next close";
+  left.append(k);
+  const snapBtn=document.createElement("button"); snapBtn.className="flow-refresh";
+  snapBtn.textContent = snipeSnapshotInFlight ? "SNAPSHOTTING…" : "SNAPSHOT TODAY'S PICK NOW";
+  snapBtn.disabled = snipeSnapshotInFlight;
+  snapBtn.addEventListener("click", doSnipeSnapshot);
+  top.append(left, snapBtn);
+  sec.append(top);
+
+  if(snipeLogLoading && !snipeLogData){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="Loading the Snipe Log…";
+    sec.append(e); box.append(sec); return;
+  }
+  if(!snipeLogData || snipeLogData._error){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent = "Snipe Log unavailable"+(snipeLogData&&snipeLogData._error?" ("+snipeLogData._error+")":"")+". Is server.py running?";
+    sec.append(e); box.append(sec); return;
+  }
+
+  const s = snipeLogData.summary || {};
+  const strip=document.createElement("div"); strip.className="snipe-log-summary";
+  const mkStat=(label,val,cls)=>{
+    const d=document.createElement("div"); d.className="stat";
+    const kk=document.createElement("div"); kk.className="k"; kk.textContent=label;
+    const vv=document.createElement("div"); vv.className="v"+(cls?" "+cls:""); vv.textContent=val;
+    d.append(kk,vv); return d;
+  };
+  strip.append(
+    mkStat("Trades logged", s.trades!=null ? s.trades : "—"),
+    mkStat("Win rate", s.win_rate!=null ? (s.win_rate*100).toFixed(0)+"%" : "—"),
+    mkStat("Total P&L", fmtUsd(s.total_pnl_dollars), s.total_pnl_dollars<0?"neg":"pos"),
+    mkStat("Avg P&L / trade", fmtUsd(s.avg_pnl_dollars), s.avg_pnl_dollars<0?"neg":"pos"),
+  );
+  sec.append(strip);
+
+  const entries = snipeLogData.entries || [];
+  if(!entries.length){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="No picks logged yet — the scheduler snapshots the top Snipe candidate ~30min before the close on weekdays, or use Snapshot now.";
+    sec.append(e);
+  } else {
+    const tbl=document.createElement("table"); tbl.className="opt";
+    const hr=document.createElement("tr");
+    for(const t of ["Date","Ticker","Type/Strike","Entry Ask","Score","Status","Close","Exit Val","P&L $","P&L %","Correct"]){
+      const th=document.createElement("th"); th.textContent=t; hr.append(th);
+    }
+    tbl.append(hr);
+    for(const e of entries){
+      const tr=document.createElement("tr"); tr.className="body";
+
+      const td1=document.createElement("td"); td1.textContent=e.date;
+
+      const td2=document.createElement("td");
+      const tk=document.createElement("span"); tk.className="opt-und"; tk.style.fontWeight="700"; tk.textContent=e.underlying;
+      td2.append(tk);
+
+      const td3=document.createElement("td");
+      const cp=document.createElement("span"); cp.className="cp "+e.type; cp.textContent=e.type; td3.append(cp);
+      const stk=document.createElement("span"); stk.className="opt-strike";
+      stk.textContent = " "+(e.strike!=null ? e.strike.toFixed(e.strike>=100?0:2) : "—");
+      td3.append(stk);
+
+      const td4=document.createElement("td"); td4.className="num";
+      td4.textContent = e.entry_ask!=null ? e.entry_ask.toFixed(2) : "—";
+
+      const td5=document.createElement("td"); td5.className="num";
+      td5.textContent = e.entry_score!=null ? e.entry_score.toFixed(0) : "—";
+
+      const td6=document.createElement("td");
+      const pill=document.createElement("span"); pill.className="snipe-log-status "+e.status;
+      pill.textContent = e.status==="open" ? "OPEN" : "CLOSED";
+      td6.append(pill);
+
+      const td7=document.createElement("td"); td7.className="num";
+      td7.textContent = e.close_price!=null ? e.close_price.toFixed(2) : "—";
+
+      const td8=document.createElement("td"); td8.className="num";
+      td8.textContent = e.exit_value!=null ? e.exit_value.toFixed(2) : "—";
+
+      const td9=document.createElement("td"); td9.className="num";
+      td9.textContent = e.pnl_dollars!=null ? fmtUsd(e.pnl_dollars) : "—";
+      if(e.pnl_dollars!=null) td9.style.color = e.pnl_dollars<0 ? "var(--down)" : "var(--up)";
+
+      const td10=document.createElement("td"); td10.className="num";
+      td10.textContent = e.pnl_pct!=null ? fmtPct1(e.pnl_pct) : "—";
+      if(e.pnl_pct!=null) td10.style.color = e.pnl_pct<0 ? "var(--down)" : "var(--up)";
+
+      const td11=document.createElement("td"); td11.className="num";
+      td11.textContent = e.correct==null ? "—" : (e.correct ? "✓" : "✗");
+      td11.style.color = e.correct==null ? "var(--ink-muted)" : (e.correct ? "var(--up)" : "var(--down)");
+
+      tr.append(td1,td2,td3,td4,td5,td6,td7,td8,td9,td10,td11);
+      tbl.append(tr);
+    }
+    sec.append(tbl);
+  }
+
+  const note=document.createElement("div"); note.className="flow-note";
+  note.textContent = "Hypothetical paper log for studying this screening strategy — no real trades are placed. Past days do not predict future ones.";
+  sec.append(note);
+
+  box.append(sec);
 }
 
 /* boot — deep-linkable via ?sel=TICKER&sel2=TICKER&tab=overview|cascade|flow|matrix|snipe&shock=-4&depth=2
@@ -2220,6 +2376,7 @@ if(qp.get("tab")==="flow") fetchFlow();
 if(qp.get("tab")==="snipe"){
   document.querySelector("main").classList.add("snipe-active");
   fetchSnipe();
+  fetchSnipeLog();
 }
 </script>
 </body>

@@ -10,6 +10,8 @@ import contextlib
 import io
 import json
 import os
+import shutil
+import tempfile
 import time
 import unittest
 import unittest.mock
@@ -234,6 +236,7 @@ class ApiRoutesTests(unittest.TestCase):
             "/api/lookup": server.Handler._api_lookup,
             "/api/options/active": server.Handler._api_options_active,
             "/api/options/itm-scan": server.Handler._api_options_itm_scan,
+            "/api/snipe-log": server.Handler._api_snipe_log,
         }
         self.assertEqual(server.Handler._API_ROUTES, expected)
 
@@ -883,6 +886,290 @@ class GetItmScanTests(NetworkFreeTestCase):
         out = server.get_itm_scan(["SPY"])
         self.assertTrue(out["delayed"])
         self.assertIn("Screening tool", out["note"])
+
+
+class SnipeLogTests(NetworkFreeTestCase):
+    """Tests for the forward paper-trading Snipe Log: snapshot creation and
+    same-day dedupe, next-day close resolution and P&L math (a known win and
+    a known loss, hand-verified like GetItmScanTests.test_execution_model_math
+    does for the scan itself), the same-day-does-not-resolve rule, the
+    missing-close-price-leaves-it-open fallback, and get_snipe_log()'s
+    closed-trades-only summary.
+
+    SNIPE_LOG_PATH is monkeypatched to a per-test temp file (via
+    NetworkFreeTestCase.patch_server) so these tests never read or write the
+    real snipe_log.json this project ships alongside server.py, and never
+    race against each other or a real running instance.
+    """
+    def setUp(self):
+        super().setUp()
+        self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
+        self.patch_server("SNIPE_LOG_PATH", os.path.join(self._tmpdir, "snipe_log.json"))
+
+    @staticmethod
+    def _date_offset(days):
+        """ISO date `days` away from the real "today" -- used instead of a
+        hardcoded date string so these tests stay correct on any run date
+        (a negative `days` is always strictly in the past, which is all the
+        resolve-path tests actually need)."""
+        return (server.dt.date.today() + server.dt.timedelta(days=days)).isoformat()
+
+    @staticmethod
+    def _hist_for_date(date_str, close):
+        """A get_history()-shaped payload with exactly one bar, timestamped
+        at 9:30am America/New_York on `date_str` -- matches how a real Yahoo
+        daily bar's timestamp maps back to its calendar trading day. Uses
+        server's own _ny_utcoffset_hours() (rather than a hardcoded offset)
+        so this stays correct whether `date_str` falls in EDT or EST."""
+        d = server.dt.date.fromisoformat(date_str)
+        offset = server._ny_utcoffset_hours(d)
+        tz = server.dt.timezone(server.dt.timedelta(hours=offset))
+        local_open = server.dt.datetime(d.year, d.month, d.day, 9, 30, tzinfo=tz)
+        return {"t": [int(local_open.timestamp())], "c": [close]}
+
+    @staticmethod
+    def _raw_entry(date, status="open", underlying="SPY", opt_type="C",
+                    strike=495.0, ask=5.0, cost=500.0, id_suffix=None):
+        """Build one full-shaped log entry dict (matching snapshot_snipe_pick's
+        own schema) directly, for tests that exercise resolve_snipe_log() /
+        get_snipe_log() without going through a scan snapshot first."""
+        return {
+            "id": f"{date}-{id_suffix or underlying}",
+            "date": date, "logged_at": f"{date}T15:30:00-04:00",
+            "underlying": underlying, "type": opt_type, "strike": strike, "expiry": date,
+            "entry_ask": ask, "entry_delta": 0.9, "entry_spread_pct": 0.02,
+            "entry_score": 78.4, "contract_cost": cost, "breakeven": strike + ask,
+            "late_snapshot": False, "status": status,
+            "close_price": None, "exit_value": None, "pnl_dollars": None,
+            "pnl_pct": None, "correct": None, "resolved_at": None,
+        }
+
+    @staticmethod
+    def _scan_with(contracts):
+        return {"as_of": 1700000000, "delayed": True, "note": "", "contracts": contracts}
+
+    @staticmethod
+    def _pick(**overrides):
+        base = {"underlying": "SPY", "type": "C", "strike": 495.0, "expiry": "2026-08-06",
+                "ask": 5.0, "delta": 0.9, "spread_pct": 0.02, "score": 78.4,
+                "contract_cost": 500.0, "breakeven": 500.0}
+        base.update(overrides)
+        return base
+
+    # -- snapshot_snipe_pick() --------------------------------------------
+
+    def test_snapshot_creates_one_entry_with_expected_fields(self):
+        self.patch_server("get_itm_scan", lambda *a, **k: self._scan_with([self._pick()]))
+        entry = server.snapshot_snipe_pick()
+        today = server.dt.date.today().isoformat()
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["id"], f"{today}-SPY")
+        self.assertEqual(entry["date"], today)
+        self.assertEqual(entry["underlying"], "SPY")
+        self.assertEqual(entry["type"], "C")
+        self.assertEqual(entry["strike"], 495.0)
+        self.assertEqual(entry["entry_ask"], 5.0)
+        self.assertEqual(entry["contract_cost"], 500.0)
+        self.assertEqual(entry["status"], "open")
+        self.assertFalse(entry["late_snapshot"])
+        self.assertEqual(len(server._load_snipe_log()), 1)
+
+    def test_snapshot_no_candidates_logs_nothing(self):
+        self.patch_server("get_itm_scan", lambda *a, **k: self._scan_with([]))
+        entry = server.snapshot_snipe_pick()
+        self.assertIsNone(entry)
+        self.assertEqual(server._load_snipe_log(), [])
+
+    def test_snapshot_twice_same_day_does_not_duplicate(self):
+        self.patch_server("get_itm_scan", lambda *a, **k: self._scan_with([self._pick()]))
+        first = server.snapshot_snipe_pick()
+        second = server.snapshot_snipe_pick(late=True)
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(len(server._load_snipe_log()), 1)
+
+    def test_late_snapshot_flag_recorded(self):
+        self.patch_server("get_itm_scan", lambda *a, **k: self._scan_with([self._pick()]))
+        entry = server.snapshot_snipe_pick(late=True)
+        self.assertTrue(entry["late_snapshot"])
+
+    # -- resolve_snipe_log() P&L math --------------------------------------
+
+    def test_resolve_computes_correct_pnl_for_a_win(self):
+        """Call strike 495, entry_ask 5.0 (cost $500), close 502 ->
+        exit_value = max(0, 502-495) = 7.0
+        pnl_dollars = (7.0 - 5.0) * 100 = 200.0
+        pnl_pct = 200.0 / 500.0 = 0.4"""
+        yest = self._date_offset(-1)
+        server._save_snipe_log([self._raw_entry(date=yest)])
+        self.patch_server("get_history", lambda symbol, rng="1mo": self._hist_for_date(yest, 502.0))
+        out = server.resolve_snipe_log()
+        e = out[0]
+        self.assertEqual(e["status"], "closed")
+        self.assertEqual(e["close_price"], 502.0)
+        self.assertAlmostEqual(e["exit_value"], 7.0)
+        self.assertAlmostEqual(e["pnl_dollars"], 200.0)
+        self.assertAlmostEqual(e["pnl_pct"], 0.4)
+        self.assertTrue(e["correct"])
+        self.assertIsNotNone(e["resolved_at"])
+
+    def test_resolve_computes_correct_pnl_for_a_loss(self):
+        """Call strike 495, entry_ask 5.0 (cost $500), close 490 (finishes
+        OTM) -> exit_value = max(0, 490-495) = 0.0
+        pnl_dollars = (0.0 - 5.0) * 100 = -500.0
+        pnl_pct = -500.0 / 500.0 = -1.0"""
+        yest = self._date_offset(-1)
+        server._save_snipe_log([self._raw_entry(date=yest)])
+        self.patch_server("get_history", lambda symbol, rng="1mo": self._hist_for_date(yest, 490.0))
+        out = server.resolve_snipe_log()
+        e = out[0]
+        self.assertEqual(e["status"], "closed")
+        self.assertAlmostEqual(e["exit_value"], 0.0)
+        self.assertAlmostEqual(e["pnl_dollars"], -500.0)
+        self.assertAlmostEqual(e["pnl_pct"], -1.0)
+        self.assertFalse(e["correct"])
+
+    def test_resolve_put_uses_strike_minus_close(self):
+        """Put strike 495, entry_ask 5.0, close 488 ->
+        exit_value = max(0, 495-488) = 7.0 -> same $200 win math as the call case."""
+        yest = self._date_offset(-1)
+        server._save_snipe_log([self._raw_entry(date=yest, opt_type="P")])
+        self.patch_server("get_history", lambda symbol, rng="1mo": self._hist_for_date(yest, 488.0))
+        e = server.resolve_snipe_log()[0]
+        self.assertAlmostEqual(e["exit_value"], 7.0)
+        self.assertAlmostEqual(e["pnl_dollars"], 200.0)
+
+    def test_open_entry_from_today_does_not_resolve(self):
+        """Even with a matching close price available, a same-day entry must
+        stay open -- it only resolves the NEXT time the log is read on a
+        later date."""
+        today = server.dt.date.today().isoformat()
+        server._save_snipe_log([self._raw_entry(date=today)])
+        self.patch_server("get_history", lambda symbol, rng="1mo": self._hist_for_date(today, 502.0))
+        out = server.resolve_snipe_log()
+        e = out[0]
+        self.assertEqual(e["status"], "open")
+        self.assertIsNone(e["pnl_dollars"])
+        self.assertIsNone(e["close_price"])
+
+    def test_missing_close_price_leaves_entry_open(self):
+        """A past-day entry whose close can't be found (feed hiccup, stale
+        cache, etc.) must stay open, not crash or resolve with bad data."""
+        yest = self._date_offset(-1)
+        server._save_snipe_log([self._raw_entry(date=yest)])
+        self.patch_server("get_history", lambda symbol, rng="1mo": {"t": [], "c": []})
+        out = server.resolve_snipe_log()
+        e = out[0]
+        self.assertEqual(e["status"], "open")
+        self.assertIsNone(e["pnl_dollars"])
+
+    def test_already_closed_entry_is_left_alone(self):
+        """resolve_snipe_log() must not re-touch an entry that's already
+        settled, even if get_history is (incorrectly) able to produce a bar
+        for its date."""
+        yest = self._date_offset(-1)
+        closed = self._raw_entry(date=yest, status="closed")
+        closed.update(close_price=500.0, exit_value=5.0, pnl_dollars=0.0,
+                      pnl_pct=0.0, correct=False, resolved_at="already-set")
+        server._save_snipe_log([closed])
+        self.patch_server("get_history", lambda symbol, rng="1mo": self._hist_for_date(yest, 999.0))
+        out = server.resolve_snipe_log()
+        self.assertEqual(out[0]["close_price"], 500.0)  # untouched
+        self.assertEqual(out[0]["resolved_at"], "already-set")
+
+    # -- get_snipe_log() summary --------------------------------------------
+
+    def test_summary_zero_trades_when_none_closed(self):
+        today = server.dt.date.today().isoformat()
+        server._save_snipe_log([self._raw_entry(date=today)])
+        out = server.get_snipe_log()
+        self.assertEqual(out["summary"], {
+            "trades": 0, "wins": 0, "win_rate": None,
+            "total_pnl_dollars": 0.0, "avg_pnl_dollars": 0.0, "avg_pnl_pct": 0.0,
+        })
+
+    def test_summary_only_counts_closed_trades_and_computes_correctly(self):
+        yest = self._date_offset(-1)
+        today = server.dt.date.today().isoformat()
+        win_entry = self._raw_entry(date=yest, underlying="SPY")
+        still_open = self._raw_entry(date=today, underlying="QQQ", id_suffix="QQQ")
+        server._save_snipe_log([win_entry, still_open])
+        self.patch_server("get_history", lambda symbol, rng="1mo": self._hist_for_date(yest, 502.0))
+        out = server.get_snipe_log()
+
+        self.assertEqual(out["summary"]["trades"], 1)
+        self.assertEqual(out["summary"]["wins"], 1)
+        self.assertEqual(out["summary"]["win_rate"], 1.0)
+        self.assertAlmostEqual(out["summary"]["total_pnl_dollars"], 200.0)
+        self.assertAlmostEqual(out["summary"]["avg_pnl_dollars"], 200.0)
+        self.assertAlmostEqual(out["summary"]["avg_pnl_pct"], 0.4)
+        # most-recent-first ordering
+        self.assertEqual(out["entries"][0]["date"], today)
+        self.assertEqual(out["entries"][1]["date"], yest)
+
+    def test_summary_win_rate_with_mixed_results(self):
+        """One win, one loss -> win_rate 0.5, total_pnl is their sum."""
+        d1, d2 = self._date_offset(-1), self._date_offset(-2)
+        win = self._raw_entry(date=d1, underlying="SPY")
+        loss = self._raw_entry(date=d2, underlying="QQQ", id_suffix="QQQ")
+        server._save_snipe_log([win, loss])
+
+        def fake_history(symbol, rng="1mo"):
+            if symbol == "SPY":
+                return self._hist_for_date(d1, 502.0)  # win: +200
+            return self._hist_for_date(d2, 490.0)       # loss: -500
+
+        self.patch_server("get_history", fake_history)
+        out = server.get_snipe_log()
+        self.assertEqual(out["summary"]["trades"], 2)
+        self.assertEqual(out["summary"]["wins"], 1)
+        self.assertAlmostEqual(out["summary"]["win_rate"], 0.5)
+        self.assertAlmostEqual(out["summary"]["total_pnl_dollars"], -300.0)
+        self.assertAlmostEqual(out["summary"]["avg_pnl_dollars"], -150.0)
+
+
+class DoPostRoutingTests(unittest.TestCase):
+    """Tests for do_POST()'s minimal routing.
+
+    Only one POST route exists (/api/snipe-log/snapshot, the manual
+    "snapshot today's pick now" trigger) -- everything else must 404, matching
+    do_GET's own error-handling conventions. Handler is built via __new__
+    (see DoGetErrorHandlingTests) with just enough stubbed to run _send_json
+    to completion and inspect its output, plus a stubbed rfile/headers pair
+    so the body-draining step at the top of do_POST doesn't need a real socket.
+    """
+    def _make_handler(self, path, body=b""):
+        handler = server.Handler.__new__(server.Handler)
+        handler.path = path
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.sent_status = None
+        handler.send_response = lambda status: setattr(handler, "sent_status", status)
+        handler.send_header = lambda *a: None
+        handler.end_headers = lambda: None
+        handler.wfile = io.BytesIO()
+        handler.send_error = lambda code: setattr(handler, "sent_status", code)
+        return handler
+
+    def test_unknown_post_path_404s(self):
+        handler = self._make_handler("/api/nope")
+        handler.do_POST()
+        self.assertEqual(handler.sent_status, 404)
+
+    def test_snapshot_route_returns_the_entry(self):
+        handler = self._make_handler("/api/snipe-log/snapshot")
+        fake_entry = {"id": "2026-08-06-SPY", "status": "open"}
+        with unittest.mock.patch.object(server, "snapshot_snipe_pick", return_value=fake_entry):
+            handler.do_POST()
+        self.assertEqual(handler.sent_status, 200)
+        self.assertEqual(json.loads(handler.wfile.getvalue()), fake_entry)
+
+    def test_snapshot_route_with_no_candidates_returns_error_dict_not_500(self):
+        handler = self._make_handler("/api/snipe-log/snapshot")
+        with unittest.mock.patch.object(server, "snapshot_snipe_pick", return_value=None):
+            handler.do_POST()
+        self.assertEqual(handler.sent_status, 200)
+        self.assertIn("_error", json.loads(handler.wfile.getvalue()))
 
 
 if __name__ == "__main__":

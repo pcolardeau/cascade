@@ -3,3 +3,4 @@ __pycache__/
 cascade-serve.log
 .ironpaw/
 .playwright-mcp/
+snipe_log.json

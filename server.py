@@ -25,6 +25,14 @@ API-key headaches:
                moneyness/delta tier, and a 1-contract execution model
                (breakeven, P&L at a few spot-move scenarios). Screening tool
                only — it never places or simulates placing an order.
+  * Snipe Log — forward paper-trading track record for the Snipe board's
+               top-scored pick each day: a daemon thread snapshots it ~30min
+               before the close (snipe_log.json), settled against the
+               underlying's real closing price the next time the log is read
+               on a later day. Not a backtest (no historical intraday options
+               data exists on this free feed) and never places a real trade
+               — pure simulated bookkeeping for studying the strategy's
+               honest, forward-only hit rate.
 
 Run:  python server.py                (defaults to port 8474)
       python server.py --port 9000
@@ -98,6 +106,56 @@ OPTION_SCAN = [
 # (SPX's own M/W/F 0DTE cadence), so plumbing it in couldn't even be verified
 # end-to-end. Add it later if CBOE's index-option support turns out sturdier.
 SNIPE_SCAN = ["SPY", "QQQ", "IWM"]
+
+# Forward paper-trading log for the Snipe board's top-scored pick each day --
+# see snapshot_snipe_pick()/resolve_snipe_log() below. Lives next to server.py
+# (not under a data/ subdir) to match this project's flat, no-build-step layout.
+SNIPE_LOG_PATH = os.path.join(BASE_DIR, "snipe_log.json")
+
+# US Eastern time helpers, used to compute "30 minutes before the close"
+# (15:30 America/New_York) for the Snipe Log's daily snapshot scheduler, and
+# to map a closing-price timestamp back to the calendar trading day it
+# belongs to.
+#
+# zoneinfo.ZoneInfo("America/New_York") would normally do this, but zoneinfo
+# depends on an IANA tz database that it expects the OS to supply -- Windows
+# doesn't ship one, so without the (non-stdlib) `tzdata` PyPI package as a
+# fallback, zoneinfo raises ModuleNotFoundError on a stock Windows Python
+# install (verified: that's exactly what happens on this project's own dev
+# machine). Hand-rolling the US DST rule, which has been stable since 2007
+# (2nd Sunday in March -> 1st Sunday in November, 2am local), keeps this
+# genuinely dependency-free instead of quietly requiring `pip install
+# tzdata` on the platform this app actually runs on.
+def _nth_sunday(year, month, n):
+    """The date of the n-th Sunday of `month`/`year` (n=1 -> first Sunday)."""
+    first_of_month = dt.date(year, month, 1)
+    first_sunday = first_of_month + dt.timedelta(days=(6 - first_of_month.weekday()) % 7)
+    return first_sunday + dt.timedelta(weeks=n - 1)
+
+
+def _ny_utcoffset_hours(date_obj):
+    """US Eastern's UTC offset in hours (-4 EDT / -5 EST) for calendar
+    `date_obj`, per the US DST rule in effect since 2007."""
+    dst_start = _nth_sunday(date_obj.year, 3, 2)   # 2nd Sunday in March
+    dst_end = _nth_sunday(date_obj.year, 11, 1)    # 1st Sunday in November
+    return -4 if dst_start <= date_obj < dst_end else -5
+
+
+def _now_et():
+    """Current time as a tz-aware datetime in US Eastern (EDT/EST, DST-correct)."""
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    offset = _ny_utcoffset_hours(now_utc.date())
+    return now_utc.astimezone(dt.timezone(dt.timedelta(hours=offset)))
+
+
+def _et_date_from_ts(ts):
+    """Unix timestamp -> the US-Eastern calendar date (YYYY-MM-DD) it falls
+    on. Used to match a Yahoo daily-bar timestamp back to the trading day
+    it represents."""
+    utc_dt = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc)
+    offset = _ny_utcoffset_hours(utc_dt.date())
+    return utc_dt.astimezone(dt.timezone(dt.timedelta(hours=offset))).date().isoformat()
+
 
 # Hard cap on how many symbols a single API request may fan out to, so a
 # crafted ?symbols=... list can't trigger an unbounded burst of outbound
@@ -748,6 +806,261 @@ def get_itm_scan(symbols=None, down_pct=-0.005, flat_pct=0.0, up_pct=0.005, top=
 
 
 # ---------------------------------------------------------------------------
+# Snipe Log -- forward paper-trading track record for the Snipe board's
+# top-scored pick each day.
+#
+# This is intentionally NOT a backtest: there is no historical intraday
+# options data available from the free CBOE feed, so retroactively pricing
+# "what would this contract have cost yesterday at 3:30pm" would mean
+# fabricating option prices. Instead this logs the real top-ranked candidate
+# going forward (at ~30min before close) and settles it against the
+# underlying's REAL closing price the next time the log is read on a later
+# day -- an honest, if slower-to-accumulate, track record.
+#
+# 100% read-only bookkeeping: entry price is the screen's own ask, exit value
+# is computed intrinsic value at the close. Nothing here places, simulates
+# placing, or connects to anything capable of placing a real order.
+# ---------------------------------------------------------------------------
+_snipe_log_lock = threading.Lock()
+
+
+def _load_snipe_log():
+    """Read the persisted Snipe Log as a list of entry dicts.
+
+    Returns [] if the file doesn't exist yet (first run) or is unreadable/
+    corrupt -- a bad log file should degrade to "no history yet", not crash
+    every endpoint that touches the Snipe tab.
+    """
+    with _snipe_log_lock:
+        try:
+            with open(SNIPE_LOG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except FileNotFoundError:
+            return []
+        except (json.JSONDecodeError, OSError, ValueError):
+            return []
+
+
+def _save_snipe_log(entries):
+    """Persist the Snipe Log via write-temp-then-atomic-replace, so a crash
+    or power loss mid-write can't leave a half-written/corrupt JSON file
+    behind (os.replace is atomic on both POSIX and Windows, unlike writing
+    the target path directly)."""
+    with _snipe_log_lock:
+        tmp_path = f"{SNIPE_LOG_PATH}.tmp-{os.getpid()}-{threading.get_ident()}"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2)
+        os.replace(tmp_path, SNIPE_LOG_PATH)
+
+
+def snapshot_snipe_pick(late=False):
+    """Log today's top-scored Snipe candidate (contracts[0] of a fresh
+    get_itm_scan() over all of SNIPE_SCAN) as a new open paper-trade entry.
+
+    Idempotent per calendar day: if today's date already has a logged entry,
+    that existing entry is returned unchanged rather than duplicated (this
+    makes the startup catch-up call and the scheduler's own daily call, or
+    two clicks of the manual "snapshot now" button, all safe to run more
+    than once on the same day). If the scan currently has zero candidates
+    (e.g. no live two-sided market yet), nothing is logged and None is
+    returned -- there's nothing honest to record.
+
+    Args:
+        late (bool): True when this snapshot is a startup catch-up (server
+            wasn't running at the scheduled 15:30 ET time) rather than the
+            regular on-schedule snapshot. Stored on the entry for visibility;
+            doesn't change the logging logic itself.
+
+    Returns:
+        dict or None: the (new or pre-existing) log entry, or None if there
+        was nothing to log.
+    """
+    scan = get_itm_scan()
+    contracts = scan.get("contracts") or []
+    today = dt.date.today().isoformat()
+
+    entries = _load_snipe_log()
+    for existing in entries:
+        if existing.get("date") == today:
+            return existing
+
+    if not contracts:
+        return None
+
+    c = contracts[0]
+    logged_at = _now_et().isoformat(timespec="seconds")
+    entry = {
+        "id": f"{today}-{c.get('underlying')}",
+        "date": today,
+        "logged_at": logged_at,
+        "underlying": c.get("underlying"),
+        "type": c.get("type"),
+        "strike": c.get("strike"),
+        "expiry": c.get("expiry"),
+        "entry_ask": c.get("ask"),
+        "entry_delta": c.get("delta"),
+        "entry_spread_pct": c.get("spread_pct"),
+        "entry_score": c.get("score"),
+        "contract_cost": c.get("contract_cost"),
+        "breakeven": c.get("breakeven"),
+        "late_snapshot": bool(late),
+        "status": "open",
+        "close_price": None,
+        "exit_value": None,
+        "pnl_dollars": None,
+        "pnl_pct": None,
+        "correct": None,
+        "resolved_at": None,
+    }
+    entries.append(entry)
+    _save_snipe_log(entries)
+    return entry
+
+
+def _closing_price_on(symbol, date_str):
+    """Find `symbol`'s closing price on a specific calendar trading day
+    (YYYY-MM-DD, America/New_York) from its recent daily-bar history.
+
+    Returns None if that date's bar can't be found (feed hiccup, thin/stale
+    cache, symbol delisted, etc.) rather than raising -- callers must treat
+    "can't find it" as "try again later," not a crash.
+    """
+    hist = get_history(symbol, rng="1mo")
+    ts_list = hist.get("t") or []
+    closes = hist.get("c") or []
+    for t, c in zip(ts_list, closes):
+        if _et_date_from_ts(t) == date_str:
+            return c
+    return None
+
+
+def resolve_snipe_log():
+    """Settle every open Snipe Log entry whose date is a strictly-past
+    trading day against that day's real closing price.
+
+    A same-day entry is deliberately left open -- "sold at the close" hasn't
+    happened yet on the same day the pick was logged, so it only resolves
+    the next time this is called on a LATER date. If the close price for an
+    entry's date can't be found yet, that entry is left open and skipped
+    rather than resolved with bad data.
+
+    Returns:
+        list: the full (possibly updated) log, unsorted.
+    """
+    entries = _load_snipe_log()
+    today = dt.date.today().isoformat()
+    changed = False
+    for e in entries:
+        if e.get("status") != "open":
+            continue
+        if e.get("date") >= today:
+            continue  # today (or, shouldn't happen, a future date) -- not settled yet
+        close = _closing_price_on(e.get("underlying"), e.get("date"))
+        if close is None:
+            continue  # can't resolve yet (feed hiccup / stale cache) -- try again later
+        strike = e.get("strike")
+        if e.get("type") == "C":
+            exit_value = max(0.0, close - strike)
+        else:
+            exit_value = max(0.0, strike - close)
+        entry_ask = e.get("entry_ask") or 0.0
+        contract_cost = e.get("contract_cost")
+        pnl_dollars = round((exit_value - entry_ask) * 100, 2)
+        e["close_price"] = close
+        e["exit_value"] = round(exit_value, 4)
+        e["pnl_dollars"] = pnl_dollars
+        e["pnl_pct"] = round(pnl_dollars / contract_cost, 4) if contract_cost else None
+        e["correct"] = pnl_dollars > 0
+        e["resolved_at"] = _now_et().isoformat(timespec="seconds")
+        e["status"] = "closed"
+        changed = True
+    if changed:
+        _save_snipe_log(entries)
+    return entries
+
+
+def get_snipe_log():
+    """Return the Snipe Log, freshly resolved, most-recent-first, plus a
+    summary computed only over closed (settled) trades.
+
+    Returns:
+        dict: {entries: [...], summary: {trades, wins, win_rate,
+            total_pnl_dollars, avg_pnl_dollars, avg_pnl_pct}}. summary
+            fields are all 0/None-ish when there are zero closed trades yet.
+    """
+    entries = resolve_snipe_log()
+    ordered = sorted(entries, key=lambda e: e.get("date", ""), reverse=True)
+    closed = [e for e in entries if e.get("status") == "closed"]
+    n = len(closed)
+    if n == 0:
+        summary = {
+            "trades": 0, "wins": 0, "win_rate": None,
+            "total_pnl_dollars": 0.0, "avg_pnl_dollars": 0.0, "avg_pnl_pct": 0.0,
+        }
+    else:
+        wins = sum(1 for e in closed if e.get("correct"))
+        total_pnl = sum(e.get("pnl_dollars") or 0.0 for e in closed)
+        avg_pct = sum(e.get("pnl_pct") or 0.0 for e in closed) / n
+        summary = {
+            "trades": n,
+            "wins": wins,
+            "win_rate": round(wins / n, 4),
+            "total_pnl_dollars": round(total_pnl, 2),
+            "avg_pnl_dollars": round(total_pnl / n, 2),
+            "avg_pnl_pct": round(avg_pct, 4),
+        }
+    return {"entries": ordered, "summary": summary}
+
+
+def _next_snipe_snapshot_time(now=None):
+    """Next weekday occurrence of 15:30 America/New_York (30min before the
+    16:00 ET equity close), strictly after `now`.
+
+    No market-holiday awareness -- a real exchange holiday still produces a
+    scheduled attempt. Known/accepted gap: get_itm_scan() naturally returns
+    zero candidates on a day the market never opened, so snapshot_snipe_pick()
+    just logs nothing for that date rather than misbehaving.
+    """
+    now = now or _now_et()
+    candidate = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += dt.timedelta(days=1)
+    while candidate.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        candidate += dt.timedelta(days=1)
+    return candidate
+
+
+def _snipe_scheduler_loop():
+    """Daemon loop: snapshot the day's top Snipe pick ~30min before the US
+    equity close, every weekday, forever.
+
+    Runs a one-time startup catch-up first (if the server happens to start
+    on a weekday after 15:30 ET, e.g. it wasn't running at the scheduled
+    time), then loops sleeping to the next 15:30 ET and snapshotting again.
+    Each snapshot attempt is wrapped in its own try/except: a bad snapshot
+    (network hiccup, CBOE outage, etc.) is logged to stderr and the loop
+    keeps running rather than the whole background thread dying silently.
+    """
+    now = _now_et()
+    if now.weekday() < 5 and now.time() >= dt.time(15, 30):
+        try:
+            snapshot_snipe_pick(late=True)
+        except Exception as e:  # noqa: BLE001 -- one bad catch-up must not kill the thread
+            print(f"[snipe scheduler] catch-up snapshot failed: {e}", file=sys.stderr)
+    while True:
+        try:
+            target = _next_snipe_snapshot_time()
+            sleep_s = (target - _now_et()).total_seconds()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            snapshot_snipe_pick()
+        except Exception as e:  # noqa: BLE001 -- keep the daemon loop alive across bad runs
+            print(f"[snipe scheduler] snapshot failed: {e}", file=sys.stderr)
+            time.sleep(60)  # avoid a tight crash loop if something's persistently broken
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
@@ -845,6 +1158,9 @@ class Handler(BaseHTTPRequestHandler):
         up = float(self._qparam(query, "up", "0.005"))
         return get_itm_scan(syms, down, flat, up, top)
 
+    def _api_snipe_log(self, query):
+        return get_snipe_log()
+
     # path -> (self, query) -> response-dict. Keeps do_GET itself pure routing:
     # "which endpoint is this" is separated from "how is its response computed",
     # so a new endpoint adds one table row and one small method instead of
@@ -856,6 +1172,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/lookup": _api_lookup,
         "/api/options/active": _api_options_active,
         "/api/options/itm-scan": _api_options_itm_scan,
+        "/api/snipe-log": _api_snipe_log,
     }
 
     def do_GET(self):
@@ -878,6 +1195,30 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             # Catch remaining errors to prevent server crash; log to stderr
             print(f"[server error] Unhandled exception: {e}", file=sys.stderr)
+            self._send_json({"_error": "Internal server error"}, status=500)
+
+    def do_POST(self):
+        # Deliberately tiny: exactly one POST route exists (a manual "snapshot
+        # today's pick now" trigger for the Snipe Log), so this stays a small,
+        # dedicated method rather than growing do_GET's routing table/pattern
+        # for a single endpoint. Any other path 404s.
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)  # drain any body so HTTP/1.1 keep-alive stays in sync
+        parsed_url = urllib.parse.urlparse(self.path)
+        try:
+            if parsed_url.path == "/api/snipe-log/snapshot":
+                entry = snapshot_snipe_pick()
+                if entry is None:
+                    self._send_json({"_error": "No live two-sided market to snapshot right now"})
+                else:
+                    self._send_json(entry)
+            else:
+                self.send_error(404)
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            print(f"[server error] Unhandled exception in POST: {e}", file=sys.stderr)
             self._send_json({"_error": "Internal server error"}, status=500)
 
     def log_message(self, fmt, *args):  # quieter console
@@ -910,6 +1251,11 @@ def main():
     print(f"CASCADE proxy on http://{args.host}:{args.port}  (Ctrl+C to stop)")
     print(f"  static : {BASE_DIR}")
     print(f"  quotes : Yahoo spark   |  options : CBOE delayed  |  data is DELAYED")
+    # Daemon thread: snapshots the day's top Snipe pick ~30min before the US
+    # equity close every weekday (plus a startup catch-up), so it doesn't
+    # block process exit and a snapshot failure can never take the HTTP
+    # server down with it (see _snipe_scheduler_loop's own try/except).
+    threading.Thread(target=_snipe_scheduler_loop, daemon=True, name="snipe-scheduler").start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
