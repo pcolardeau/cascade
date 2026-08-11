@@ -9,6 +9,7 @@ Run:  python test_server.py
 import contextlib
 import io
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -236,6 +237,7 @@ class ApiRoutesTests(unittest.TestCase):
             "/api/lookup": server.Handler._api_lookup,
             "/api/options/active": server.Handler._api_options_active,
             "/api/options/itm-scan": server.Handler._api_options_itm_scan,
+            "/api/options/itm-scan-weekly": server.Handler._api_options_itm_scan_weekly,
             "/api/snipe-log": server.Handler._api_snipe_log,
         }
         self.assertEqual(server.Handler._API_ROUTES, expected)
@@ -886,6 +888,195 @@ class GetItmScanTests(NetworkFreeTestCase):
         out = server.get_itm_scan(["SPY"])
         self.assertTrue(out["delayed"])
         self.assertIn("Screening tool", out["note"])
+
+
+class WeeklyItmScanScoreTests(unittest.TestCase):
+    """Tests for _weekly_itm_scan_score(), the Snipe Weekly board's ranking
+    metric.
+
+    Score = 30% probability (|delta|, 0.55->0.90) + 40% profit magnitude
+    (IV-implied-move P&L%, 0%->150%) + 15% spread cost (spread%, inverted,
+    0%->20%) + 15% theta exposure (extrinsic_ratio, inverted, 0%->50%),
+    each sub-score clamped to [0,1] before weighting. Deliberately
+    different weights/floors from the 0DTE _itm_scan_score -- see
+    _weekly_itm_scan_score's docstring for why.
+    """
+    def test_perfect_inputs_score_100(self):
+        self.assertEqual(server._weekly_itm_scan_score(
+            delta=1.0, spread_pct=0.0, magnitude_pnl_pct=1.50, extrinsic_ratio=0.0), 100.0)
+
+    def test_worst_inputs_score_0(self):
+        self.assertEqual(server._weekly_itm_scan_score(
+            delta=0.55, spread_pct=0.20, magnitude_pnl_pct=0.0, extrinsic_ratio=0.50), 0.0)
+
+    def test_beyond_range_inputs_still_clamp_to_0_or_100(self):
+        self.assertEqual(server._weekly_itm_scan_score(
+            delta=1.5, spread_pct=-0.10, magnitude_pnl_pct=3.0, extrinsic_ratio=-0.10), 100.0)
+        self.assertEqual(server._weekly_itm_scan_score(
+            delta=0.30, spread_pct=0.50, magnitude_pnl_pct=-1.0, extrinsic_ratio=0.90), 0.0)
+
+    def test_missing_delta_scores_as_zero_probability(self):
+        self.assertEqual(
+            server._weekly_itm_scan_score(delta=None, spread_pct=0.05,
+                                          magnitude_pnl_pct=0.5, extrinsic_ratio=0.1),
+            server._weekly_itm_scan_score(delta=0.0, spread_pct=0.05,
+                                          magnitude_pnl_pct=0.5, extrinsic_ratio=0.1),
+        )
+
+    def test_missing_spread_scores_as_worst_case_cost(self):
+        self.assertEqual(
+            server._weekly_itm_scan_score(delta=0.8, spread_pct=None,
+                                          magnitude_pnl_pct=0.5, extrinsic_ratio=0.1),
+            server._weekly_itm_scan_score(delta=0.8, spread_pct=0.20,
+                                          magnitude_pnl_pct=0.5, extrinsic_ratio=0.1),
+        )
+
+    def test_missing_extrinsic_ratio_scores_as_worst_case_theta(self):
+        """A None extrinsic_ratio (e.g. ask <= 0, guarded against upstream,
+        but the scorer itself must still degrade safely) must NOT be
+        rewarded as if the contract were pure intrinsic value."""
+        self.assertEqual(
+            server._weekly_itm_scan_score(delta=0.8, spread_pct=0.05,
+                                          magnitude_pnl_pct=0.5, extrinsic_ratio=None),
+            server._weekly_itm_scan_score(delta=0.8, spread_pct=0.05,
+                                          magnitude_pnl_pct=0.5, extrinsic_ratio=0.50),
+        )
+
+    def test_higher_delta_scores_higher_all_else_equal(self):
+        lo = server._weekly_itm_scan_score(delta=0.60, spread_pct=0.05,
+                                           magnitude_pnl_pct=0.5, extrinsic_ratio=0.1)
+        hi = server._weekly_itm_scan_score(delta=0.85, spread_pct=0.05,
+                                           magnitude_pnl_pct=0.5, extrinsic_ratio=0.1)
+        self.assertGreater(hi, lo)
+
+    def test_higher_magnitude_scores_higher_all_else_equal(self):
+        lo = server._weekly_itm_scan_score(delta=0.75, spread_pct=0.05,
+                                           magnitude_pnl_pct=0.10, extrinsic_ratio=0.1)
+        hi = server._weekly_itm_scan_score(delta=0.75, spread_pct=0.05,
+                                           magnitude_pnl_pct=1.00, extrinsic_ratio=0.1)
+        self.assertGreater(hi, lo)
+
+    def test_tighter_spread_scores_higher_all_else_equal(self):
+        wide = server._weekly_itm_scan_score(delta=0.75, spread_pct=0.15,
+                                             magnitude_pnl_pct=0.5, extrinsic_ratio=0.1)
+        tight = server._weekly_itm_scan_score(delta=0.75, spread_pct=0.02,
+                                              magnitude_pnl_pct=0.5, extrinsic_ratio=0.1)
+        self.assertGreater(tight, wide)
+
+    def test_lower_extrinsic_ratio_scores_higher_all_else_equal(self):
+        """Less time premium (more of the price is already intrinsic value)
+        is the safer bet for a week-long hold and must score higher."""
+        mostly_time_value = server._weekly_itm_scan_score(
+            delta=0.75, spread_pct=0.05, magnitude_pnl_pct=0.5, extrinsic_ratio=0.40)
+        mostly_intrinsic = server._weekly_itm_scan_score(
+            delta=0.75, spread_pct=0.05, magnitude_pnl_pct=0.5, extrinsic_ratio=0.05)
+        self.assertGreater(mostly_intrinsic, mostly_time_value)
+
+
+class GetItmScanWeeklyTests(NetworkFreeTestCase):
+    """Tests get_itm_scan_weekly()'s DTE-window filtering, IV-derived
+    execution model math, and ordering -- the weekly sibling of
+    GetItmScanTests, reusing the same _snipe_contract() builder (its
+    dte=0/iv=20.0 defaults are overridden per test as needed)."""
+
+    def _patch(self, spot, contracts):
+        self.patch_server("get_quotes", lambda syms: {"SPY": {"price": spot}})
+        self.patch_server("_fetch_chain", lambda symbol: {
+            "contracts": contracts, "call_vol": 0.0, "put_vol": 0.0, "ts": 1700000000,
+        })
+
+    def test_execution_model_math(self):
+        """contract_cost/breakeven/flat-scenario P&L match plain arithmetic
+        exactly; the IV-derived expected move and favorable-scenario P&L
+        are checked against the same sqrt(time)-scaling formula, computed
+        independently here rather than by calling the private helper."""
+        self._patch(500.0, [_snipe_contract(dte=7, iv=25.0, delta=0.75, bid=5.8, ask=6.0)])
+        out = server.get_itm_scan_weekly(["SPY"])
+        self.assertEqual(len(out["contracts"]), 1)
+        c = out["contracts"][0]
+        self.assertEqual(c["contract_cost"], 600.0)
+        self.assertEqual(c["max_loss"], 600.0)
+        self.assertAlmostEqual(c["breakeven"], 501.0)
+        self.assertAlmostEqual(c["breakeven_cushion_pct"], -0.002)
+        self.assertAlmostEqual(c["extrinsic_ratio"], 1.0 / 6.0, places=4)
+        flat = c["scenarios"]["flat"]
+        self.assertAlmostEqual(flat["pnl_dollars"], -100.0)
+        self.assertAlmostEqual(flat["pnl_pct"], -100.0 / 600.0, places=4)
+
+        expected_move = 0.25 * math.sqrt(7 / 365.0)
+        self.assertAlmostEqual(c["expected_move_pct"], expected_move, places=4)
+        favorable_price = 500.0 * (1 + expected_move)
+        favorable_intrinsic = favorable_price - 495.0
+        expected_pnl_dollars = (favorable_intrinsic - 6.0) * 100
+        favorable = c["scenarios"]["favorable"]
+        self.assertAlmostEqual(favorable["pnl_dollars"], expected_pnl_dollars, places=1)
+        self.assertAlmostEqual(favorable["pnl_pct"],
+                               expected_pnl_dollars / 600.0, places=4)
+
+    def test_dte_within_default_window_is_included(self):
+        """target_dte=7, window=2 (defaults) -> dte in [5,9] included."""
+        self._patch(500.0, [_snipe_contract(dte=5), _snipe_contract(dte=9)])
+        out = server.get_itm_scan_weekly(["SPY"])
+        self.assertEqual(len(out["contracts"]), 2)
+
+    def test_dte_outside_default_window_is_excluded(self):
+        self._patch(500.0, [_snipe_contract(dte=4), _snipe_contract(dte=10)])
+        out = server.get_itm_scan_weekly(["SPY"])
+        self.assertEqual(out["contracts"], [])
+
+    def test_custom_target_dte_and_window(self):
+        self._patch(500.0, [_snipe_contract(dte=13), _snipe_contract(dte=20)])
+        out = server.get_itm_scan_weekly(["SPY"], target_dte=14, window=3)
+        self.assertEqual(len(out["contracts"]), 1)
+        self.assertEqual(out["contracts"][0]["dte"], 13)
+
+    def test_otm_call_is_excluded(self):
+        self._patch(500.0, [_snipe_contract(dte=7, strike=505.0)])
+        out = server.get_itm_scan_weekly(["SPY"])
+        self.assertEqual(out["contracts"], [])
+
+    def test_zero_bid_is_excluded(self):
+        self._patch(500.0, [_snipe_contract(dte=7, bid=0)])
+        out = server.get_itm_scan_weekly(["SPY"])
+        self.assertEqual(out["contracts"], [])
+
+    def test_missing_spot_price_excludes_symbol(self):
+        self.patch_server("get_quotes", lambda syms: {})
+        self.patch_server("_fetch_chain", lambda symbol: {
+            "contracts": [_snipe_contract(dte=7)], "call_vol": 0.0, "put_vol": 0.0, "ts": None,
+        })
+        out = server.get_itm_scan_weekly(["SPY"])
+        self.assertEqual(out["contracts"], [])
+
+    def test_ranked_by_weekly_score_descending(self):
+        low = _snipe_contract(dte=7, strike=498.0, bid=2.4, ask=2.6,
+                              delta=0.58, iv=10.0)
+        high = _snipe_contract(dte=7, strike=470.0, bid=29.5, ask=30.5,
+                               delta=0.88, iv=30.0)
+        self._patch(500.0, [low, high])
+        out = server.get_itm_scan_weekly(["SPY"])
+        scores = [c["weekly_score"] for c in out["contracts"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertEqual(out["contracts"][0]["delta"], 0.88)
+
+    def test_contract_includes_weekly_score_field(self):
+        self._patch(500.0, [_snipe_contract(dte=7)])
+        out = server.get_itm_scan_weekly(["SPY"])
+        self.assertIn("weekly_score", out["contracts"][0])
+        self.assertIsInstance(out["contracts"][0]["weekly_score"], float)
+
+    def test_top_limits_total_contracts_returned(self):
+        contracts = [_snipe_contract(dte=7, strike=490.0 - i) for i in range(5)]
+        self._patch(500.0, contracts)
+        out = server.get_itm_scan_weekly(["SPY"], top=2)
+        self.assertEqual(len(out["contracts"]), 2)
+
+    def test_note_mentions_target_dte_and_screening_disclaimer(self):
+        self._patch(500.0, [_snipe_contract(dte=7)])
+        out = server.get_itm_scan_weekly(["SPY"], target_dte=7)
+        self.assertTrue(out["delayed"])
+        self.assertIn("Screening tool", out["note"])
+        self.assertIn("7-DTE", out["note"])
 
 
 class SnipeLogTests(NetworkFreeTestCase):

@@ -33,6 +33,18 @@ API-key headaches:
                data exists on this free feed) and never places a real trade
                — pure simulated bookkeeping for studying the strategy's
                honest, forward-only hit rate.
+  * Snipe Weekly — same idea as Snipe, but for ~7-day-out ITM contracts
+               instead of same-day. A week-long hold has a different risk
+               shape than 0DTE (real theta bleed, weekend gap risk, lower
+               attainable delta), so it filters to a DTE window (not exactly
+               7 — not every name lands a Friday expiry precisely there),
+               derives each contract's own expected move from its IV
+               (spot * iv * sqrt(dte/365)) instead of a fixed spot-move
+               scenario, and scores on probability + profit magnitude +
+               spread + theta exposure — the Snipe board's score explicitly
+               excludes raw payoff by design, which is wrong for "biggest
+               profit" questions. Same disclaimer: screening tool only,
+               never places or simulates placing an order.
 
 Run:  python server.py                (defaults to port 8474)
       python server.py --port 9000
@@ -46,6 +58,7 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import json
+import math
 import os
 import re
 import sys
@@ -805,6 +818,208 @@ def get_itm_scan(symbols=None, down_pct=-0.005, flat_pct=0.0, up_pct=0.005, top=
     return out
 
 
+# Snipe Weekly Score weights/ranges -- named here for the same reason as the
+# 0DTE _SCORE_* constants above: one place to retune instead of magic
+# numbers in the formula. Deliberately a DIFFERENT set of weights/floors
+# from the 0DTE Snipe Score, not a parameterization of it -- a week-long
+# hold has a different risk shape (real theta bleed, weekend gap risk) and
+# a different goal (biggest attainable profit, not "small and repeatable").
+_WEEKLY_PROB_WEIGHT = 0.30     # |delta| -- probability of finishing ITM
+_WEEKLY_MAGNITUDE_WEIGHT = 0.40  # P&L% at the contract's own IV-implied move
+_WEEKLY_SPREAD_WEIGHT = 0.15   # same spread-cost signal as the 0DTE score
+_WEEKLY_THETA_WEIGHT = 0.15    # extrinsic (time) value as a fraction of price
+_WEEKLY_DELTA_FLOOR = 0.55     # |delta| at/below this scores 0 on probability
+_WEEKLY_DELTA_CEIL = 0.90      # |delta| at/above this scores 1 on probability
+_WEEKLY_MAGNITUDE_CEIL = 1.50  # P&L% at/above this (150%) scores 1 on magnitude
+_WEEKLY_SPREAD_CEIL = 0.20     # spread% at/above this scores 0 on spread cost
+_WEEKLY_EXTRINSIC_CEIL = 0.50  # extrinsic-ratio at/above this scores 0 on theta
+
+
+def _weekly_itm_scan_score(delta, spread_pct, magnitude_pnl_pct, extrinsic_ratio):
+    """0-100 "Weekly Score" -- ranks ~7-DTE ITM contracts by probability of
+    finishing ITM blended with the SIZE of the profit if the contract's own
+    IV-implied move actually happens, unlike the 0DTE Snipe Score (which
+    explicitly excludes raw payoff by design -- see _itm_scan_score). Four
+    signals, each clamped to [0,1] before weighting so one extreme input
+    can't swamp the other three:
+
+      - probability (30%): |delta|, scaled 0.55 (score 0) to 0.90 (score 1).
+        Lower floor/ceiling than the 0DTE score's 0.70/1.00 -- a contract a
+        full week from expiry rarely trades at 0.85+ delta even when solidly
+        ITM today.
+      - profit magnitude (40%): P&L% if the underlying moves, by expiry, the
+        amount this contract's own IV implies (see expected_move_pct in
+        get_itm_scan_weekly) -- scaled 0% (score 0) to 150% (score 1). This
+        is the "biggest profit" signal the 0DTE score deliberately omits.
+      - spread cost (15%): identical formula to the 0DTE score.
+      - theta/extrinsic exposure (15%): extrinsic_ratio (time value as a
+        fraction of the ask) inverted and scaled 0%->1, 50%->0. A week-long
+        hold actually bleeds theta if the move doesn't happen, unlike 0DTE
+        where it barely matters intraday -- a contract that's mostly time
+        premium is a worse bet here even at the same delta and spread.
+    """
+    prob = _clamp01((abs(delta or 0) - _WEEKLY_DELTA_FLOOR) /
+                     (_WEEKLY_DELTA_CEIL - _WEEKLY_DELTA_FLOOR))
+    magnitude = _clamp01(magnitude_pnl_pct / _WEEKLY_MAGNITUDE_CEIL)
+    spread = _clamp01(1 - (spread_pct if spread_pct is not None else 1.0) / _WEEKLY_SPREAD_CEIL)
+    theta = _clamp01(1 - (extrinsic_ratio if extrinsic_ratio is not None else 1.0)
+                      / _WEEKLY_EXTRINSIC_CEIL)
+    return round(100 * (_WEEKLY_PROB_WEIGHT * prob +
+                         _WEEKLY_MAGNITUDE_WEIGHT * magnitude +
+                         _WEEKLY_SPREAD_WEIGHT * spread +
+                         _WEEKLY_THETA_WEIGHT * theta), 1)
+
+
+def get_itm_scan_weekly(symbols=None, target_dte=7, window=2, top=20):
+    """Scan SNIPE_SCAN underlyings for ~week-out deep-ITM candidates ranked
+    by probability blended with profit magnitude, not the 0DTE board's
+    "small and repeatable" goal -- see _weekly_itm_scan_score.
+
+    Sibling to get_itm_scan(), reusing the same chain-fetch/quote-fetch
+    plumbing and per-contract execution-model shape (breakeven,
+    contract_cost, max_loss) so the two boards' contract dicts stay
+    interchangeable in the UI. Diverges where the strategy actually
+    differs: the DTE filter is a window around target_dte (not `== 0`,
+    since not every name lands an expiry on exactly day 7), and the
+    "scenarios" moves are derived per-contract from its own IV instead of
+    one fixed spot-move percentage for every contract -- a week is long
+    enough that a flat, near-zero IV name and a wild, high-IV name
+    shouldn't be priced against the same fixed bump.
+
+    Args:
+        symbols (list): Underlyings to scan. Defaults to SNIPE_SCAN.
+        target_dte (int): Center of the DTE window, in calendar days.
+        window (int): Contracts with dte in [target_dte-window,
+            target_dte+window] are included.
+        top (int): Max contracts to return across all symbols, ranked by
+            Weekly Score descending. Defaults to 20.
+
+    Returns:
+        dict: {as_of, delayed, note, contracts}.
+    """
+    if symbols is None:
+        symbols = SNIPE_SCAN
+    symbols = symbols[:MAX_API_SYMBOLS]  # see get_itm_scan's identical guard
+    top = max(top, 0)  # see get_active_options' identical guard
+    dte_lo, dte_hi = target_dte - window, target_dte + window
+    key = f"itm-weekly:{','.join(sorted(symbols))}:{dte_lo}:{dte_hi}:{top}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    quotes = get_quotes(symbols)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        chains = dict(zip(symbols, executor.map(_fetch_chain, symbols)))
+
+    all_contracts = []
+    as_of = None
+    for sym in symbols:
+        res = chains.get(sym) or {}
+        as_of = as_of or res.get("ts")
+        spot = (quotes.get(sym) or {}).get("price")
+        if not spot:
+            continue  # can't score moneyness/breakeven/P&L without a spot price
+        for c in res.get("contracts", []):
+            dte = c.get("dte")
+            if dte is None or not (dte_lo <= dte <= dte_hi):
+                continue
+            strike, typ = c.get("strike"), c.get("type")
+            is_itm = (typ == "C" and strike < spot) or (typ == "P" and strike > spot)
+            if not is_itm:
+                continue
+            bid, ask = c.get("bid"), c.get("ask")
+            if bid is None or ask is None or bid <= 0 or ask <= 0:
+                continue  # spread math needs a real two-sided market
+
+            mid = (bid + ask) / 2
+            spread_pct = (ask - bid) / mid if mid else None
+            moneyness_pct = ((spot - strike) / spot if typ == "C"
+                              else (strike - spot) / spot)
+            delta = c.get("delta")
+            iv = c.get("iv") or 0.0  # already a percent, e.g. 23.4 == 23.4%
+
+            intrinsic = max(0.0, spot - strike) if typ == "C" else max(0.0, strike - spot)
+            extrinsic = max(0.0, ask - intrinsic)
+            extrinsic_ratio = extrinsic / ask if ask else None
+
+            # Per-contract expected move from its own IV, not a fixed spot-move
+            # scenario -- standard vol-scaling: annualized vol * sqrt(time).
+            expected_move_pct = (iv / 100.0) * math.sqrt(max(dte, 0) / 365.0)
+            favorable_price = (spot * (1 + expected_move_pct) if typ == "C"
+                               else spot * (1 - expected_move_pct))
+            favorable_intrinsic = (max(0.0, favorable_price - strike) if typ == "C"
+                                   else max(0.0, strike - favorable_price))
+
+            contract_cost = ask * 100
+            if typ == "C":
+                breakeven = strike + ask
+                breakeven_cushion_pct = (spot - breakeven) / spot
+            else:
+                breakeven = strike - ask
+                breakeven_cushion_pct = (breakeven - spot) / spot
+
+            magnitude_pnl_dollars = (favorable_intrinsic - ask) * 100
+            magnitude_pnl_pct = magnitude_pnl_dollars / contract_cost if contract_cost else 0.0
+            flat_pnl_dollars = (intrinsic - ask) * 100
+
+            score = _weekly_itm_scan_score(delta, spread_pct, magnitude_pnl_pct, extrinsic_ratio)
+
+            all_contracts.append({
+                "underlying": c.get("underlying"),
+                "type": typ,
+                "strike": strike,
+                "expiry": c.get("expiry"),
+                "dte": dte,
+                "bid": bid,
+                "ask": ask,
+                "volume": c.get("volume"),
+                "oi": c.get("oi"),
+                "iv": c.get("iv"),
+                "delta": delta,
+                "theta": c.get("theta"),
+                "spot": spot,
+                "mid": round(mid, 4),
+                "spread_pct": round(spread_pct, 4) if spread_pct is not None else None,
+                "moneyness_pct": round(moneyness_pct, 4),
+                "extrinsic_ratio": round(extrinsic_ratio, 4) if extrinsic_ratio is not None else None,
+                "expected_move_pct": round(expected_move_pct, 4),
+                "weekly_score": score,
+                "contract_cost": round(contract_cost, 2),
+                "max_loss": round(contract_cost, 2),  # 1 long contract: max loss == entry cost
+                "breakeven": round(breakeven, 4),
+                "breakeven_cushion_pct": round(breakeven_cushion_pct, 4),
+                "scenarios": {
+                    "flat": {"scenario_price": round(spot, 2),
+                             "pnl_dollars": round(flat_pnl_dollars, 2),
+                             "pnl_pct": round(flat_pnl_dollars / contract_cost, 4)
+                                        if contract_cost else 0.0},
+                    "favorable": {"scenario_price": round(favorable_price, 2),
+                                  "move_pct": round(expected_move_pct, 4),
+                                  "pnl_dollars": round(magnitude_pnl_dollars, 2),
+                                  "pnl_pct": round(magnitude_pnl_pct, 4)},
+                },
+            })
+
+    # Ranked by Weekly Score (highest first) -- probability + profit
+    # magnitude + spread + theta exposure. Two contracts can legitimately
+    # trade probability against magnitude differently; weekly_score is the
+    # blended default sort, but abs(delta) and scenarios.favorable.pnl_pct
+    # are both returned unscaled so a client can sort by either axis alone
+    # instead of only trusting one composite number.
+    all_contracts.sort(key=lambda c: c["weekly_score"], reverse=True)
+    out = {
+        "as_of": as_of,
+        "delayed": True,
+        "note": (f"CBOE delayed ~15min. ~{target_dte}-DTE ITM contracts (window "
+                 f"+/-{window} days). Ranked by Weekly Score (probability + "
+                 "IV-implied profit magnitude + spread + theta cost). Screening "
+                 "tool, not a trade recommendation. No trades are placed automatically."),
+        "contracts": all_contracts[:top],
+    }
+    cache_put(key, out, ttl=300)  # a week-out decision doesn't need 0DTE-grade freshness
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Snipe Log -- forward paper-trading track record for the Snipe board's
 # top-scored pick each day.
@@ -1158,6 +1373,13 @@ class Handler(BaseHTTPRequestHandler):
         up = float(self._qparam(query, "up", "0.005"))
         return get_itm_scan(syms, down, flat, up, top)
 
+    def _api_options_itm_scan_weekly(self, query):
+        syms = self._qsymbols(query, default=SNIPE_SCAN)
+        top = int(self._qparam(query, "top", "20"))
+        target_dte = int(self._qparam(query, "target_dte", "7"))
+        window = int(self._qparam(query, "window", "2"))
+        return get_itm_scan_weekly(syms, target_dte, window, top)
+
     def _api_snipe_log(self, query):
         return get_snipe_log()
 
@@ -1172,6 +1394,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/lookup": _api_lookup,
         "/api/options/active": _api_options_active,
         "/api/options/itm-scan": _api_options_itm_scan,
+        "/api/options/itm-scan-weekly": _api_options_itm_scan_weekly,
         "/api/snipe-log": _api_snipe_log,
     }
 
