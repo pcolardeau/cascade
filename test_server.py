@@ -1079,6 +1079,117 @@ class GetItmScanWeeklyTests(NetworkFreeTestCase):
         self.assertIn("7-DTE", out["note"])
 
 
+class ScanItmCandidatesTests(NetworkFreeTestCase):
+    """Tests for _scan_itm_candidates(), the fetch/filter/base-metrics core
+    shared by the 0DTE and weekly boards.
+
+    Covers it directly (not just through the two callers) because a
+    regression here silently changes BOTH boards at once.
+    """
+    def _patch(self, spot, contracts):
+        self.patch_server("get_quotes", lambda syms: {"SPY": {"price": spot}})
+        self.patch_server("_fetch_chain", lambda symbol: {
+            "contracts": contracts, "call_vol": 0.0, "put_vol": 0.0, "ts": 1700000000,
+        })
+
+    def test_base_metrics_math(self):
+        """spot 500, ITM call strike 495, bid 4.9/ask 5.1: intrinsic is 5.0,
+        so extrinsic is the 0.1 of ask above it."""
+        self._patch(500.0, [_snipe_contract(dte=0)])
+        as_of, candidates = server._scan_itm_candidates(["SPY"], 0, 0)
+        self.assertEqual(as_of, 1700000000)
+        self.assertEqual(len(candidates), 1)
+        _c, spot, base = candidates[0]
+        self.assertEqual(spot, 500.0)
+        self.assertAlmostEqual(base["mid"], 5.0)
+        self.assertAlmostEqual(base["spread_pct"], 0.2 / 5.0)
+        self.assertAlmostEqual(base["moneyness_pct"], 5.0 / 500.0)
+        self.assertAlmostEqual(base["intrinsic"], 5.0)
+        self.assertAlmostEqual(base["extrinsic"], 0.1, places=6)
+        self.assertAlmostEqual(base["extrinsic_ratio"], 0.1 / 5.1, places=6)
+        self.assertAlmostEqual(base["contract_cost"], 510.0)
+        self.assertAlmostEqual(base["breakeven"], 500.1)
+
+    def test_put_side_metrics_use_strike_minus_spot(self):
+        self._patch(500.0, [_snipe_contract(dte=0, type="P", strike=505.0)])
+        _as_of, candidates = server._scan_itm_candidates(["SPY"], 0, 0)
+        _c, _spot, base = candidates[0]
+        self.assertAlmostEqual(base["moneyness_pct"], 5.0 / 500.0)
+        self.assertAlmostEqual(base["intrinsic"], 5.0)
+        self.assertAlmostEqual(base["breakeven"], 499.9)
+
+    def test_dte_window_is_inclusive_on_both_ends(self):
+        self._patch(500.0, [_snipe_contract(dte=d) for d in (4, 5, 7, 9, 10)])
+        _as_of, candidates = server._scan_itm_candidates(["SPY"], 5, 9)
+        self.assertEqual(sorted(c[0]["dte"] for c in candidates), [5, 7, 9])
+
+    def test_otm_and_untradeable_contracts_are_dropped(self):
+        self._patch(500.0, [
+            _snipe_contract(dte=0, strike=505.0),   # OTM call
+            _snipe_contract(dte=0, bid=0),          # no two-sided market
+            _snipe_contract(dte=0, ask=None),       # missing ask
+        ])
+        _as_of, candidates = server._scan_itm_candidates(["SPY"], 0, 0)
+        self.assertEqual(candidates, [])
+
+    def test_missing_spot_price_yields_no_candidates(self):
+        self.patch_server("get_quotes", lambda syms: {})
+        self.patch_server("_fetch_chain", lambda symbol: {
+            "contracts": [_snipe_contract(dte=0)], "call_vol": 0.0, "put_vol": 0.0, "ts": None,
+        })
+        _as_of, candidates = server._scan_itm_candidates(["SPY"], 0, 0)
+        self.assertEqual(candidates, [])
+
+
+class ItmScanEndpointHorizonRoutingTests(NetworkFreeTestCase):
+    """The /api/options/itm-scan handler picks the board by horizon:
+    target_dte=0 (the default) keeps the 0DTE score, target_dte>0 routes to
+    the weekly board's scoring. Verifies the dispatch itself, not the
+    scan math (covered by the two GetItmScan* classes)."""
+
+    def _record_calls(self):
+        calls = {}
+        self.patch_server("get_itm_scan",
+                          lambda *a, **k: calls.setdefault("0dte", (a, k)) or {"contracts": []})
+        self.patch_server("get_itm_scan_weekly",
+                          lambda *a, **k: calls.setdefault("weekly", (a, k)) or {"contracts": []})
+        return calls
+
+    def test_no_target_dte_uses_the_0dte_board(self):
+        calls = self._record_calls()
+        server.Handler._api_options_itm_scan(server.Handler, {})
+        self.assertIn("0dte", calls)
+        self.assertNotIn("weekly", calls)
+
+    def test_explicit_target_dte_zero_uses_the_0dte_board(self):
+        calls = self._record_calls()
+        server.Handler._api_options_itm_scan(server.Handler, {"target_dte": ["0"]})
+        self.assertIn("0dte", calls)
+        self.assertNotIn("weekly", calls)
+
+    def test_positive_target_dte_routes_to_the_weekly_board(self):
+        calls = self._record_calls()
+        server.Handler._api_options_itm_scan(server.Handler, {"target_dte": ["7"]})
+        self.assertIn("weekly", calls)
+        self.assertNotIn("0dte", calls)
+        args, _kw = calls["weekly"]
+        self.assertEqual(args[1], 7, "target_dte is threaded through")
+        self.assertEqual(args[2], 2, "window defaults to 2")
+
+    def test_custom_window_is_threaded_through(self):
+        calls = self._record_calls()
+        server.Handler._api_options_itm_scan(server.Handler, {"target_dte": ["14"], "window": ["3"]})
+        args, _kw = calls["weekly"]
+        self.assertEqual((args[1], args[2]), (14, 3))
+
+    def test_weekly_path_still_routes_to_the_weekly_board(self):
+        """The dedicated /api/options/itm-scan-weekly path stays live -- the
+        unified target_dte param is additive, not a replacement."""
+        calls = self._record_calls()
+        server.Handler._api_options_itm_scan_weekly(server.Handler, {})
+        self.assertIn("weekly", calls)
+
+
 class SnipeLogTests(NetworkFreeTestCase):
     """Tests for the forward paper-trading Snipe Log: snapshot creation and
     same-day dedupe, next-day close resolution and P&L math (a known win and

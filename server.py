@@ -690,6 +690,79 @@ def _itm_scan_score(delta, spread_pct, flat_pnl_pct):
                          _SCORE_COST_WEIGHT * cost), 1)
 
 
+def _scan_itm_candidates(symbols, dte_lo, dte_hi):
+    """Shared scan core behind every ITM board (0DTE Snipe, Snipe Weekly,
+    debit spreads).
+
+    Does the one network fan-out (quotes + full chains, in parallel), filters
+    to in-the-money contracts whose DTE falls in [dte_lo, dte_hi] and which
+    have a real two-sided market, and computes the per-contract math that is
+    genuinely identical across boards: mid/spread, moneyness, intrinsic and
+    extrinsic value, 1-contract cost, breakeven and its cushion.
+
+    Deliberately stops short of scoring and scenarios -- those are where the
+    boards actually differ (the 0DTE score rewards banked flat-scenario
+    profit; the weekly score rewards profit magnitude at an IV-implied move),
+    and collapsing them into one formula would silently re-tune both boards'
+    calibration. This helper exists to kill the duplicated *plumbing*, not to
+    pretend the strategies are the same.
+
+    Args:
+        symbols (list): Underlyings to scan (already caller-clamped).
+        dte_lo, dte_hi (int): Inclusive DTE window. Pass 0, 0 for 0DTE.
+
+    Returns:
+        (as_of, candidates): `candidates` is a list of (raw_contract, spot,
+        base) triples, where `base` holds the shared metrics above.
+    """
+    quotes = get_quotes(symbols)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        chains = dict(zip(symbols, executor.map(_fetch_chain, symbols)))
+
+    candidates = []
+    as_of = None
+    for sym in symbols:
+        res = chains.get(sym) or {}
+        as_of = as_of or res.get("ts")
+        spot = (quotes.get(sym) or {}).get("price")
+        if not spot:
+            continue  # can't score moneyness/breakeven/P&L without a spot price
+        for c in res.get("contracts", []):
+            dte = c.get("dte")
+            if dte is None or not (dte_lo <= dte <= dte_hi):
+                continue
+            strike, typ = c.get("strike"), c.get("type")
+            is_itm = (typ == "C" and strike < spot) or (typ == "P" and strike > spot)
+            if not is_itm:
+                continue
+            bid, ask = c.get("bid"), c.get("ask")
+            if bid is None or ask is None or bid <= 0 or ask <= 0:
+                continue  # spread math needs a real two-sided market
+
+            mid = (bid + ask) / 2
+            intrinsic = max(0.0, spot - strike) if typ == "C" else max(0.0, strike - spot)
+            if typ == "C":
+                breakeven = strike + ask
+                breakeven_cushion_pct = (spot - breakeven) / spot
+            else:
+                breakeven = strike - ask
+                breakeven_cushion_pct = (breakeven - spot) / spot
+
+            candidates.append((c, spot, {
+                "mid": mid,
+                "spread_pct": (ask - bid) / mid if mid else None,
+                "moneyness_pct": ((spot - strike) / spot if typ == "C"
+                                   else (strike - spot) / spot),
+                "intrinsic": intrinsic,
+                "extrinsic": max(0.0, ask - intrinsic),
+                "extrinsic_ratio": (max(0.0, ask - intrinsic) / ask) if ask else None,
+                "contract_cost": ask * 100,
+                "breakeven": breakeven,
+                "breakeven_cushion_pct": breakeven_cushion_pct,
+            }))
+    return as_of, candidates
+
+
 def get_itm_scan(symbols=None, down_pct=-0.005, flat_pct=0.0, up_pct=0.005, top=20):
     """Scan SNIPE_SCAN underlyings for 0DTE deep-ITM "sniping" candidates.
 
@@ -698,6 +771,11 @@ def get_itm_scan(symbols=None, down_pct=-0.005, flat_pct=0.0, up_pct=0.005, top=
     tier) and a simple 1-contract execution model (entry at ask, breakeven,
     P&L at three spot-move scenarios). This is a screening/analysis tool --
     it never places or simulates placing an order.
+
+    Shares its fetch/filter/execution-model plumbing with the weekly board
+    via _scan_itm_candidates(); keeps its own scoring, which deliberately
+    rewards "already profitable if the underlying doesn't move" rather than
+    raw payoff (see _itm_scan_score).
 
     Args:
         symbols (list): Underlyings to scan. Defaults to SNIPE_SCAN.
@@ -720,84 +798,56 @@ def get_itm_scan(symbols=None, down_pct=-0.005, flat_pct=0.0, up_pct=0.005, top=
     if cached is not None:
         return cached
 
-    quotes = get_quotes(symbols)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        chains = dict(zip(symbols, executor.map(_fetch_chain, symbols)))
-
     scenarios = (("down", down_pct), ("flat", flat_pct), ("up", up_pct))
+    as_of, candidates = _scan_itm_candidates(symbols, 0, 0)
     all_contracts = []
-    as_of = None
-    for sym in symbols:
-        res = chains.get(sym) or {}
-        as_of = as_of or res.get("ts")
-        spot = (quotes.get(sym) or {}).get("price")
-        if not spot:
-            continue  # can't score moneyness/breakeven/P&L without a spot price
-        for c in res.get("contracts", []):
-            if c.get("dte") != 0:
-                continue
-            strike, typ = c.get("strike"), c.get("type")
-            is_itm = (typ == "C" and strike < spot) or (typ == "P" and strike > spot)
-            if not is_itm:
-                continue
-            bid, ask = c.get("bid"), c.get("ask")
-            if bid is None or ask is None or bid <= 0 or ask <= 0:
-                continue  # spread math needs a real two-sided market
+    for c, spot, base in candidates:
+        strike, typ = c.get("strike"), c.get("type")
+        ask = c.get("ask")
+        delta = c.get("delta")
+        spread_pct = base["spread_pct"]
+        contract_cost = base["contract_cost"]
+        tier = _itm_scan_tier(spread_pct, delta, base["moneyness_pct"])
 
-            mid = (bid + ask) / 2
-            spread_pct = (ask - bid) / mid if mid else None
-            moneyness_pct = ((spot - strike) / spot if typ == "C"
-                              else (strike - spot) / spot)
-            delta = c.get("delta")
-            tier = _itm_scan_tier(spread_pct, delta, moneyness_pct)
+        scenario_out = {}
+        for name, move_pct in scenarios:
+            scenario_price = spot * (1 + move_pct)
+            intrinsic = (max(0.0, scenario_price - strike) if typ == "C"
+                         else max(0.0, strike - scenario_price))
+            pnl_dollars = (intrinsic - ask) * 100
+            scenario_out[name] = {
+                "move_pct": move_pct,
+                "scenario_price": round(scenario_price, 2),
+                "pnl_dollars": round(pnl_dollars, 2),
+                "pnl_pct": round(pnl_dollars / contract_cost, 4),
+            }
 
-            contract_cost = ask * 100
-            if typ == "C":
-                breakeven = strike + ask
-                breakeven_cushion_pct = (spot - breakeven) / spot
-            else:
-                breakeven = strike - ask
-                breakeven_cushion_pct = (breakeven - spot) / spot
+        score = _itm_scan_score(delta, spread_pct, scenario_out["flat"]["pnl_pct"])
 
-            scenario_out = {}
-            for name, move_pct in scenarios:
-                scenario_price = spot * (1 + move_pct)
-                intrinsic = (max(0.0, scenario_price - strike) if typ == "C"
-                             else max(0.0, strike - scenario_price))
-                pnl_dollars = (intrinsic - ask) * 100
-                scenario_out[name] = {
-                    "move_pct": move_pct,
-                    "scenario_price": round(scenario_price, 2),
-                    "pnl_dollars": round(pnl_dollars, 2),
-                    "pnl_pct": round(pnl_dollars / contract_cost, 4),
-                }
-
-            score = _itm_scan_score(delta, spread_pct, scenario_out["flat"]["pnl_pct"])
-
-            all_contracts.append({
-                "underlying": c.get("underlying"),
-                "type": typ,
-                "strike": strike,
-                "expiry": c.get("expiry"),
-                "dte": c.get("dte"),
-                "bid": bid,
-                "ask": ask,
-                "volume": c.get("volume"),
-                "oi": c.get("oi"),
-                "iv": c.get("iv"),
-                "delta": delta,
-                "spot": spot,
-                "mid": round(mid, 4),
-                "spread_pct": round(spread_pct, 4) if spread_pct is not None else None,
-                "moneyness_pct": round(moneyness_pct, 4),
-                "tier": tier,
-                "score": score,
-                "contract_cost": round(contract_cost, 2),
-                "max_loss": round(contract_cost, 2),  # 1 long contract: max loss == entry cost
-                "breakeven": round(breakeven, 4),
-                "breakeven_cushion_pct": round(breakeven_cushion_pct, 4),
-                "scenarios": scenario_out,
-            })
+        all_contracts.append({
+            "underlying": c.get("underlying"),
+            "type": typ,
+            "strike": strike,
+            "expiry": c.get("expiry"),
+            "dte": c.get("dte"),
+            "bid": c.get("bid"),
+            "ask": ask,
+            "volume": c.get("volume"),
+            "oi": c.get("oi"),
+            "iv": c.get("iv"),
+            "delta": delta,
+            "spot": spot,
+            "mid": round(base["mid"], 4),
+            "spread_pct": round(spread_pct, 4) if spread_pct is not None else None,
+            "moneyness_pct": round(base["moneyness_pct"], 4),
+            "tier": tier,
+            "score": score,
+            "contract_cost": round(contract_cost, 2),
+            "max_loss": round(contract_cost, 2),  # 1 long contract: max loss == entry cost
+            "breakeven": round(base["breakeven"], 4),
+            "breakeven_cushion_pct": round(base["breakeven_cushion_pct"], 4),
+            "scenarios": scenario_out,
+        })
 
     # Ranked by Snipe Score (highest first) -- see _itm_scan_score for what
     # that rewards: high probability of finishing ITM, already profitable
@@ -907,98 +957,67 @@ def get_itm_scan_weekly(symbols=None, target_dte=7, window=2, top=20):
     if cached is not None:
         return cached
 
-    quotes = get_quotes(symbols)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        chains = dict(zip(symbols, executor.map(_fetch_chain, symbols)))
-
+    as_of, candidates = _scan_itm_candidates(symbols, dte_lo, dte_hi)
     all_contracts = []
-    as_of = None
-    for sym in symbols:
-        res = chains.get(sym) or {}
-        as_of = as_of or res.get("ts")
-        spot = (quotes.get(sym) or {}).get("price")
-        if not spot:
-            continue  # can't score moneyness/breakeven/P&L without a spot price
-        for c in res.get("contracts", []):
-            dte = c.get("dte")
-            if dte is None or not (dte_lo <= dte <= dte_hi):
-                continue
-            strike, typ = c.get("strike"), c.get("type")
-            is_itm = (typ == "C" and strike < spot) or (typ == "P" and strike > spot)
-            if not is_itm:
-                continue
-            bid, ask = c.get("bid"), c.get("ask")
-            if bid is None or ask is None or bid <= 0 or ask <= 0:
-                continue  # spread math needs a real two-sided market
+    for c, spot, base in candidates:
+        dte = c.get("dte")
+        strike, typ = c.get("strike"), c.get("type")
+        ask = c.get("ask")
+        delta = c.get("delta")
+        iv = c.get("iv") or 0.0  # already a percent, e.g. 23.4 == 23.4%
+        spread_pct = base["spread_pct"]
+        extrinsic_ratio = base["extrinsic_ratio"]
+        contract_cost = base["contract_cost"]
 
-            mid = (bid + ask) / 2
-            spread_pct = (ask - bid) / mid if mid else None
-            moneyness_pct = ((spot - strike) / spot if typ == "C"
-                              else (strike - spot) / spot)
-            delta = c.get("delta")
-            iv = c.get("iv") or 0.0  # already a percent, e.g. 23.4 == 23.4%
+        # Per-contract expected move from its own IV, not a fixed spot-move
+        # scenario -- standard vol-scaling: annualized vol * sqrt(time).
+        expected_move_pct = (iv / 100.0) * math.sqrt(max(dte, 0) / 365.0)
+        favorable_price = (spot * (1 + expected_move_pct) if typ == "C"
+                           else spot * (1 - expected_move_pct))
+        favorable_intrinsic = (max(0.0, favorable_price - strike) if typ == "C"
+                               else max(0.0, strike - favorable_price))
 
-            intrinsic = max(0.0, spot - strike) if typ == "C" else max(0.0, strike - spot)
-            extrinsic = max(0.0, ask - intrinsic)
-            extrinsic_ratio = extrinsic / ask if ask else None
+        magnitude_pnl_dollars = (favorable_intrinsic - ask) * 100
+        magnitude_pnl_pct = magnitude_pnl_dollars / contract_cost if contract_cost else 0.0
+        flat_pnl_dollars = (base["intrinsic"] - ask) * 100
 
-            # Per-contract expected move from its own IV, not a fixed spot-move
-            # scenario -- standard vol-scaling: annualized vol * sqrt(time).
-            expected_move_pct = (iv / 100.0) * math.sqrt(max(dte, 0) / 365.0)
-            favorable_price = (spot * (1 + expected_move_pct) if typ == "C"
-                               else spot * (1 - expected_move_pct))
-            favorable_intrinsic = (max(0.0, favorable_price - strike) if typ == "C"
-                                   else max(0.0, strike - favorable_price))
+        score = _weekly_itm_scan_score(delta, spread_pct, magnitude_pnl_pct, extrinsic_ratio)
 
-            contract_cost = ask * 100
-            if typ == "C":
-                breakeven = strike + ask
-                breakeven_cushion_pct = (spot - breakeven) / spot
-            else:
-                breakeven = strike - ask
-                breakeven_cushion_pct = (breakeven - spot) / spot
-
-            magnitude_pnl_dollars = (favorable_intrinsic - ask) * 100
-            magnitude_pnl_pct = magnitude_pnl_dollars / contract_cost if contract_cost else 0.0
-            flat_pnl_dollars = (intrinsic - ask) * 100
-
-            score = _weekly_itm_scan_score(delta, spread_pct, magnitude_pnl_pct, extrinsic_ratio)
-
-            all_contracts.append({
-                "underlying": c.get("underlying"),
-                "type": typ,
-                "strike": strike,
-                "expiry": c.get("expiry"),
-                "dte": dte,
-                "bid": bid,
-                "ask": ask,
-                "volume": c.get("volume"),
-                "oi": c.get("oi"),
-                "iv": c.get("iv"),
-                "delta": delta,
-                "theta": c.get("theta"),
-                "spot": spot,
-                "mid": round(mid, 4),
-                "spread_pct": round(spread_pct, 4) if spread_pct is not None else None,
-                "moneyness_pct": round(moneyness_pct, 4),
-                "extrinsic_ratio": round(extrinsic_ratio, 4) if extrinsic_ratio is not None else None,
-                "expected_move_pct": round(expected_move_pct, 4),
-                "weekly_score": score,
-                "contract_cost": round(contract_cost, 2),
-                "max_loss": round(contract_cost, 2),  # 1 long contract: max loss == entry cost
-                "breakeven": round(breakeven, 4),
-                "breakeven_cushion_pct": round(breakeven_cushion_pct, 4),
-                "scenarios": {
-                    "flat": {"scenario_price": round(spot, 2),
-                             "pnl_dollars": round(flat_pnl_dollars, 2),
-                             "pnl_pct": round(flat_pnl_dollars / contract_cost, 4)
-                                        if contract_cost else 0.0},
-                    "favorable": {"scenario_price": round(favorable_price, 2),
-                                  "move_pct": round(expected_move_pct, 4),
-                                  "pnl_dollars": round(magnitude_pnl_dollars, 2),
-                                  "pnl_pct": round(magnitude_pnl_pct, 4)},
-                },
-            })
+        all_contracts.append({
+            "underlying": c.get("underlying"),
+            "type": typ,
+            "strike": strike,
+            "expiry": c.get("expiry"),
+            "dte": dte,
+            "bid": c.get("bid"),
+            "ask": ask,
+            "volume": c.get("volume"),
+            "oi": c.get("oi"),
+            "iv": c.get("iv"),
+            "delta": delta,
+            "theta": c.get("theta"),
+            "spot": spot,
+            "mid": round(base["mid"], 4),
+            "spread_pct": round(spread_pct, 4) if spread_pct is not None else None,
+            "moneyness_pct": round(base["moneyness_pct"], 4),
+            "extrinsic_ratio": round(extrinsic_ratio, 4) if extrinsic_ratio is not None else None,
+            "expected_move_pct": round(expected_move_pct, 4),
+            "weekly_score": score,
+            "contract_cost": round(contract_cost, 2),
+            "max_loss": round(contract_cost, 2),  # 1 long contract: max loss == entry cost
+            "breakeven": round(base["breakeven"], 4),
+            "breakeven_cushion_pct": round(base["breakeven_cushion_pct"], 4),
+            "scenarios": {
+                "flat": {"scenario_price": round(spot, 2),
+                         "pnl_dollars": round(flat_pnl_dollars, 2),
+                         "pnl_pct": round(flat_pnl_dollars / contract_cost, 4)
+                                    if contract_cost else 0.0},
+                "favorable": {"scenario_price": round(favorable_price, 2),
+                              "move_pct": round(expected_move_pct, 4),
+                              "pnl_dollars": round(magnitude_pnl_dollars, 2),
+                              "pnl_pct": round(magnitude_pnl_pct, 4)},
+            },
+        })
 
     # Ranked by Weekly Score (highest first) -- probability + profit
     # magnitude + spread + theta exposure. Two contracts can legitimately
@@ -1366,8 +1385,18 @@ class Handler(BaseHTTPRequestHandler):
         return get_active_options(syms, top)
 
     def _api_options_itm_scan(self, query):
+        """0DTE board by default. `target_dte`/`window` route to the weekly
+        board's scoring instead of the 0DTE score, so one endpoint can serve
+        any horizon -- the two boards optimize for genuinely different things
+        (see _itm_scan_score vs _weekly_itm_scan_score), so the horizon picks
+        the formula rather than one formula being stretched across both.
+        /api/options/itm-scan-weekly stays live as its own path."""
         syms = self._qsymbols(query, default=SNIPE_SCAN)
         top = int(self._qparam(query, "top", "20"))
+        target_dte = int(self._qparam(query, "target_dte", "0"))
+        if target_dte > 0:
+            window = int(self._qparam(query, "window", "2"))
+            return get_itm_scan_weekly(syms, target_dte, window, top)
         down = float(self._qparam(query, "down", "-0.005"))
         flat = float(self._qparam(query, "flat", "0.0"))
         up = float(self._qparam(query, "up", "0.005"))
