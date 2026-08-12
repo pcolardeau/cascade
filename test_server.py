@@ -1624,6 +1624,151 @@ class BuildRiskFlagsTests(unittest.TestCase):
         self.assertEqual(ra, rb)
 
 
+class WeeklySnipeLogTests(NetworkFreeTestCase):
+    """The forward paper-trading log now covers both boards.
+
+    The generalization rests on settling by EXPIRY rather than by the date
+    the pick was logged. For a 0DTE pick those are the same date, so the
+    original behavior is unchanged; a weekly pick simply waits until its own
+    expiry. These tests pin both halves of that, plus the backward
+    compatibility that matters most: entries written before the weekly board
+    existed carry no `board` field and must keep working untouched.
+    """
+    def setUp(self):
+        super().setUp()
+        self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
+        self.patch_server("SNIPE_LOG_PATH", os.path.join(self._tmpdir, "snipe_log.json"))
+
+    @staticmethod
+    def _entry(**kw):
+        base = {
+            "id": "x", "date": "2026-08-03", "underlying": "SPY", "type": "C",
+            "strike": 495.0, "expiry": "2026-08-03", "entry_ask": 5.0,
+            "contract_cost": 500.0, "status": "open",
+        }
+        base.update(kw)
+        return base
+
+    def _write(self, entries):
+        with open(server.SNIPE_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(entries, f)
+
+    # -- board tagging ----------------------------------------------------
+
+    def test_legacy_entry_without_board_reads_as_0dte(self):
+        """Real entries predating the weekly board have no `board` key. They
+        were all 0DTE picks, so that's the correct reading of a missing
+        value -- not a reason to rewrite the user's file."""
+        self.assertEqual(server._entry_board({"date": "2026-08-07"}), "0dte")
+        self.assertEqual(server._entry_board({"board": None}), "0dte")
+        self.assertEqual(server._entry_board({"board": "weekly"}), "weekly")
+
+    def test_snapshot_tags_the_board_and_scans_the_right_one(self):
+        self.patch_server("get_itm_scan", lambda *a, **k: {"contracts": [
+            {"underlying": "SPY", "type": "C", "strike": 1.0, "expiry": "2026-08-11",
+             "ask": 1.0, "contract_cost": 100.0, "score": 10.0}]})
+        self.patch_server("get_itm_scan_weekly", lambda *a, **k: {"contracts": [
+            {"underlying": "IWM", "type": "P", "strike": 2.0, "expiry": "2026-08-21",
+             "ask": 2.0, "contract_cost": 200.0, "weekly_score": 20.0}]})
+        a = server.snapshot_snipe_pick(board="0dte")
+        b = server.snapshot_snipe_pick(board="weekly")
+        self.assertEqual((a["board"], a["underlying"], a["entry_score"]), ("0dte", "SPY", 10.0))
+        self.assertEqual((b["board"], b["underlying"], b["entry_score"]), ("weekly", "IWM", 20.0))
+
+    def test_each_board_dedupes_independently_on_the_same_day(self):
+        """Two boards may both log on one day; neither may log twice."""
+        self.patch_server("get_itm_scan", lambda *a, **k: {"contracts": [
+            {"underlying": "SPY", "type": "C", "strike": 1.0, "expiry": "2026-08-11",
+             "ask": 1.0, "contract_cost": 100.0, "score": 10.0}]})
+        self.patch_server("get_itm_scan_weekly", lambda *a, **k: {"contracts": [
+            {"underlying": "IWM", "type": "P", "strike": 2.0, "expiry": "2026-08-21",
+             "ask": 2.0, "contract_cost": 200.0, "weekly_score": 20.0}]})
+        server.snapshot_snipe_pick(board="0dte")
+        server.snapshot_snipe_pick(board="weekly")
+        server.snapshot_snipe_pick(board="0dte")   # repeat
+        server.snapshot_snipe_pick(board="weekly")  # repeat
+        self.assertEqual(len(server._load_snipe_log()), 2)
+
+    def test_unknown_board_logs_nothing(self):
+        self.assertIsNone(server.snapshot_snipe_pick(board="not-a-board"))
+
+    # -- settlement by expiry ---------------------------------------------
+
+    def test_settle_date_is_the_expiry(self):
+        self.assertEqual(server._entry_settle_date(
+            {"date": "2026-08-03", "expiry": "2026-08-21"}), "2026-08-21")
+
+    def test_settle_date_falls_back_to_the_entry_date(self):
+        """A hand-edited or malformed entry without an expiry stays
+        resolvable rather than stuck open forever."""
+        self.assertEqual(server._entry_settle_date({"date": "2026-08-03"}), "2026-08-03")
+
+    def test_weekly_entry_stays_open_until_its_expiry_passes(self):
+        self.patch_server("_today_et", lambda: dt.date(2026, 8, 14))
+        self.patch_server("_closing_price_on", lambda s, d: 500.0)
+        self._write([self._entry(board="weekly", date="2026-08-10",
+                                 expiry="2026-08-21")])
+        entries = server.resolve_snipe_log()
+        self.assertEqual(entries[0]["status"], "open",
+                         "a weekly pick must not settle just because a day passed")
+
+    def test_weekly_entry_settles_against_the_close_on_its_expiry(self):
+        self.patch_server("_today_et", lambda: dt.date(2026, 8, 24))
+        seen = []
+        self.patch_server("_closing_price_on",
+                          lambda s, d: (seen.append(d), 505.0)[1])
+        self._write([self._entry(board="weekly", date="2026-08-10",
+                                 expiry="2026-08-21")])
+        entries = server.resolve_snipe_log()
+        self.assertEqual(seen, ["2026-08-21"], "settles on the EXPIRY date, not the log date")
+        e = entries[0]
+        self.assertEqual(e["status"], "closed")
+        self.assertAlmostEqual(e["exit_value"], 10.0)          # 505 - 495
+        self.assertAlmostEqual(e["pnl_dollars"], 500.0)        # (10 - 5) * 100
+        self.assertTrue(e["correct"])
+
+    def test_0dte_settlement_is_unchanged_by_the_generalization(self):
+        """Regression guard for the real data on disk: for a 0DTE pick
+        expiry == date, so settling by expiry must behave exactly as
+        settling by date always did."""
+        self.patch_server("_today_et", lambda: dt.date(2026, 8, 4))
+        self.patch_server("_closing_price_on", lambda s, d: 502.0)
+        self._write([self._entry(date="2026-08-03", expiry="2026-08-03")])
+        e = server.resolve_snipe_log()[0]
+        self.assertEqual(e["status"], "closed")
+        self.assertAlmostEqual(e["pnl_dollars"], 200.0)  # (7 - 5) * 100
+
+    # -- per-board reporting ----------------------------------------------
+
+    def test_log_is_scoped_and_summarized_per_board(self):
+        """Pooling two boards' records would produce a win rate that
+        describes neither."""
+        self.patch_server("_today_et", lambda: dt.date(2026, 9, 1))
+        self.patch_server("_closing_price_on", lambda s, d: 600.0)
+        self._write([
+            self._entry(id="a", board="0dte", date="2026-08-03", expiry="2026-08-03"),
+            self._entry(id="b", board="weekly", date="2026-08-03", expiry="2026-08-14"),
+            self._entry(id="c", board="weekly", date="2026-08-04", expiry="2026-08-14"),
+        ])
+        zero = server.get_snipe_log("0dte")
+        weekly = server.get_snipe_log("weekly")
+        self.assertEqual(zero["board"], "0dte")
+        self.assertEqual(len(zero["entries"]), 1)
+        self.assertEqual(zero["summary"]["trades"], 1)
+        self.assertEqual(len(weekly["entries"]), 2)
+        self.assertEqual(weekly["summary"]["trades"], 2)
+
+    def test_resolution_runs_across_all_boards_regardless_of_who_asks(self):
+        """Settling is independent of which board is being read."""
+        self.patch_server("_today_et", lambda: dt.date(2026, 9, 1))
+        self.patch_server("_closing_price_on", lambda s, d: 600.0)
+        self._write([self._entry(id="w", board="weekly", date="2026-08-03",
+                                 expiry="2026-08-14")])
+        server.get_snipe_log("0dte")  # ask for the OTHER board
+        self.assertEqual(server._load_snipe_log()[0]["status"], "closed")
+
+
 class SpreadScoreTests(unittest.TestCase):
     """Tests _spread_score(): 40% probability of MAX profit (short-leg
     delta, 0.40->0.85) + 40% reward per dollar risked (0->2.0x) + 20%
@@ -1816,7 +1961,7 @@ class SnipeLogTests(NetworkFreeTestCase):
         hardcoded date string so these tests stay correct on any run date
         (a negative `days` is always strictly in the past, which is all the
         resolve-path tests actually need)."""
-        return (server.dt.date.today() + server.dt.timedelta(days=days)).isoformat()
+        return (server._today_et() + server.dt.timedelta(days=days)).isoformat()
 
     @staticmethod
     def _hist_for_date(date_str, close):
@@ -1865,9 +2010,12 @@ class SnipeLogTests(NetworkFreeTestCase):
     def test_snapshot_creates_one_entry_with_expected_fields(self):
         self.patch_server("get_itm_scan", lambda *a, **k: self._scan_with([self._pick()]))
         entry = server.snapshot_snipe_pick()
-        today = server.dt.date.today().isoformat()
+        today = server._today_et().isoformat()
         self.assertIsNotNone(entry)
-        self.assertEqual(entry["id"], f"{today}-SPY")
+        self.assertEqual(entry["id"], f"{today}-0dte-SPY",
+                         "id carries the board, so two boards' same-day picks on the"
+                         " same underlying stay distinct")
+        self.assertEqual(entry["board"], "0dte")
         self.assertEqual(entry["date"], today)
         self.assertEqual(entry["underlying"], "SPY")
         self.assertEqual(entry["type"], "C")
@@ -1946,7 +2094,7 @@ class SnipeLogTests(NetworkFreeTestCase):
         """Even with a matching close price available, a same-day entry must
         stay open -- it only resolves the NEXT time the log is read on a
         later date."""
-        today = server.dt.date.today().isoformat()
+        today = server._today_et().isoformat()
         server._save_snipe_log([self._raw_entry(date=today)])
         self.patch_server("get_history", lambda symbol, rng="1mo": self._hist_for_date(today, 502.0))
         out = server.resolve_snipe_log()
@@ -1983,7 +2131,7 @@ class SnipeLogTests(NetworkFreeTestCase):
     # -- get_snipe_log() summary --------------------------------------------
 
     def test_summary_zero_trades_when_none_closed(self):
-        today = server.dt.date.today().isoformat()
+        today = server._today_et().isoformat()
         server._save_snipe_log([self._raw_entry(date=today)])
         out = server.get_snipe_log()
         self.assertEqual(out["summary"], {
@@ -1993,7 +2141,7 @@ class SnipeLogTests(NetworkFreeTestCase):
 
     def test_summary_only_counts_closed_trades_and_computes_correctly(self):
         yest = self._date_offset(-1)
-        today = server.dt.date.today().isoformat()
+        today = server._today_et().isoformat()
         win_entry = self._raw_entry(date=yest, underlying="SPY")
         still_open = self._raw_entry(date=today, underlying="QQQ", id_suffix="QQQ")
         server._save_snipe_log([win_entry, still_open])

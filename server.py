@@ -1607,35 +1607,73 @@ def _save_snipe_log(entries):
         os.replace(tmp_path, SNIPE_LOG_PATH)
 
 
-def snapshot_snipe_pick(late=False):
-    """Log today's top-scored Snipe candidate (contracts[0] of a fresh
-    get_itm_scan() over all of SNIPE_SCAN) as a new open paper-trade entry.
+# The boards that keep a forward paper-trading record, and how to scan each.
+# Adding a board here is all it takes for the scheduler, the resolver and the
+# API to cover it -- the settlement rule below is horizon-independent.
+SNIPE_LOG_BOARDS = {
+    "0dte": {"scan": lambda: get_itm_scan(), "score_key": "score"},
+    "weekly": {"scan": lambda: get_itm_scan_weekly(), "score_key": "weekly_score"},
+}
+DEFAULT_SNIPE_BOARD = "0dte"
 
-    Idempotent per calendar day: if today's date already has a logged entry,
-    that existing entry is returned unchanged rather than duplicated (this
-    makes the startup catch-up call and the scheduler's own daily call, or
-    two clicks of the manual "snapshot now" button, all safe to run more
-    than once on the same day). If the scan currently has zero candidates
-    (e.g. no live two-sided market yet), nothing is logged and None is
-    returned -- there's nothing honest to record.
+
+def _entry_board(entry):
+    """The board an entry belongs to, defaulting to 0DTE.
+
+    Entries written before the weekly board existed have no `board` field;
+    they were all 0DTE picks, so that's the correct reading of a missing
+    value rather than a reason to migrate the file.
+    """
+    return entry.get("board") or DEFAULT_SNIPE_BOARD
+
+
+def _entry_settle_date(entry):
+    """The date an entry can first be settled against: the contract's expiry.
+
+    This is what makes one resolver serve both boards. A 0DTE pick expires
+    the same day it's logged, so its expiry EQUALS its date and the rule is
+    identical to the original "settle the day after it was logged". A weekly
+    pick expires 5-10 days later, and the same rule waits for that date
+    instead -- no per-board branching needed.
+
+    Falls back to the entry date if `expiry` is somehow absent, which keeps
+    a malformed or hand-edited entry resolvable rather than stuck open.
+    """
+    return entry.get("expiry") or entry.get("date")
+
+
+def snapshot_snipe_pick(late=False, board=DEFAULT_SNIPE_BOARD):
+    """Log a board's top-scored candidate as a new open paper-trade entry.
+
+    Idempotent per calendar day PER BOARD: if this board already has an
+    entry dated today, that entry is returned unchanged rather than
+    duplicated (so the startup catch-up, the scheduler's own daily call, and
+    repeated clicks of the manual "snapshot now" button are all safe). If the
+    scan currently has zero candidates (e.g. no live two-sided market yet),
+    nothing is logged and None is returned -- there's nothing honest to
+    record.
 
     Args:
-        late (bool): True when this snapshot is a startup catch-up (server
-            wasn't running at the scheduled 15:30 ET time) rather than the
-            regular on-schedule snapshot. Stored on the entry for visibility;
-            doesn't change the logging logic itself.
+        late (bool): True when this is a startup catch-up (the server wasn't
+            running at the scheduled 15:30 ET time) rather than the regular
+            on-schedule snapshot. Stored for visibility; doesn't change the
+            logging logic.
+        board (str): which board to snapshot -- see SNIPE_LOG_BOARDS.
 
     Returns:
         dict or None: the (new or pre-existing) log entry, or None if there
         was nothing to log.
     """
-    scan = get_itm_scan()
+    cfg = SNIPE_LOG_BOARDS.get(board)
+    if cfg is None:
+        return None
+    scan = cfg["scan"]()
     contracts = scan.get("contracts") or []
     today = _today_et().isoformat()  # ET: this is the entry's TRADING day
 
     entries = _load_snipe_log()
     for existing in entries:
-        if existing.get("date") == today:
+        if existing.get("date") == today and _entry_board(existing) == board:
             return existing
 
     if not contracts:
@@ -1644,17 +1682,22 @@ def snapshot_snipe_pick(late=False):
     c = contracts[0]
     logged_at = _now_et().isoformat(timespec="seconds")
     entry = {
-        "id": f"{today}-{c.get('underlying')}",
+        # board is part of the id so the two boards' same-day picks on the
+        # same underlying stay distinguishable
+        "id": f"{today}-{board}-{c.get('underlying')}",
+        "board": board,
         "date": today,
         "logged_at": logged_at,
         "underlying": c.get("underlying"),
         "type": c.get("type"),
         "strike": c.get("strike"),
         "expiry": c.get("expiry"),
+        "dte": c.get("dte"),
         "entry_ask": c.get("ask"),
         "entry_delta": c.get("delta"),
         "entry_spread_pct": c.get("spread_pct"),
-        "entry_score": c.get("score"),
+        "entry_score": c.get(cfg["score_key"]),
+        "entry_flags": [f.get("code") for f in (c.get("flags") or [])],
         "contract_cost": c.get("contract_cost"),
         "breakeven": c.get("breakeven"),
         "late_snapshot": bool(late),
@@ -1689,27 +1732,30 @@ def _closing_price_on(symbol, date_str):
 
 
 def resolve_snipe_log():
-    """Settle every open Snipe Log entry whose date is a strictly-past
-    trading day against that day's real closing price.
+    """Settle every open Snipe Log entry whose contract has expired, against
+    the underlying's real closing price on that expiry date.
 
-    A same-day entry is deliberately left open -- "sold at the close" hasn't
-    happened yet on the same day the pick was logged, so it only resolves
-    the next time this is called on a LATER date. If the close price for an
-    entry's date can't be found yet, that entry is left open and skipped
-    rather than resolved with bad data.
+    Settling on EXPIRY (not on the day the pick was logged) is what lets one
+    resolver serve every board: a 0DTE pick expires the same day it's logged,
+    so this is identical to the original "settle it the next day" rule, while
+    a weekly pick simply waits the 5-10 days until its own expiry. An entry
+    whose expiry is today or later stays open -- the contract hasn't settled
+    yet. If the close price for that date can't be found, the entry is left
+    open and retried later rather than resolved with bad data.
 
     Returns:
         list: the full (possibly updated) log, unsorted.
     """
     entries = _load_snipe_log()
-    today = _today_et().isoformat()  # ET: "is this entry's trading day past?"
+    today = _today_et().isoformat()  # ET: "has this contract's expiry passed?"
     changed = False
     for e in entries:
         if e.get("status") != "open":
             continue
-        if e.get("date") >= today:
-            continue  # today (or, shouldn't happen, a future date) -- not settled yet
-        close = _closing_price_on(e.get("underlying"), e.get("date"))
+        settle_date = _entry_settle_date(e)
+        if not settle_date or settle_date >= today:
+            continue  # not expired yet (or a future date) -- not settled
+        close = _closing_price_on(e.get("underlying"), settle_date)
         if close is None:
             continue  # can't resolve yet (feed hiccup / stale cache) -- try again later
         strike = e.get("strike")
@@ -1733,16 +1779,29 @@ def resolve_snipe_log():
     return entries
 
 
-def get_snipe_log():
-    """Return the Snipe Log, freshly resolved, most-recent-first, plus a
-    summary computed only over closed (settled) trades.
+def get_snipe_log(board=DEFAULT_SNIPE_BOARD):
+    """Return one board's Snipe Log, freshly resolved, most-recent-first,
+    plus a summary computed only over that board's closed (settled) trades.
+
+    Scoped per board deliberately: the whole point of the log is to say
+    whether a given board's scoring picks winners, and pooling two boards'
+    records would produce a number that describes neither. Resolution still
+    runs across every entry regardless of the board asked for -- settling is
+    independent of who's reading.
+
+    Args:
+        board (str): which board's record to return. Pass None for all
+            boards pooled (the entries, at least; the summary then spans
+            them and should be read with that in mind).
 
     Returns:
-        dict: {entries: [...], summary: {trades, wins, win_rate,
+        dict: {board, entries: [...], summary: {trades, wins, win_rate,
             total_pnl_dollars, avg_pnl_dollars, avg_pnl_pct}}. summary
             fields are all 0/None-ish when there are zero closed trades yet.
     """
-    entries = resolve_snipe_log()
+    all_entries = resolve_snipe_log()
+    entries = ([e for e in all_entries if _entry_board(e) == board]
+               if board else all_entries)
     ordered = sorted(entries, key=lambda e: e.get("date", ""), reverse=True)
     closed = [e for e in entries if e.get("status") == "closed"]
     n = len(closed)
@@ -1763,7 +1822,7 @@ def get_snipe_log():
             "avg_pnl_dollars": round(total_pnl / n, 2),
             "avg_pnl_pct": round(avg_pct, 4),
         }
-    return {"entries": ordered, "summary": summary}
+    return {"board": board, "entries": ordered, "summary": summary}
 
 
 def _next_snipe_snapshot_time(now=None):
@@ -1795,21 +1854,27 @@ def _snipe_scheduler_loop():
     (network hiccup, CBOE outage, etc.) is logged to stderr and the loop
     keeps running rather than the whole background thread dying silently.
     """
+    def _snapshot_all(late=False):
+        """Snapshot every board, isolating failures per board: a CBOE hiccup
+        on one must not cost the other its record for the day."""
+        for board in SNIPE_LOG_BOARDS:
+            try:
+                snapshot_snipe_pick(late=late, board=board)
+            except Exception as e:  # noqa: BLE001
+                print(f"[snipe scheduler] {board} snapshot failed: {e}", file=sys.stderr)
+
     now = _now_et()
     if now.weekday() < 5 and now.time() >= dt.time(15, 30):
-        try:
-            snapshot_snipe_pick(late=True)
-        except Exception as e:  # noqa: BLE001 -- one bad catch-up must not kill the thread
-            print(f"[snipe scheduler] catch-up snapshot failed: {e}", file=sys.stderr)
+        _snapshot_all(late=True)
     while True:
         try:
             target = _next_snipe_snapshot_time()
             sleep_s = (target - _now_et()).total_seconds()
             if sleep_s > 0:
                 time.sleep(sleep_s)
-            snapshot_snipe_pick()
+            _snapshot_all()
         except Exception as e:  # noqa: BLE001 -- keep the daemon loop alive across bad runs
-            print(f"[snipe scheduler] snapshot failed: {e}", file=sys.stderr)
+            print(f"[snipe scheduler] scheduling failed: {e}", file=sys.stderr)
             time.sleep(60)  # avoid a tight crash loop if something's persistently broken
 
 
@@ -1936,7 +2001,10 @@ class Handler(BaseHTTPRequestHandler):
         return get_debit_spreads(syms, target_dte, window, top)
 
     def _api_snipe_log(self, query):
-        return get_snipe_log()
+        board = self._qparam(query, "board", DEFAULT_SNIPE_BOARD)
+        if board not in SNIPE_LOG_BOARDS:
+            return {"_error": f"unknown board {board!r}"}
+        return get_snipe_log(board)
 
     # path -> (self, query) -> response-dict. Keeps do_GET itself pure routing:
     # "which endpoint is this" is separated from "how is its response computed",
@@ -1985,9 +2053,14 @@ class Handler(BaseHTTPRequestHandler):
         if length:
             self.rfile.read(length)  # drain any body so HTTP/1.1 keep-alive stays in sync
         parsed_url = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed_url.query)
         try:
             if parsed_url.path == "/api/snipe-log/snapshot":
-                entry = snapshot_snipe_pick()
+                board = self._qparam(query, "board", DEFAULT_SNIPE_BOARD)
+                if board not in SNIPE_LOG_BOARDS:
+                    self._send_json({"_error": f"unknown board {board!r}"}, status=400)
+                    return
+                entry = snapshot_snipe_pick(board=board)
                 if entry is None:
                     self._send_json({"_error": "No live two-sided market to snapshot right now"})
                 else:

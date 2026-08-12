@@ -1467,7 +1467,8 @@ tabs.forEach(b=>b.addEventListener("click",()=>{
   if(b.dataset.tab==="snipe"){
     const st = snipeState(snipeMode);
     if(!st.loaded && !st.loading) fetchSnipe(snipeMode); else renderSnipe();
-    if(!snipeLogLoaded && !snipeLogLoading) fetchSnipeLog();
+    const ls = snipeLogState(snipeMode);
+    if(LOGGED_BOARDS.includes(snipeMode) && !ls.loaded && !ls.loading) fetchSnipeLog(snipeMode);
   }
 }));
 
@@ -2227,7 +2228,14 @@ function sortSnipeRows(rows){
   return [...rows].sort((a,b) => (key(b) ?? -Infinity) - (key(a) ?? -Infinity));
 }
 
-let snipeLogData=null, snipeLogLoading=false, snipeLogLoaded=false, snipeSnapshotInFlight=false;
+/* The log is per-board: it exists to say whether THAT board's scoring picks
+   winners, so pooling the two would give a number describing neither.
+   Spreads has no log yet (settling a two-leg position needs its own math),
+   so LOGGED_BOARDS is deliberately a subset of SNIPE_MODES. */
+const LOGGED_BOARDS = ["0dte", "weekly"];
+const snipeLogCache = {};  // board -> {data, loading, loaded}
+const snipeLogState = b => (snipeLogCache[b] ||= {data:null, loading:false, loaded:false});
+let snipeSnapshotInFlight=false;
 const fmtUsd = v => (v==null ? "—" : (v<0?"-":"")+"$"+Math.abs(v).toFixed(2));
 const fmtPct1 = v => v==null ? "—" : (v*100).toFixed(1)+"%";
 
@@ -2278,21 +2286,28 @@ function scoreCell(score, rawScore){
    real trade). Its own fetch/render pair, but rendered as a sub-section
    inside renderSnipe() (see renderSnipeLogSection below) rather than a
    separate tab -- it's the same feature, just a second view onto it. */
-async function fetchSnipeLog(){
-  if(snipeLogLoading) return;
-  snipeLogLoading=true; renderSnipe();
-  try{ const r=await fetch("/api/snipe-log"); snipeLogData=await r.json(); snipeLogLoaded=true; }
-  catch(e){ snipeLogData={_error:String(e)}; }
-  snipeLogLoading=false; renderSnipe();
+async function fetchSnipeLog(board){
+  board = board || snipeMode;
+  if(!LOGGED_BOARDS.includes(board)) return;
+  const st = snipeLogState(board);
+  if(st.loading) return;
+  st.loading=true; renderSnipe();
+  try{
+    const r=await fetch("/api/snipe-log?board="+encodeURIComponent(board));
+    st.data=await r.json(); st.loaded=true;
+  }
+  catch(e){ st.data={_error:String(e)}; }
+  st.loading=false; renderSnipe();
 }
 
-async function doSnipeSnapshot(){
+async function doSnipeSnapshot(board){
+  board = board || snipeMode;
   if(snipeSnapshotInFlight) return;
   snipeSnapshotInFlight=true; renderSnipe();
-  try{ await fetch("/api/snipe-log/snapshot", {method:"POST"}); }
-  catch(e){ /* surfaced through the refetch below via snipeLogData._error if it truly failed */ }
+  try{ await fetch("/api/snipe-log/snapshot?board="+encodeURIComponent(board), {method:"POST"}); }
+  catch(e){ /* surfaced through the refetch below via the log's _error if it truly failed */ }
   snipeSnapshotInFlight=false;
-  await fetchSnipeLog();
+  await fetchSnipeLog(board);
 }
 
 function renderSnipe(){
@@ -2323,6 +2338,12 @@ function renderSnipe(){
       snipeMode=id;
       const s=snipeState(id);
       if(!s.loaded && !s.loading) fetchSnipe(id); else renderSnipe();
+      // The log is per-board too, and switching modes is the only other way
+      // to reach a board besides opening the tab -- without this the new
+      // board's log stays null and renders as "unavailable" even though the
+      // endpoint is fine.
+      const ls=snipeLogState(id);
+      if(LOGGED_BOARDS.includes(id) && !ls.loaded && !ls.loading) fetchSnipeLog(id);
     });
     modes.append(b);
   }
@@ -2454,7 +2475,7 @@ function renderSnipe(){
   // The Snipe Log tracks the 0DTE board's own daily pick and settles at the
   // next close; it is not a record of the weekly or spreads boards, so it
   // only belongs under the mode it actually describes.
-  if(snipeMode==="0dte") renderSnipeLogSection(box);
+  if(LOGGED_BOARDS.includes(snipeMode)) renderSnipeLogSection(box, snipeMode);
 }
 
 /* Shared footer note. Prefers the server's own note (which spells out the
@@ -2532,18 +2553,27 @@ function renderSpreadsTable(box, data, cfg){
    own top-level tab -- same feature, same fetch cadence). Renders the
    summary strip + entries table from snipeLogData, or an appropriate
    loading/error/empty state, plus the manual "snapshot now" button. */
-function renderSnipeLogSection(box){
+function renderSnipeLogSection(box, board){
+  const logSt = snipeLogState(board);
+  const snipeLogData = logSt.data, snipeLogLoading = logSt.loading;
   const sec=document.createElement("div"); sec.className="snipe-log-section";
-  const sh=document.createElement("h3"); sh.textContent="Snipe Log — forward paper-trading track record"; sec.append(sh);
+  const sh=document.createElement("h3");
+  sh.textContent = SNIPE_MODES[board].label + " Snipe Log — forward paper-trading track record";
+  sec.append(sh);
 
   const top=document.createElement("div"); top.className="flow-top";
   const left=document.createElement("div");
-  const k=document.createElement("div"); k.className="k"; k.textContent="Top pick logged daily · settled at next close";
+  const k=document.createElement("div"); k.className="k";
+  // Both boards settle on the contract's EXPIRY; for 0DTE that IS the day it
+  // was logged, which is why the two read differently.
+  k.textContent = board==="weekly"
+    ? "Top pick logged daily · settled at the underlying's close on expiry (~7d later)"
+    : "Top pick logged daily · settled at next close";
   left.append(k);
   const snapBtn=document.createElement("button"); snapBtn.className="flow-refresh";
   snapBtn.textContent = snipeSnapshotInFlight ? "SNAPSHOTTING…" : "SNAPSHOT TODAY'S PICK NOW";
   snapBtn.disabled = snipeSnapshotInFlight;
-  snapBtn.addEventListener("click", doSnipeSnapshot);
+  snapBtn.addEventListener("click", ()=>doSnipeSnapshot(board));
   top.append(left, snapBtn);
   sec.append(top);
 
@@ -2577,7 +2607,8 @@ function renderSnipeLogSection(box){
   const entries = snipeLogData.entries || [];
   if(!entries.length){
     const e=document.createElement("div"); e.className="empty-note";
-    e.textContent="No picks logged yet — the scheduler snapshots the top Snipe candidate ~30min before the close on weekdays, or use Snapshot now.";
+    e.textContent="No "+SNIPE_MODES[board].label+" picks logged yet — the scheduler snapshots each board's top candidate ~30min before the close on weekdays, or use Snapshot now."
+      + (board==="weekly" ? " Weekly picks stay OPEN until their expiry (~7 days), so the first settled result takes a week to arrive." : "");
     sec.append(e);
   } else {
     const tbl=document.createElement("table"); tbl.className="opt";
@@ -2668,7 +2699,7 @@ if(qp.get("tab")==="flow") fetchFlow();
 if(qp.get("tab")==="snipe"){
   document.querySelector("main").classList.add("snipe-active");
   fetchSnipe();
-  fetchSnipeLog();
+  fetchSnipeLog(snipeMode);
 }
 </script>
 </body>
