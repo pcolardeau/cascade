@@ -1935,6 +1935,25 @@ def _realized_vol_from(closes):
 # exists to prevent, arriving via throttling instead of a missing ticker.
 _IV_MIN_COVERAGE = 0.80
 
+# How many times to re-request a vol proxy whose response came back short.
+# Measured on ^VIX9D at a 10y range: 4 of 5 consecutive fetches returned a
+# single bar. Without retries the run silently used 30-day vol instead of
+# 9-day depending on luck, which makes the simulation irreproducible.
+_IV_FETCH_ATTEMPTS = 4
+
+# History window the simulation runs over.
+#
+# 10y, not 2y. Two years of daily bars was a single benign regime, which was
+# the largest remaining caveat on every number this produces. Ten years spans
+# the 2018 Q4 selloff, the 2020 COVID crash and the 2022 bear market, and
+# takes the sample from ~465 trades to ~2,476.
+#
+# The edge held: SPY averaged +10.7% / +12.3% / +13.3% per trade at 2y / 5y /
+# 10y on the same 9-day tenor, so the short sample was not flattering the
+# strategy. Yahoo returns MONTHLY bars for "max", so 10y is the longest
+# usable daily window rather than an arbitrary choice.
+_DEFAULT_BACKTEST_RANGE = "10y"
+
 
 def implied_vol_series(symbol, rng, needed_dates=None):
     """(proxy_name, {date: sigma}) for `symbol`, or (None, None) when no
@@ -1957,15 +1976,36 @@ def implied_vol_series(symbol, rng, needed_dates=None):
         return None, None
     best = (None, None, -1.0)
     for proxy in proxies:
-        hist = get_history(proxy, rng)
-        ts, closes = hist.get("t") or [], hist.get("c") or []
-        series = {_et_date_from_ts(t): c / 100.0 for t, c in zip(ts, closes) if c}
+        # Retry a short response before giving up on this proxy. Yahoo answers
+        # HTTP 200 with a TRUNCATED series often enough that the outcome was
+        # otherwise a coin flip: measured on ^VIX9D over a 10y range, 4 of 5
+        # consecutive fetches came back with 1 bar instead of ~2500. Falling
+        # straight through to the 30-day index on a throttle would silently
+        # change which volatility the simulation used from run to run, which
+        # is worse than being slow. fetch_yahoo's own retry only covers HTTP
+        # 400s, not a truncated 200.
+        series, coverage = {}, 0.0
+        for attempt in range(_IV_FETCH_ATTEMPTS):
+            if attempt:
+                # Drop the cached short answer, then back off. Escalating,
+                # because the truncation is a throttle: spacing the retries
+                # out recovers noticeably more often than hammering.
+                with _cache_lock:
+                    _cache.pop(f"h:{proxy}:{rng}", None)
+                time.sleep(0.6 * attempt)
+            hist = get_history(proxy, rng)
+            ts, closes = hist.get("t") or [], hist.get("c") or []
+            series = {_et_date_from_ts(t): c / 100.0 for t, c in zip(ts, closes) if c}
+            if not needed_dates:
+                break
+            covered = sum(1 for d in needed_dates if d in series)
+            coverage = covered / len(needed_dates)
+            if coverage >= _IV_MIN_COVERAGE:
+                break
         if not needed_dates:
             if series:
                 return proxy, series
             continue
-        covered = sum(1 for d in needed_dates if d in series)
-        coverage = covered / len(needed_dates)
         if coverage >= _IV_MIN_COVERAGE:
             return proxy, series
         if coverage > best[2]:
@@ -2037,7 +2077,7 @@ def _summarize_trades(trades):
     }
 
 
-def get_modeled_backtest(symbol, rng="2y", hold_days=7, moneyness=0.01,
+def get_modeled_backtest(symbol, rng=_DEFAULT_BACKTEST_RANGE, hold_days=7, moneyness=0.01,
                          vol_lookback=30, spread_pct=_MODELED_SPREAD_PCT,
                          option_type="C", vol_source="implied"):
     """Model the weekly ITM strategy over historical daily bars.
@@ -2708,7 +2748,7 @@ class Handler(BaseHTTPRequestHandler):
             return {"_error": "no symbol"}
         return get_modeled_backtest(
             sym,
-            rng=self._qparam(query, "range", "2y"),
+            rng=self._qparam(query, "range", _DEFAULT_BACKTEST_RANGE),
             hold_days=int(self._qparam(query, "hold_days", "7")),
             moneyness=float(self._qparam(query, "moneyness", "0.01")),
             option_type=self._qparam(query, "type", "C"),

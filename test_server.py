@@ -68,6 +68,13 @@ class NetworkFreeTestCase(unittest.TestCase):
         server._cache.clear()
         self.patch_server("realized_vol", lambda symbol, lookback_days=30: None)
         self.patch_server("earnings_map", lambda days_ahead: {})
+        # Nothing here talks to a real service, so any sleep is backing off
+        # from a throttle that cannot happen. Left unpatched, the vol-proxy
+        # retry's escalating backoff fires against stubbed fetches and takes
+        # the suite from 0.5s to 47s.
+        sleep_patch = unittest.mock.patch("time.sleep", lambda *_a, **_k: None)
+        sleep_patch.start()
+        self.addCleanup(sleep_patch.stop)
 
     def tearDown(self):
         server._cache.clear()
@@ -2199,6 +2206,59 @@ class ModeledBacktestTests(NetworkFreeTestCase):
         out = server.get_modeled_backtest("QQQ", vol_source="implied")
         self.assertFalse(out["term_adjusted"])
         self.assertNotIn("MODELLED", out["vol_source"])
+
+    def test_a_truncated_proxy_fetch_is_retried_before_falling_back(self):
+        """Yahoo answers 200 with a truncated series often enough that the
+        choice of tenor was a coin flip: measured on ^VIX9D over 10y, 4 of 5
+        consecutive fetches returned 1 bar instead of ~2500. Falling straight
+        through to the 30-day index on a throttle would silently change which
+        volatility the run used, so a short answer is retried first."""
+        base = 1700000000
+        closes = self._drifting(200)
+        calls = {"n": 0}
+        def flaky(sym, rng="6mo"):
+            n = len(closes)
+            ts = [base + i * 86400 for i in range(n)]
+            if sym == "^VIX9D":
+                calls["n"] += 1
+                if calls["n"] < 3:                 # throttled twice, then fine
+                    return {"t": [base], "c": [17.0]}
+                return {"t": ts, "c": [17.0] * n}
+            if sym.startswith("^"):
+                return {"t": ts, "c": [20.0] * n}
+            return {"t": ts, "c": closes}
+        self.patch_server("get_history", flaky)
+        proxy, series = server.implied_vol_series("SPY", "10y",
+                                                  [server._et_date_from_ts(base + i*86400)
+                                                   for i in range(len(closes))])
+        self.assertEqual(proxy, "^VIX9D", "should retry rather than fall back on a throttle")
+        self.assertGreater(calls["n"], 1, "the short answer must actually be re-requested")
+
+    def test_retries_are_bounded_and_then_fall_back(self):
+        """A proxy that is genuinely unavailable must not retry forever."""
+        base = 1700000000
+        closes = self._drifting(200)
+        calls = {"n": 0}
+        def always_short(sym, rng="6mo"):
+            n = len(closes)
+            ts = [base + i * 86400 for i in range(n)]
+            if sym == "^VIX9D":
+                calls["n"] += 1
+                return {"t": [base], "c": [17.0]}
+            if sym.startswith("^"):
+                return {"t": ts, "c": [20.0] * n}
+            return {"t": ts, "c": closes}
+        self.patch_server("get_history", always_short)
+        out = server.get_modeled_backtest("SPY", vol_source="implied")
+        self.assertLessEqual(calls["n"], server._IV_FETCH_ATTEMPTS)
+        self.assertIn("implied (^VIX)", out["vol_source"], "falls back to the 30-day index")
+
+    def test_default_range_spans_more_than_one_regime(self):
+        """2y was a single benign stretch, which was the largest caveat on
+        every number this produces. The default has to cover more than that."""
+        self.assertEqual(server._DEFAULT_BACKTEST_RANGE, "10y")
+        self._patch_history(self._drifting(200), vix=18.0)
+        self.assertEqual(server.get_modeled_backtest("SPY")["range"], "10y")
 
     def test_implied_and_realized_runs_are_both_reported(self):
         """The point of keeping both: the difference the vol input makes is
