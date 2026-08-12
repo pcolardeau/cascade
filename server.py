@@ -33,6 +33,19 @@ API-key headaches:
                data exists on this free feed) and never places a real trade
                — pure simulated bookkeeping for studying the strategy's
                honest, forward-only hit rate.
+  * Risk flags — every ITM board penalizes and labels three signals the
+               raw scores are blind to: IV rich relative to the underlying's
+               REALIZED vol (not "IV Rank" — this feed has no IV history to
+               rank against), an earnings report landing before expiry
+               (Nasdaq's keyless calendar; Yahoo's earnings endpoints now
+               401), and thin open interest / volume. Flags reduce the score
+               and travel with it rather than filtering the contract out, so
+               a flagged row stays visible with a legible reason.
+  * Spreads  — vertical debit spreads (long ITM leg + short leg further
+               out), as a separate board because a defined-risk/capped-gain
+               payoff isn't rankable against a naked long's. Priced at the
+               worst realistic fill (buy the ask, sell the bid), so net
+               debit is an upper bound and max gain a lower bound.
   * Snipe Weekly — same idea as Snipe, but for ~7-day-out ITM contracts
                instead of same-day. A week-long hold has a different risk
                shape than 0DTE (real theta bleed, weekend gap risk, lower
