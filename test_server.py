@@ -1927,6 +1927,34 @@ class GetDebitSpreadsTests(NetworkFreeTestCase):
                             self._leg(500.0, 3.0, 3.2, delta=0.50)])
         self.assertEqual(len(server.get_debit_spreads(["SPY"], top=1)["spreads"]), 1)
 
+    def test_rejects_pairings_below_the_minimum_reward_risk(self):
+        """A validity guard, not a preference: width 5.00 bought for a 4.90
+        debit -> $10 max gain on $490 of risk (0.02x). Its best case doesn't
+        clear a round-trip commission on two legs."""
+        self._patch(500.0, [self._leg(495.0, 5.9, 6.0, delta=0.75),
+                            self._leg(500.0, 1.1, 1.2, delta=0.50)])
+        self.assertEqual(server.get_debit_spreads(["SPY"])["spreads"], [])
+
+    def test_keeps_pairings_at_or_above_the_minimum(self):
+        """Boundary: the rule is `< floor` rejects, so exactly at the floor
+        must survive. width 5.00, debit 4.7619 -> reward:risk exactly 0.05."""
+        debit = 5.0 / (1 + server._SPREAD_MIN_REWARD_RISK)
+        self._patch(500.0, [self._leg(495.0, debit + 2.0 - 0.01, debit + 2.0, delta=0.75),
+                            self._leg(500.0, 2.0, 2.1, delta=0.50)])
+        spreads = server.get_debit_spreads(["SPY"])["spreads"]
+        self.assertEqual(len(spreads), 1)
+        self.assertAlmostEqual(spreads[0]["reward_risk"],
+                               server._SPREAD_MIN_REWARD_RISK, places=3)
+
+    def test_exclusion_is_disclosed_in_the_note(self):
+        """Filtering silently would make an empty board look like a broken
+        feed; the note says what was removed and why."""
+        self._patch(500.0, [self._leg(495.0, 5.8, 6.0, delta=0.75),
+                            self._leg(500.0, 3.0, 3.2, delta=0.50)])
+        note = server.get_debit_spreads(["SPY"])["note"]
+        self.assertIn("excluded", note)
+        self.assertIn("transaction costs", note)
+
     def test_note_carries_the_screening_disclaimer(self):
         self._patch(500.0, [self._leg(495.0, 5.8, 6.0, delta=0.75),
                             self._leg(500.0, 3.0, 3.2, delta=0.50)])

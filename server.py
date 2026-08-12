@@ -1377,6 +1377,23 @@ _SPREAD_REWARD_CEIL = 2.0     # max_gain/max_loss at/above this scores 1 on rewa
 _SPREAD_COST_CEIL = 0.25      # combined spread% at/above this scores 0 on cost
 _SPREAD_MAX_WIDTH_STEPS = 6   # how many strikes above/below the long leg to pair
 
+# Minimum max_gain/max_loss for a pairing to be worth listing at all.
+#
+# This is a VALIDITY guard, not a risk preference -- the same category as the
+# net_debit >= width rejection below, which drops spreads that mathematically
+# cannot profit. A pairing can also be structurally pointless without being
+# impossible: measured against the live chain, the worst real example was IWM
+# 200/284 offering a $2 max gain on $8,398 of risk, and six pairings had a max
+# gain under a realistic round-trip commission on two legs (~$2.60), so they
+# could not clear costs even when everything went right.
+#
+# 0.05 keeps ~92% of generated pairings (measured, not guessed) while dropping
+# that tail. The Spread Score already penalizes weak reward through its 40%
+# reward term, but score-based demotion alone doesn't help here: the "Safer"
+# sort ranks on short-leg delta only, which floats exactly these
+# near-certain/near-worthless pairings to the top.
+_SPREAD_MIN_REWARD_RISK = 0.05
+
 
 def _spread_score(short_delta, reward_risk, cost_pct):
     """0-100 score for one vertical debit spread.
@@ -1495,6 +1512,13 @@ def get_debit_spreads(symbols=None, target_dte=7, window=_DEFAULT_DTE_WINDOW, to
                     max_loss = net_debit * 100
                     max_gain = (width - net_debit) * 100
                     reward_risk = max_gain / max_loss if max_loss else None
+                    if reward_risk is None or reward_risk < _SPREAD_MIN_REWARD_RISK:
+                        # Structurally not worth listing -- see
+                        # _SPREAD_MIN_REWARD_RISK. Same family as the
+                        # rejection above: that one drops pairings that
+                        # cannot profit, this one drops pairings whose best
+                        # case doesn't justify the capital or clear costs.
+                        continue
                     breakeven = (long_strike + net_debit if typ == "C"
                                  else long_strike - net_debit)
                     breakeven_cushion_pct = ((spot - breakeven) / spot if typ == "C"
@@ -1548,9 +1572,11 @@ def get_debit_spreads(symbols=None, target_dte=7, window=_DEFAULT_DTE_WINDOW, to
         "note": (f"CBOE delayed ~15min. Vertical debit spreads, ~{target_dte}-DTE "
                  f"(window +/-{window} days), long leg ITM. Priced at the worst "
                  "realistic fill (buy the ask, sell the bid), so net debit is an "
-                 "upper bound and max gain a lower bound. Ranked by Spread Score "
-                 "(probability of max profit + reward per dollar risked + "
-                 "execution cost). Screening tool, not a trade recommendation. "
+                 "upper bound and max gain a lower bound. Pairings returning under "
+                 f"{_SPREAD_MIN_REWARD_RISK:.0%} of the capital at risk are excluded "
+                 "— their best case doesn't clear transaction costs. Ranked by "
+                 "Spread Score (probability of max profit + reward per dollar risked "
+                 "+ execution cost). Screening tool, not a trade recommendation. "
                  "No trades are placed automatically."),
         "spreads": all_spreads[:top],
     }
