@@ -35,6 +35,13 @@ def _wrap_chain_json(options):
     return json.dumps({"data": {"options": options}})
 
 
+# Captured at import, before any patching, so the handful of tests that
+# exercise the real risk-signal lookups can restore them over the
+# network-free defaults NetworkFreeTestCase installs (see setUp below).
+_REAL_REALIZED_VOL = server.realized_vol
+_REAL_EARNINGS_MAP = server.earnings_map
+
+
 class NetworkFreeTestCase(unittest.TestCase):
     """Base for tests that monkeypatch one of server.py's network-touching
     functions (fetch_yahoo, _fetch_chain) to stay off the real network.
@@ -45,9 +52,21 @@ class NetworkFreeTestCase(unittest.TestCase):
     to actually run, and restore the original afterward. Centralizing it here
     means a new network-free test class gets that behavior by inheriting
     instead of copying five lines of boilerplate a fourth time.
+
+    setUp also neutralizes the two risk-signal lookups the ITM scan core
+    makes (realized_vol -> Yahoo history, earnings_map -> Nasdaq calendar).
+    They're patched here rather than in each scan test's own _patch() helper
+    because they're reached indirectly, through _scan_itm_candidates, from
+    every board and from the Snipe Log snapshot -- easy to miss one and
+    silently reintroduce real network I/O into a suite whose whole premise
+    is not having any. (Caught exactly that way: wiring the flags in took
+    the suite from 0.06s to 23s.) Tests that want the real behavior restore
+    it explicitly via _REAL_REALIZED_VOL / _REAL_EARNINGS_MAP.
     """
     def setUp(self):
         server._cache.clear()
+        self.patch_server("realized_vol", lambda symbol, lookback_days=30: None)
+        self.patch_server("earnings_map", lambda days_ahead: {})
 
     def tearDown(self):
         server._cache.clear()
@@ -1139,6 +1158,235 @@ class ScanItmCandidatesTests(NetworkFreeTestCase):
         })
         _as_of, candidates = server._scan_itm_candidates(["SPY"], 0, 0)
         self.assertEqual(candidates, [])
+
+
+class RealizedVolTests(NetworkFreeTestCase):
+    """Tests realized_vol(): annualized realized volatility from trailing
+    daily closes. Restores the real function over the network-free stub and
+    patches get_history instead, so the math runs for real without I/O."""
+
+    def _patch_history(self, closes):
+        self.patch_server("realized_vol", _REAL_REALIZED_VOL)
+        self.patch_server("get_history", lambda sym, rng="6mo": {
+            "t": list(range(len(closes))), "c": closes})
+
+    def test_flat_series_has_zero_vol(self):
+        self._patch_history([100.0] * 40)
+        self.assertAlmostEqual(server.realized_vol("SPY"), 0.0)
+
+    def test_known_series_matches_hand_computed_annualization(self):
+        """A series alternating +1%/-1% daily: verify against the same
+        sample-stdev * sqrt(252) * 100 formula computed independently."""
+        closes = [100.0]
+        for i in range(40):
+            closes.append(closes[-1] * (1.01 if i % 2 == 0 else 1 / 1.01))
+        self._patch_history(closes)
+        window = closes[-31:]
+        rets = [math.log(window[i] / window[i - 1]) for i in range(1, len(window))]
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        expected = math.sqrt(var) * math.sqrt(252) * 100
+        self.assertAlmostEqual(server.realized_vol("SPY"), expected, places=6)
+
+    def test_higher_volatility_series_scores_higher(self):
+        calm = [100.0 + (0.1 if i % 2 else -0.1) for i in range(40)]
+        wild = [100.0 + (5.0 if i % 2 else -5.0) for i in range(40)]
+        self._patch_history(calm)
+        calm_vol = server.realized_vol("SPY")
+        server._cache.clear()
+        self._patch_history(wild)
+        self.assertGreater(server.realized_vol("SPY"), calm_vol)
+
+    def test_insufficient_history_returns_none(self):
+        self._patch_history([100.0, 101.0])
+        self.assertIsNone(server.realized_vol("SPY"))
+        server._cache.clear()
+        self._patch_history([])
+        self.assertIsNone(server.realized_vol("SPY"))
+
+    def test_non_positive_closes_are_skipped_not_fatal(self):
+        """A zero/negative close would blow up log() -- it must be skipped."""
+        self._patch_history([100.0, 0.0, 101.0, 102.0, 103.0, 104.0])
+        self.assertIsNotNone(server.realized_vol("SPY"))
+
+
+class RiskFlagTests(unittest.TestCase):
+    """Tests the individual risk-flag builders and the penalty application.
+
+    Per the board's design, flags penalize and annotate rather than filter:
+    a flagged contract stays visible with a legible reason, the same way the
+    A/B/C tier works.
+    """
+    def test_iv_flag_fires_above_the_ratio_threshold(self):
+        flag, ratio = server._iv_flag(iv=30.0, rvol=15.0)  # 2.0x
+        self.assertIsNotNone(flag)
+        self.assertEqual(flag["code"], "IV_RICH")
+        self.assertEqual(ratio, 2.0)
+        self.assertIn("2.0x", flag["label"])
+
+    def test_iv_flag_silent_below_threshold_but_still_reports_ratio(self):
+        """A normal variance risk premium (implied slightly above realized)
+        is not a red flag -- but the ratio is still returned for display."""
+        flag, ratio = server._iv_flag(iv=16.0, rvol=15.0)
+        self.assertIsNone(flag)
+        self.assertAlmostEqual(ratio, 1.07)
+
+    def test_iv_flag_missing_inputs_yield_no_flag_and_no_ratio(self):
+        self.assertEqual(server._iv_flag(None, 15.0), (None, None))
+        self.assertEqual(server._iv_flag(20.0, None), (None, None))
+        self.assertEqual(server._iv_flag(20.0, 0), (None, None))
+
+    def test_liquidity_flags_thin_oi_and_thin_volume(self):
+        flags = server._liquidity_flags(volume=1, oi=2)
+        self.assertEqual({f["code"] for f in flags}, {"THIN_OI", "THIN_VOL"})
+
+    def test_liquidity_flags_silent_when_healthy(self):
+        self.assertEqual(server._liquidity_flags(volume=5000, oi=20000), [])
+
+    def test_earnings_flag_fires_when_report_precedes_expiry(self):
+        flag = server._earnings_flag("2026-08-14", "2026-08-21")
+        self.assertIsNotNone(flag)
+        self.assertEqual(flag["code"], "EARNINGS")
+
+    def test_earnings_flag_fires_on_the_expiry_date_itself(self):
+        """Same-day is still inside the holding period, so it counts."""
+        self.assertIsNotNone(server._earnings_flag("2026-08-21", "2026-08-21"))
+
+    def test_earnings_flag_silent_when_report_is_after_expiry(self):
+        self.assertIsNone(server._earnings_flag("2026-08-28", "2026-08-21"))
+
+    def test_earnings_flag_silent_on_missing_or_malformed_dates(self):
+        self.assertIsNone(server._earnings_flag(None, "2026-08-21"))
+        self.assertIsNone(server._earnings_flag("2026-08-14", None))
+        self.assertIsNone(server._earnings_flag("not-a-date", "2026-08-21"))
+
+    def test_apply_risk_flags_subtracts_each_penalty(self):
+        flags = [{"code": "A", "penalty": 10}, {"code": "B", "penalty": 5}]
+        self.assertEqual(server._apply_risk_flags(80.0, flags), 65.0)
+
+    def test_apply_risk_flags_is_a_noop_without_flags(self):
+        self.assertEqual(server._apply_risk_flags(80.0, []), 80.0)
+
+    def test_apply_risk_flags_floors_at_zero(self):
+        """Penalties must never drive a score negative -- 0 is the floor."""
+        flags = [{"code": "A", "penalty": 99}]
+        self.assertEqual(server._apply_risk_flags(10.0, flags), 0.0)
+
+
+class EarningsCalendarTests(NetworkFreeTestCase):
+    """Tests the Nasdaq earnings-calendar lookup's parsing and its
+    never-raise contract (an unavailable calendar means "unknown", which
+    suppresses the flag, not a failed scan)."""
+
+    def _patch_urlopen(self, payload=None, exc=None):
+        """Patch urllib.request.urlopen itself (server.py calls it through
+        the module, so this intercepts the real call site) rather than
+        swapping out server.urllib wholesale."""
+        class _Resp:
+            def read(self):
+                return json.dumps(payload).encode()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            if exc:
+                raise exc
+            return _Resp()
+
+        patcher = unittest.mock.patch("urllib.request.urlopen", fake_urlopen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_parses_symbols_from_the_calendar(self):
+        self._patch_urlopen({"data": {"rows": [
+            {"symbol": "AMAT"}, {"symbol": "bn"}, {"symbol": ""}, {}]}})
+        out = server._nasdaq_earnings_for_date("2026-08-13")
+        self.assertEqual(out, {"AMAT": "2026-08-13", "BN": "2026-08-13"})
+
+    def test_network_failure_yields_empty_not_an_exception(self):
+        self._patch_urlopen(exc=urllib.error.URLError("down"))
+        self.assertEqual(server._nasdaq_earnings_for_date("2026-08-13"), {})
+
+    def test_malformed_payload_yields_empty(self):
+        self._patch_urlopen({"unexpected": "shape"})
+        self.assertEqual(server._nasdaq_earnings_for_date("2026-08-13"), {})
+
+    def test_earnings_map_merges_days_and_keeps_the_soonest(self):
+        self.patch_server("earnings_map", _REAL_EARNINGS_MAP)
+        calls = []
+
+        def fake_day(date_iso):
+            calls.append(date_iso)
+            return {"AAPL": date_iso}  # reports "every" day; soonest must win
+        self.patch_server("_nasdaq_earnings_for_date", fake_day)
+        out = server.earnings_map(3)
+        self.assertEqual(len(calls), 4, "queries today + each of the next 3 days")
+        self.assertEqual(out["AAPL"], min(calls), "the soonest date wins")
+
+    def test_earnings_map_negative_horizon_is_empty(self):
+        self.patch_server("earnings_map", _REAL_EARNINGS_MAP)
+        self.assertEqual(server.earnings_map(-1), {})
+
+
+class ScanRiskFlagIntegrationTests(NetworkFreeTestCase):
+    """End-to-end: flags computed in the shared scan core must reach both
+    boards' output and actually reduce the ranked score."""
+
+    def _patch(self, contracts, rvol=None, earnings=None):
+        self.patch_server("get_quotes", lambda syms: {"SPY": {"price": 500.0}})
+        self.patch_server("_fetch_chain", lambda symbol: {
+            "contracts": contracts, "call_vol": 0.0, "put_vol": 0.0, "ts": 1700000000,
+        })
+        self.patch_server("realized_vol", lambda symbol, lookback_days=30: rvol)
+        self.patch_server("earnings_map", lambda days_ahead: earnings or {})
+
+    def test_healthy_contract_has_no_flags_and_an_unpenalized_score(self):
+        self._patch([_snipe_contract(dte=0, volume=5000, oi=20000, iv=15.0)], rvol=15.0)
+        c = server.get_itm_scan(["SPY"])["contracts"][0]
+        self.assertEqual(c["flags"], [])
+        self.assertEqual(c["score"], c["raw_score"])
+
+    def test_thin_liquidity_penalizes_the_0dte_score(self):
+        self._patch([_snipe_contract(dte=0, volume=1, oi=2)])
+        c = server.get_itm_scan(["SPY"])["contracts"][0]
+        self.assertEqual({f["code"] for f in c["flags"]}, {"THIN_OI", "THIN_VOL"})
+        self.assertLess(c["score"], c["raw_score"])
+
+    def test_rich_iv_penalizes_and_reports_the_ratio(self):
+        self._patch([_snipe_contract(dte=0, volume=5000, oi=20000, iv=40.0)], rvol=10.0)
+        c = server.get_itm_scan(["SPY"])["contracts"][0]
+        self.assertIn("IV_RICH", {f["code"] for f in c["flags"]})
+        self.assertEqual(c["iv_rv_ratio"], 4.0)
+        self.assertEqual(c["realized_vol"], 10.0)
+        self.assertLess(c["score"], c["raw_score"])
+
+    def test_earnings_before_expiry_penalizes_the_weekly_score(self):
+        self._patch([_snipe_contract(dte=7, expiry="2026-08-18",
+                                      volume=5000, oi=20000)],
+                    earnings={"SPY": "2026-08-17"})
+        c = server.get_itm_scan_weekly(["SPY"])["contracts"][0]
+        self.assertIn("EARNINGS", {f["code"] for f in c["flags"]})
+        self.assertEqual(c["earnings_date"], "2026-08-17")
+        self.assertLess(c["weekly_score"], c["raw_weekly_score"])
+
+    def test_flagged_contract_is_penalized_not_removed(self):
+        """The whole point of the flag design: it still appears on the board."""
+        self._patch([_snipe_contract(dte=0, volume=1, oi=1, iv=99.0)], rvol=5.0)
+        out = server.get_itm_scan(["SPY"])
+        self.assertEqual(len(out["contracts"]), 1, "flagged rows stay visible")
+        self.assertGreater(len(out["contracts"][0]["flags"]), 0)
+
+    def test_flags_demote_a_contract_below_a_clean_rival(self):
+        clean = _snipe_contract(dte=0, strike=496.0, bid=4.0, ask=4.1,
+                                 delta=0.90, volume=5000, oi=20000, iv=15.0)
+        flagged = _snipe_contract(dte=0, strike=495.0, bid=4.9, ask=5.1,
+                                   delta=0.90, volume=1, oi=1, iv=15.0)
+        self._patch([flagged, clean], rvol=15.0)
+        contracts = server.get_itm_scan(["SPY"])["contracts"]
+        self.assertEqual(contracts[0]["strike"], 496.0,
+                         "the clean contract outranks the thin one")
 
 
 class ItmScanEndpointHorizonRoutingTests(NetworkFreeTestCase):

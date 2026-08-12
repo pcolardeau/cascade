@@ -690,6 +690,184 @@ def _itm_scan_score(delta, spread_pct, flat_pnl_pct):
                          _SCORE_COST_WEIGHT * cost), 1)
 
 
+# ---------------------------------------------------------------------------
+# Risk flags -- shared by every ITM board.
+#
+# Each flag is a named, visible reason a contract is riskier than its raw
+# score suggests. Flags PENALIZE the score and are returned alongside it
+# rather than filtering the contract out: a flagged contract stays on the
+# board where it can be seen and judged, and the reason it dropped is
+# legible instead of the board silently going quiet. Same design as the
+# existing A/B/C tier -- surface the judgement, don't hide the row.
+# ---------------------------------------------------------------------------
+_RISK_PENALTIES = {
+    "IV_RICH": 12,     # option priced well above the underlying's realized vol
+    "EARNINGS": 25,    # an earnings report lands before expiry (IV-crush risk)
+    "THIN_OI": 10,     # too few open contracts to trust the quoted market
+    "THIN_VOL": 8,     # barely traded today -- the quote may be stale
+}
+
+# IV/realized-vol ratio at/above which a contract is flagged IV_RICH. 1.0
+# would flag nearly everything (index options almost always carry a variance
+# risk premium -- implied normally sits above realized); 1.5 targets the
+# genuinely expensive tail.
+_IV_RICH_RATIO = 1.5
+_MIN_OI = 50               # below this, THIN_OI
+_MIN_VOLUME = 10           # below this, THIN_VOL
+_REALIZED_VOL_DAYS = 30    # trailing sessions used for the realized-vol estimate
+
+
+def realized_vol(symbol, lookback_days=_REALIZED_VOL_DAYS):
+    """Annualized realized volatility (in percent, to match CBOE's IV units)
+    from `lookback_days` of trailing daily closes, or None if there isn't
+    enough history.
+
+    Reuses get_history(symbol, "6mo") -- the exact call the correlation
+    feature already makes and caches -- so this adds no extra network round
+    trip in the common case.
+
+    NOTE ON WHAT THIS IS NOT: this is realized (historical) vol, not an "IV
+    Rank" or "IV percentile". Those require a history of *implied* vol, and
+    the CBOE delayed-quotes feed gives only a current IV snapshot -- there is
+    no IV history to rank against on this data source. Comparing today's IV
+    to realized vol answers a real but different question ("is this option
+    expensive relative to how much the underlying has actually been moving?"),
+    and naming it accurately matters because IV Rank is what a trader would
+    normally expect from a label like that.
+    """
+    hist = get_history(symbol, "6mo")
+    closes = hist.get("c") or []
+    window = closes[-(lookback_days + 1):]
+    if len(window) < 3:  # need at least 2 returns for a standard deviation
+        return None
+    rets = [math.log(window[i] / window[i - 1])
+            for i in range(1, len(window)) if window[i - 1] > 0 and window[i] > 0]
+    if len(rets) < 2:
+        return None
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)  # sample variance
+    return math.sqrt(var) * math.sqrt(252) * 100
+
+
+def _nasdaq_earnings_for_date(date_iso):
+    """{SYMBOL: date_iso} for every company reporting on one calendar date,
+    from Nasdaq's public earnings calendar (no API key).
+
+    Yahoo is not usable for this: both quoteSummary/calendarEvents and the
+    v7 quote endpoint now 401 without crumb/cookie auth, while the v8 chart
+    endpoint this app already uses carries no earnings field at all. Nasdaq's
+    calendar is date-indexed rather than symbol-indexed, hence this shape.
+
+    Never raises -- an unavailable calendar degrades to "no earnings known",
+    which suppresses the flag rather than taking down the whole scan.
+    """
+    key = f"earn:{date_iso}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    out = {}
+    url = f"https://api.nasdaq.com/api/calendar/earnings?date={urllib.parse.quote(date_iso)}"
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        for row in ((data.get("data") or {}).get("rows") or []):
+            sym = (row.get("symbol") or "").strip().upper()
+            if sym:
+                out[sym] = date_iso
+    except (urllib.error.URLError, IOError, json.JSONDecodeError,
+            KeyError, TypeError, ValueError):
+        pass  # see docstring: unknown, not fatal
+    cache_put(key, out, ttl=43200)  # 12h -- an earnings calendar doesn't move intraday
+    return out
+
+
+def earnings_map(days_ahead):
+    """{SYMBOL: 'YYYY-MM-DD'} of the soonest earnings date within the next
+    `days_ahead` calendar days, built once per scan and shared by every
+    symbol in it.
+
+    Bounded deliberately: the calendar is queried per date, so the number of
+    outbound requests equals the horizon being scanned (1 for a 0DTE board,
+    <=9 for a ~7-DTE one), fetched in parallel and cached 12h. A per-symbol
+    lookahead would instead multiply that by the size of the scan universe.
+    """
+    if days_ahead < 0:
+        return {}
+    today = _now_et().date()
+    dates = [(today + dt.timedelta(days=i)).isoformat()
+             for i in range(days_ahead + 1)]
+    merged = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        for day in executor.map(_nasdaq_earnings_for_date, dates):
+            for sym, date_iso in day.items():
+                # dates are walked in ascending order, so the first hit wins
+                merged.setdefault(sym, date_iso)
+    return merged
+
+
+def _earnings_flag(earnings_date_iso, expiry_iso):
+    """EARNINGS flag when a report lands on or before the contract expires.
+
+    The heaviest penalty on the board, and the one most worth surfacing: an
+    earnings print inside the holding period changes the distribution
+    entirely, and the IV crush immediately after it can lose money on a
+    contract whose direction was right.
+    """
+    if not earnings_date_iso or not expiry_iso:
+        return None
+    try:
+        earn = dt.date.fromisoformat(earnings_date_iso)
+        expiry = dt.date.fromisoformat(expiry_iso)
+    except (ValueError, TypeError):
+        return None
+    if earn > expiry:
+        return None
+    return {"code": "EARNINGS", "penalty": _RISK_PENALTIES["EARNINGS"],
+            "label": f"earnings {earnings_date_iso} before expiry"}
+
+
+def _liquidity_flags(volume, oi):
+    """THIN_OI / THIN_VOL flags for one contract's traded interest.
+
+    A tight bid/ask on a contract nobody holds or trades is not the same
+    thing as a tight bid/ask on a liquid one -- the quote can be stale or
+    unfillable at any real size, which the spread alone never reveals.
+    """
+    flags = []
+    if oi is not None and oi < _MIN_OI:
+        flags.append({"code": "THIN_OI", "penalty": _RISK_PENALTIES["THIN_OI"],
+                      "label": f"thin open interest ({int(oi)})"})
+    if volume is not None and volume < _MIN_VOLUME:
+        flags.append({"code": "THIN_VOL", "penalty": _RISK_PENALTIES["THIN_VOL"],
+                      "label": f"barely traded today ({int(volume)})"})
+    return flags
+
+
+def _iv_flag(iv, rvol):
+    """IV_RICH flag when this contract's IV sits well above the underlying's
+    realized vol. Returns (flag_or_None, iv_rv_ratio_or_None)."""
+    if not iv or not rvol:
+        return None, None
+    ratio = iv / rvol
+    if ratio < _IV_RICH_RATIO:
+        return None, round(ratio, 2)
+    return ({"code": "IV_RICH", "penalty": _RISK_PENALTIES["IV_RICH"],
+             "label": f"IV {ratio:.1f}x realized vol"}, round(ratio, 2))
+
+
+def _apply_risk_flags(raw_score, flags):
+    """Subtract every flag's penalty from `raw_score`, floored at 0.
+
+    Returned alongside the raw score (never in place of it) so the board can
+    show both what the contract scored on its own merits and what the risk
+    signals took off -- a penalty you can't see is indistinguishable from a
+    scoring bug.
+    """
+    return round(max(0.0, raw_score - sum(f["penalty"] for f in flags)), 1)
+
+
 def _scan_itm_candidates(symbols, dte_lo, dte_hi):
     """Shared scan core behind every ITM board (0DTE Snipe, Snipe Weekly,
     debit spreads).
@@ -699,6 +877,12 @@ def _scan_itm_candidates(symbols, dte_lo, dte_hi):
     have a real two-sided market, and computes the per-contract math that is
     genuinely identical across boards: mid/spread, moneyness, intrinsic and
     extrinsic value, 1-contract cost, breakeven and its cushion.
+
+    Also attaches the shared risk flags (IV richness vs realized vol, thin
+    open interest, thin volume, earnings before expiry) so every board
+    penalizes the same signals identically instead of each one re-deriving
+    them. Boards apply the penalty to their own raw score via
+    _apply_risk_flags.
 
     Deliberately stops short of scoring and scenarios -- those are where the
     boards actually differ (the 0DTE score rewards banked flat-scenario
@@ -718,6 +902,8 @@ def _scan_itm_candidates(symbols, dte_lo, dte_hi):
     quotes = get_quotes(symbols)
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         chains = dict(zip(symbols, executor.map(_fetch_chain, symbols)))
+    # Once per scan, not once per symbol -- see earnings_map's docstring.
+    earnings = earnings_map(dte_hi)
 
     candidates = []
     as_of = None
@@ -727,6 +913,10 @@ def _scan_itm_candidates(symbols, dte_lo, dte_hi):
         spot = (quotes.get(sym) or {}).get("price")
         if not spot:
             continue  # can't score moneyness/breakeven/P&L without a spot price
+        # Per-symbol, not per-contract: a chain runs to hundreds of rows and
+        # these depend only on the underlying.
+        rvol = realized_vol(sym)
+        earnings_date_iso = earnings.get(sym.upper())
         for c in res.get("contracts", []):
             dte = c.get("dte")
             if dte is None or not (dte_lo <= dte <= dte_hi):
@@ -748,6 +938,14 @@ def _scan_itm_candidates(symbols, dte_lo, dte_hi):
                 breakeven = strike - ask
                 breakeven_cushion_pct = (breakeven - spot) / spot
 
+            iv_flag, iv_rv_ratio = _iv_flag(c.get("iv"), rvol)
+            flags = _liquidity_flags(c.get("volume"), c.get("oi"))
+            if iv_flag:
+                flags.append(iv_flag)
+            earnings_flag = _earnings_flag(earnings_date_iso, c.get("expiry"))
+            if earnings_flag:
+                flags.append(earnings_flag)
+
             candidates.append((c, spot, {
                 "mid": mid,
                 "spread_pct": (ask - bid) / mid if mid else None,
@@ -759,6 +957,10 @@ def _scan_itm_candidates(symbols, dte_lo, dte_hi):
                 "contract_cost": ask * 100,
                 "breakeven": breakeven,
                 "breakeven_cushion_pct": breakeven_cushion_pct,
+                "realized_vol": round(rvol, 2) if rvol else None,
+                "iv_rv_ratio": iv_rv_ratio,
+                "earnings_date": earnings_date_iso,
+                "flags": flags,
             }))
     return as_of, candidates
 
@@ -822,7 +1024,8 @@ def get_itm_scan(symbols=None, down_pct=-0.005, flat_pct=0.0, up_pct=0.005, top=
                 "pnl_pct": round(pnl_dollars / contract_cost, 4),
             }
 
-        score = _itm_scan_score(delta, spread_pct, scenario_out["flat"]["pnl_pct"])
+        raw_score = _itm_scan_score(delta, spread_pct, scenario_out["flat"]["pnl_pct"])
+        score = _apply_risk_flags(raw_score, base["flags"])
 
         all_contracts.append({
             "underlying": c.get("underlying"),
@@ -842,6 +1045,11 @@ def get_itm_scan(symbols=None, down_pct=-0.005, flat_pct=0.0, up_pct=0.005, top=
             "moneyness_pct": round(base["moneyness_pct"], 4),
             "tier": tier,
             "score": score,
+            "raw_score": raw_score,  # before risk-flag penalties, so both are visible
+            "flags": base["flags"],
+            "realized_vol": base["realized_vol"],
+            "iv_rv_ratio": base["iv_rv_ratio"],
+            "earnings_date": base["earnings_date"],
             "contract_cost": round(contract_cost, 2),
             "max_loss": round(contract_cost, 2),  # 1 long contract: max loss == entry cost
             "breakeven": round(base["breakeven"], 4),
@@ -981,7 +1189,9 @@ def get_itm_scan_weekly(symbols=None, target_dte=7, window=2, top=20):
         magnitude_pnl_pct = magnitude_pnl_dollars / contract_cost if contract_cost else 0.0
         flat_pnl_dollars = (base["intrinsic"] - ask) * 100
 
-        score = _weekly_itm_scan_score(delta, spread_pct, magnitude_pnl_pct, extrinsic_ratio)
+        raw_score = _weekly_itm_scan_score(delta, spread_pct, magnitude_pnl_pct,
+                                           extrinsic_ratio)
+        score = _apply_risk_flags(raw_score, base["flags"])
 
         all_contracts.append({
             "underlying": c.get("underlying"),
@@ -1003,6 +1213,11 @@ def get_itm_scan_weekly(symbols=None, target_dte=7, window=2, top=20):
             "extrinsic_ratio": round(extrinsic_ratio, 4) if extrinsic_ratio is not None else None,
             "expected_move_pct": round(expected_move_pct, 4),
             "weekly_score": score,
+            "raw_weekly_score": raw_score,  # before risk-flag penalties
+            "flags": base["flags"],
+            "realized_vol": base["realized_vol"],
+            "iv_rv_ratio": base["iv_rv_ratio"],
+            "earnings_date": base["earnings_date"],
             "contract_cost": round(contract_cost, 2),
             "max_loss": round(contract_cost, 2),  # 1 long contract: max loss == entry cost
             "breakeven": round(base["breakeven"], 4),
