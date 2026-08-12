@@ -1755,6 +1755,23 @@ _BS_RATE = 0.04             # flat risk-free rate; the app has no yield-curve fe
 _MODELED_SPREAD_PCT = 0.03  # measured live median 2.7% / mean 3.6% of premium
 _VOL_PREMIUM_SENSITIVITY = (1.0, 1.1, 1.25)
 
+# Implied-vol proxies. Pricing entries off realized vol was the single
+# largest source of optimism in this simulation (implied normally trades
+# above realized, so modeled entries came out too cheap); these indices are
+# actual traded implied vol, which removes the guess rather than scaling it.
+#
+# Only symbols with a REAL proxy appear here. ^RVX (the Russell 2000 vol
+# index, the natural match for IWM) 404s on this feed, and ^VXD carries one
+# usable bar -- so IWM has no proxy and falls back to realized rather than
+# borrowing SPY's volatility, which would be a different underlying's risk
+# dressed up as IWM's.
+#
+# Two approximations remain, and they're documented rather than hidden:
+# these track the INDEX (SPX/NDX), not the ETF, and they quote 30-day
+# implied vol while the simulated contracts are ~7-day, so term structure
+# is ignored.
+_IV_PROXY = {"SPY": "^VIX", "QQQ": "^VXN"}
+
 
 def _norm_cdf(x):
     """Standard normal CDF via math.erf -- keeps this stdlib-only."""
@@ -1791,19 +1808,42 @@ def _realized_vol_from(closes):
     return math.sqrt(var) * math.sqrt(252)
 
 
+def implied_vol_series(symbol, rng):
+    """{date: sigma} from `symbol`'s implied-vol proxy index, or None when no
+    proxy exists for it.
+
+    The index quotes annualized implied vol in percent (VIX 15.4 -> 0.154).
+    Returning None rather than an empty dict lets callers distinguish "this
+    symbol has no proxy" from "the proxy fetch came back empty", which
+    matter differently: the first is permanent, the second is retryable.
+    """
+    proxy = _IV_PROXY.get(symbol.upper())
+    if not proxy:
+        return None
+    hist = get_history(proxy, rng)
+    ts, closes = hist.get("t") or [], hist.get("c") or []
+    return {_et_date_from_ts(t): c / 100.0 for t, c in zip(ts, closes) if c}
+
+
 def _simulate_weekly_itm(bars, hold_days, moneyness, vol_lookback,
-                         vol_premium, spread_pct, is_call=True):
+                         vol_premium, spread_pct, is_call=True, iv_by_date=None):
     """One pass of the simulation. `bars` is [(date, close), ...] ascending.
 
     Buys a hypothetical ITM option `moneyness` in the money, holds to
-    expiry, settles at intrinsic. Volatility comes only from bars STRICTLY
-    BEFORE the entry, so there's no lookahead.
+    expiry, settles at intrinsic.
+
+    Volatility comes from `iv_by_date` (real traded implied vol) when a
+    date is available there, otherwise from realized vol over the trailing
+    window. Either way it uses only data at or before the entry bar, so
+    there is no lookahead.
     """
     trades = []
     for i in range(vol_lookback, len(bars) - hold_days):
         entry_date, spot = bars[i]
         exit_date, exit_spot = bars[i + hold_days]
-        sigma = _realized_vol_from([c for _d, c in bars[i - vol_lookback:i + 1]])
+        sigma = (iv_by_date or {}).get(entry_date)
+        if not sigma:
+            sigma = _realized_vol_from([c for _d, c in bars[i - vol_lookback:i + 1]])
         if not sigma:
             continue
         sigma *= vol_premium
@@ -1849,7 +1889,7 @@ def _summarize_trades(trades):
 
 def get_modeled_backtest(symbol, rng="2y", hold_days=7, moneyness=0.01,
                          vol_lookback=30, spread_pct=_MODELED_SPREAD_PCT,
-                         option_type="C"):
+                         option_type="C", vol_source="implied"):
     """Model the weekly ITM strategy over historical daily bars.
 
     See the module comment above this function for why the result is a
@@ -1866,7 +1906,7 @@ def get_modeled_backtest(symbol, rng="2y", hold_days=7, moneyness=0.01,
     hold_days = _clamp_int(hold_days, 1, MAX_TARGET_DTE)
     vol_lookback = _clamp_int(vol_lookback, 5, 250)
     key = (f"mbt:{symbol}:{rng}:{hold_days}:{moneyness}:{vol_lookback}:"
-           f"{spread_pct}:{option_type}")
+           f"{spread_pct}:{option_type}:{vol_source}")
     cached = cache_get(key)
     if cached is not None:
         return cached
@@ -1875,18 +1915,34 @@ def get_modeled_backtest(symbol, rng="2y", hold_days=7, moneyness=0.01,
     ts, closes = hist.get("t") or [], hist.get("c") or []
     bars = [(_et_date_from_ts(t), c) for t, c in zip(ts, closes)]
 
-    headline = _simulate_weekly_itm(bars, hold_days, moneyness, vol_lookback,
-                                    1.0, spread_pct, is_call)
+    iv_by_date = implied_vol_series(symbol, rng) if vol_source == "implied" else None
+    proxy = _IV_PROXY.get(symbol.upper())
+    if vol_source == "implied" and iv_by_date:
+        vol_source_used = f"implied ({proxy})"
+    elif vol_source == "implied":
+        # Asked for implied, none exists for this symbol. Say so rather than
+        # silently reporting realized-vol results under an "implied" label.
+        vol_source_used = f"realized (no implied-vol proxy for {symbol})"
+    else:
+        vol_source_used = f"realized ({vol_lookback}d trailing)"
+
+    def _run(premium, spread):
+        return _simulate_weekly_itm(bars, hold_days, moneyness, vol_lookback,
+                                    premium, spread, is_call, iv_by_date)
+
+    headline = _run(1.0, spread_pct)
     sensitivity = []
     for premium in _VOL_PREMIUM_SENSITIVITY:
-        s = _summarize_trades(_simulate_weekly_itm(
-            bars, hold_days, moneyness, vol_lookback, premium, spread_pct, is_call))
+        s = _summarize_trades(_run(premium, spread_pct))
         s["vol_premium"] = premium
         sensitivity.append(s)
     # Same trades with no spread haircut, to size how much execution costs
     # actually matter rather than asserting that they do.
-    no_spread = _summarize_trades(_simulate_weekly_itm(
-        bars, hold_days, moneyness, vol_lookback, 1.0, 0.0, is_call))
+    no_spread = _summarize_trades(_run(1.0, 0.0))
+    # And the same trades priced off realized vol, so the difference the
+    # implied-vol input makes is a visible number rather than a claim.
+    realized_only = _summarize_trades(_simulate_weekly_itm(
+        bars, hold_days, moneyness, vol_lookback, 1.0, spread_pct, is_call, None))
 
     out = {
         "symbol": symbol,
@@ -1896,24 +1952,31 @@ def get_modeled_backtest(symbol, rng="2y", hold_days=7, moneyness=0.01,
         "option_type": "C" if is_call else "P",
         "spread_pct": spread_pct,
         "bars": len(bars),
+        "vol_source": vol_source_used,
         "summary": _summarize_trades(headline),
         "sensitivity": sensitivity,
         "no_spread_summary": no_spread,
+        "realized_vol_summary": realized_only,
         "trades": headline[-20:],  # a tail sample, not the whole series
         "modeled": True,
         "note": ("MODELED, NOT A BACKTEST. No historical options prices exist on "
                  "this feed, so entries are priced with Black-Scholes from daily "
-                 "underlying bars. Entry volatility is REALIZED vol from trailing "
-                 f"{vol_lookback} sessions -- implied normally trades above "
-                 "realized, so modeled entries are systematically cheaper than "
-                 "real ones and these returns are optimistic. See `sensitivity` "
-                 "for the same trades priced at higher volatility, and "
-                 "`no_spread_summary` for the same trades without the "
-                 f"{spread_pct:.0%} execution haircut. Black-Scholes also assumes "
-                 "constant vol, no skew and European exercise; real ITM equity "
-                 "options are American and skewed. Held to expiry, settled at "
-                 "intrinsic. Use this to ask whether the strategy shape has any "
-                 "edge at all, never as a performance claim."),
+                 f"underlying bars. Entry volatility: {vol_source_used}. "
+                 + ("A traded implied-vol index removes the largest guess here, but "
+                    "it tracks the INDEX rather than the ETF and quotes 30-day vol "
+                    "against ~7-day contracts, so term structure is ignored. "
+                    if iv_by_date else
+                    "Realized vol is NOT what an option would really have cost -- "
+                    "implied normally trades above it, so these returns are "
+                    "optimistic. ")
+                 + "`sensitivity` reprices the same trades at higher volatility, "
+                 f"`no_spread_summary` drops the {spread_pct:.0%} execution "
+                 "haircut, and `realized_vol_summary` prices them off realized "
+                 "vol for comparison. Black-Scholes also assumes constant vol, no "
+                 "skew and European exercise; real ITM equity options are American "
+                 "and skewed. Held to expiry, settled at intrinsic. Use this to ask "
+                 "whether the strategy shape has any edge at all, never as a "
+                 "performance claim."),
     }
     cache_put(key, out, ttl=900)
     return out
@@ -2379,6 +2442,7 @@ class Handler(BaseHTTPRequestHandler):
             hold_days=int(self._qparam(query, "hold_days", "7")),
             moneyness=float(self._qparam(query, "moneyness", "0.01")),
             option_type=self._qparam(query, "type", "C"),
+            vol_source=self._qparam(query, "vol_source", "implied"),
         )
 
     def _api_snipe_log(self, query):

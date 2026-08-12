@@ -1795,10 +1795,20 @@ class ModeledBacktestTests(NetworkFreeTestCase):
     any particular return, which is a function of whatever history the feed
     happens to return."""
 
-    def _patch_history(self, closes):
+    def _patch_history(self, closes, vix=None):
+        """Symbol-aware stub: the underlying and its implied-vol proxy must
+        return different series, or the proxy would be fed price levels as
+        volatility (a $200 close becoming 200% vol) and quietly invalidate
+        every implied-vol test."""
         base = 1700000000
-        self.patch_server("get_history", lambda sym, rng="6mo": {
-            "t": [base + i * 86400 for i in range(len(closes))], "c": closes})
+        def fake(sym, rng="6mo"):
+            series = closes
+            if sym.startswith("^"):
+                if vix is None:
+                    return {"t": [], "c": []}       # no proxy data
+                series = [vix] * len(closes)         # flat implied vol, in percent
+            return {"t": [base + i * 86400 for i in range(len(series))], "c": series}
+        self.patch_server("get_history", fake)
 
     @staticmethod
     def _drifting(n=200, start=100.0, step=0.004):
@@ -1866,11 +1876,66 @@ class ModeledBacktestTests(NetworkFreeTestCase):
         self.assertTrue(out["modeled"])
 
     def test_result_is_labeled_a_model_not_a_backtest(self):
-        self._patch_history(self._drifting(200))
+        self._patch_history(self._drifting(200), vix=18.0)
         note = server.get_modeled_backtest("SPY")["note"]
         self.assertIn("MODELED, NOT A BACKTEST", note)
-        self.assertIn("optimistic", note)
         self.assertIn("never as a performance claim", note)
+
+    def test_realized_vol_run_is_labeled_optimistic(self):
+        """When entries are priced off realized vol the note must say so --
+        that's the run whose returns are systematically flattered."""
+        self._patch_history(self._drifting(200))
+        note = server.get_modeled_backtest("SPY", vol_source="realized")["note"]
+        self.assertIn("optimistic", note)
+        self.assertIn("realized", note)
+
+    # -- implied-vol proxy -------------------------------------------------
+
+    def test_implied_vol_series_scales_percent_to_a_fraction(self):
+        """VIX quotes annualized vol in percent; the pricer wants a fraction."""
+        self._patch_history(self._drifting(50), vix=20.0)
+        series = server.implied_vol_series("SPY", "2y")
+        self.assertTrue(series)
+        self.assertAlmostEqual(next(iter(series.values())), 0.20)
+
+    def test_symbols_without_a_proxy_return_none_not_empty(self):
+        """None means 'no proxy exists' (permanent); an empty dict would mean
+        'the fetch came back empty' (retryable). Callers treat them
+        differently, so the distinction has to survive."""
+        self.assertIsNone(server.implied_vol_series("IWM", "2y"))
+        self.assertIsNone(server.implied_vol_series("NOT-A-TICKER", "2y"))
+
+    def test_implied_vol_is_used_when_a_proxy_exists(self):
+        self._patch_history(self._drifting(200), vix=20.0)
+        out = server.get_modeled_backtest("SPY", vol_source="implied")
+        self.assertIn("implied", out["vol_source"])
+        self.assertIn("^VIX", out["vol_source"])
+
+    def test_falls_back_to_realized_and_says_so_when_no_proxy_exists(self):
+        """IWM has no working vol index (^RVX 404s). Borrowing SPY's would be
+        a different underlying's risk relabelled, so it must fall back AND
+        report that it did rather than claiming an implied-vol run."""
+        self._patch_history(self._drifting(200), vix=20.0)
+        out = server.get_modeled_backtest("IWM", vol_source="implied")
+        self.assertIn("realized", out["vol_source"])
+        self.assertIn("no implied-vol proxy", out["vol_source"])
+
+    def test_implied_and_realized_runs_are_both_reported(self):
+        """The point of keeping both: the difference the vol input makes is
+        a visible number rather than an assertion."""
+        self._patch_history(self._drifting(200), vix=35.0)
+        out = server.get_modeled_backtest("SPY", vol_source="implied")
+        self.assertIn("realized_vol_summary", out)
+        self.assertIn("summary", out)
+
+    def test_higher_implied_vol_produces_worse_results(self):
+        """Sanity: pricier entries must reduce returns, all else equal."""
+        self._patch_history(self._drifting(200), vix=12.0)
+        cheap = server.get_modeled_backtest("SPY")["summary"]["avg_pnl_pct"]
+        server._cache.clear()
+        self._patch_history(self._drifting(200), vix=45.0)
+        dear = server.get_modeled_backtest("SPY")["summary"]["avg_pnl_pct"]
+        self.assertGreater(cheap, dear)
 
     def test_short_history_yields_no_trades_rather_than_an_error(self):
         self._patch_history([100.0, 101.0, 102.0])

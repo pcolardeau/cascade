@@ -75,32 +75,47 @@ than being a bolted-on screener.
 
 ## 5. What the modeled simulation actually said
 
-Not a to-do — a result worth not losing, since the number is easy to
-misread and someone (including a future me) will be tempted to quote the
-headline.
+Not a to-do — a result worth not losing, and one that inverted once the
+volatility input was fixed.
 
-Over 2 years of daily bars, buying a ~1% ITM weekly call and holding to
-expiry, priced off trailing realized vol with a 3% execution haircut:
+Buying a ~1% ITM weekly call over 2 years of daily bars, held to expiry,
+3% execution haircut. The two columns are the SAME trades priced off
+different volatility:
 
-| underlying | trades | win rate | avg / trade | at 1.25x vol premium |
+| underlying | trades | win rate | priced off REALIZED vol | priced off REAL implied vol |
 |---|---|---|---|---|
-| SPY | 464 | 50.9% | +21.6% | **+9.1%** |
-| QQQ | 464 | 50.2% | +26.8% | **+11.1%** |
-| IWM | 464 | 46.8% | +21.5% | **+5.6%** |
+| SPY | 464 | 46.1% | +21.6% | **+5.8%** (^VIX) |
+| QQQ | 464 | 47.6% | +26.8% | **+14.5%** (^VXN) |
+| IWM | 464 | 46.8% | +21.5% | *no proxy — realized only* |
 
-**The headline is not the finding.** Three things undercut it:
+**The realized-vol number was an artifact, and it was most of the result.**
+Options trade at implied, not realized; implied normally sits above it, so
+pricing entries off realized bought them too cheaply. Correcting that
+removed ~73% of SPY's apparent edge.
 
-- Most of the apparent edge is an artifact of pricing entries at REALIZED
-  vol. Real options trade at implied, which normally sits above it. At a
-  1.25x premium — ordinary, not a stress case — the edge roughly halves
-  on SPY/QQQ and nearly vanishes on IWM.
-- Win rate is a coin flip (47–51%) everywhere. A +21% average with a 50%
-  win rate means a few large winners carry it, so the average is not an
-  expectation you can plan around.
-- Two years is one regime. This period had no sustained bear market.
+What survives is thin. On SPY, at real implied vol:
 
-**If anyone picks this up next:** the useful work isn't running it over
-more symbols, it's narrowing the vol assumption. Everything else is noise
-next to that one input. A source of historical implied vol — even a
-coarse one like VIX as a proxy for SPY — would do more for this than any
-other change.
+| vol premium | avg / trade | total |
+|---|---|---|
+| ×1.00 | +5.8% | +$41,334 |
+| ×1.10 | −0.0% | +$12,899 |
+| ×1.25 | −7.7% | −$30,466 |
+
+So a 10% error in the volatility assumption — or equivalently, execution
+slightly worse than the 3% modeled — erases it entirely, and a 25% error
+makes it a losing strategy. Win rate is below 50% throughout, meaning
+what profit exists rides on a few large winners rather than consistency.
+
+**Caveats that remain, in order of how much they'd move the number:**
+
+- IWM still has no implied-vol proxy (^RVX 404s on this feed, ^VXD returns
+  one bar), so its column is still the optimistic realized-vol figure and
+  is not comparable to the other two.
+- ^VIX/^VXN track the INDEX, not the ETF, and quote 30-day vol against
+  ~7-day contracts — term structure is ignored, and short-dated vol is
+  usually the more expensive end.
+- Two years is one regime, with no sustained bear market.
+
+**If anyone picks this up next:** a real IWM vol source, and short-dated
+rather than 30-day implied vol. Both push the same direction — toward the
+strategy looking worse, which is the direction worth being sure about.
