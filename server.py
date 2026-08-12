@@ -1832,6 +1832,49 @@ _VOL_PREMIUM_SENSITIVITY = (1.0, 1.1, 1.25)
 # _IV_MIN_COVERAGE, which is exactly the failure ^VIX9D was observed to have.
 _IV_PROXY = {"SPY": ("^VIX9D", "^VIX"), "QQQ": ("^VXN",)}
 
+# Symbols whose only proxy is a 30-day index, and which therefore price
+# ~7-DTE contracts at the wrong point on the volatility curve. Probed
+# directly: no short-dated NDX index is published on this feed (^VXN9D,
+# ^VN9D, ^VXN1D, ^VXNDX, ^VOLQ all return nothing), so QQQ cannot be fixed
+# the way SPY was.
+#
+# The adjustment below borrows the SPX curve's own 9-day/30-day ratio, per
+# date, and applies it to the 30-day NDX index. That is an ASSUMPTION, not a
+# measurement, and it is labelled as one everywhere it surfaces. What
+# supports it: the two indices' daily changes correlate 0.942 over 484
+# sessions, so they respond to common drivers. What undercuts it: their
+# LEVEL correlation is only 0.856, and the SPX ratio itself varies (median
+# 0.912, IQR 0.854-0.976), so a single day's transfer can be well off.
+#
+# Applied per-date rather than as a constant median deliberately: the
+# constant would wash out precisely the stressed sessions where the curve
+# inverts and the correction matters most.
+#
+# Off unless a symbol has no short-dated proxy of its own -- SPY keeps using
+# real ^VIX9D data and is never modelled. The unadjusted figure ships
+# alongside the adjusted one (see `unadjusted_summary`), matching how this
+# module already handles realized-vs-implied and spread-vs-no-spread: when
+# an input is a judgement call, show both numbers instead of picking one.
+_TERM_STRUCTURE_REF = ("^VIX9D", "^VIX")
+_TERM_ADJUST_SYMBOLS = frozenset({"QQQ"})
+
+
+def term_structure_ratio(rng):
+    """{date: short_dated_vol / thirty_day_vol} for the reference index pair.
+
+    Empty when either leg is unavailable or truncated, which callers must
+    treat as "no adjustment possible" rather than assuming 1.0 -- silently
+    applying no adjustment while claiming one would be the same class of
+    mislabelling _IV_MIN_COVERAGE exists to prevent.
+    """
+    short_name, long_name = _TERM_STRUCTURE_REF
+    short_h, long_h = get_history(short_name, rng), get_history(long_name, rng)
+    short = {_et_date_from_ts(t): c for t, c in zip(short_h.get("t") or [],
+                                                     short_h.get("c") or []) if c}
+    long = {_et_date_from_ts(t): c for t, c in zip(long_h.get("t") or [],
+                                                    long_h.get("c") or []) if c}
+    return {d: short[d] / long[d] for d in short if d in long and long[d]}
+
 
 def _norm_cdf(x):
     """Standard normal CDF via math.erf -- keeps this stdlib-only."""
@@ -2033,9 +2076,27 @@ def get_modeled_backtest(symbol, rng="2y", hold_days=7, moneyness=0.01,
             vol_source_used = (f"realized (implied-vol data incomplete for "
                                f"{proxy}: {covered}/{len(needed)} sessions)")
 
-    def _run(premium, spread):
+    # A symbol with only a 30-day proxy is priced at the wrong point on the
+    # curve for ~7-DTE contracts. Borrow the SPX curve's own shape, per date.
+    # This is a MODELLED correction, not data -- see _TERM_ADJUST_SYMBOLS --
+    # so it is labelled as such and the unadjusted run ships alongside it.
+    unadjusted_iv = iv_by_date
+    term_adjusted = False
+    if iv_by_date and symbol.upper() in _TERM_ADJUST_SYMBOLS:
+        ratios = term_structure_ratio(rng)
+        hit = sum(1 for d in needed if d in ratios)
+        if hit / len(needed) >= _IV_MIN_COVERAGE:
+            iv_by_date = {d: v * ratios[d] for d, v in iv_by_date.items()
+                          if d in ratios}
+            term_adjusted = True
+            short_ref, long_ref = _TERM_STRUCTURE_REF
+            vol_source_used = (f"implied ({proxy} x {short_ref}/{long_ref} "
+                               f"term ratio, MODELLED)")
+
+    def _run(premium, spread, iv=None):
         return _simulate_weekly_itm(bars, hold_days, moneyness, vol_lookback,
-                                    premium, spread, is_call, iv_by_date)
+                                    premium, spread, is_call,
+                                    iv_by_date if iv is None else iv)
 
     headline = _run(1.0, spread_pct)
     sensitivity = []
@@ -2050,6 +2111,10 @@ def get_modeled_backtest(symbol, rng="2y", hold_days=7, moneyness=0.01,
     # implied-vol input makes is a visible number rather than a claim.
     realized_only = _summarize_trades(_simulate_weekly_itm(
         bars, hold_days, moneyness, vol_lookback, 1.0, spread_pct, is_call, None))
+    # When a modelled term adjustment was applied, ship the unadjusted run too
+    # so the size of the modelling assumption is a visible number.
+    unadjusted = (_summarize_trades(_run(1.0, spread_pct, iv=unadjusted_iv))
+                  if term_adjusted else None)
 
     out = {
         "symbol": symbol,
@@ -2064,14 +2129,22 @@ def get_modeled_backtest(symbol, rng="2y", hold_days=7, moneyness=0.01,
         "sensitivity": sensitivity,
         "no_spread_summary": no_spread,
         "realized_vol_summary": realized_only,
+        "unadjusted_summary": unadjusted,
+        "term_adjusted": term_adjusted,
         "trades": headline[-20:],  # a tail sample, not the whole series
         "modeled": True,
         "note": ("MODELED, NOT A BACKTEST. No historical options prices exist on "
                  "this feed, so entries are priced with Black-Scholes from daily "
                  f"underlying bars. Entry volatility: {vol_source_used}. "
-                 + ("A traded implied-vol index removes the largest guess here, but "
-                    "it tracks the INDEX rather than the ETF and quotes 30-day vol "
-                    "against ~7-day contracts, so term structure is ignored. "
+                 + ("The term adjustment is MODELLED, not measured: no short-dated "
+                    "NDX index is published, so the SPX curve's own 9-day/30-day "
+                    "ratio is borrowed per date. Their daily changes correlate "
+                    "0.94, but level correlation is 0.86 and the ratio varies, so "
+                    "any single day's transfer can be off. `unadjusted_summary` "
+                    "is the same run without it. "
+                    if term_adjusted else
+                    "A traded implied-vol index removes the largest guess here, but "
+                    "it tracks the INDEX rather than the ETF. "
                     if iv_by_date else
                     "Realized vol is NOT what an option would really have cost -- "
                     "implied normally trades above it, so these returns are "
