@@ -4,9 +4,12 @@ Ideas that are worth doing but aren't being built yet. Each entry says what it
 is, why it's valuable, and what actually stands in the way — the blockers are
 the point, since several of these look cheaper than they are.
 
-**Done since this file was written:** the probability/profit-magnitude sort
-toggle (was item 3) shipped — Balanced / Safer / Biggest swing, client-side,
-on all three boards.
+**Done since this file was written:**
+- The probability/profit-magnitude sort toggle (was item 3) — Balanced /
+  Safer / Biggest swing, client-side, on all three boards.
+- The weekly forward paper-trading log (was item 1). One resolver now serves
+  both boards by settling on the contract's expiry rather than the log date;
+  for 0DTE those are the same day, so existing records were unaffected.
 
 ---
 
@@ -34,33 +37,6 @@ made a pre-existing wart newly prominent.
 
 ---
 
-## 1. Weekly Snipe Log — forward track record for the ~7-DTE board
-
-**What:** The 0DTE Snipe board has a forward paper-trading log (`snipe_log.json`)
-— a daemon thread snapshots the top-scored pick ~30 min before the close, and
-the next read on a later day settles it against the underlying's real closing
-price. The Weekly board (`get_itm_scan_weekly`) has no equivalent, so there's
-no honest record of whether its scoring actually picks winners.
-
-**Why:** Without it, the Weekly Score is an untested hypothesis. The 0DTE log is
-the only reason the 0DTE score's calibration can be argued about with evidence
-instead of taste.
-
-**Blockers / notes:**
-- Settlement is genuinely different: the 0DTE log settles against *the next
-  day's* close, which works because the option expires the same day it was
-  logged. A weekly pick has to be settled against the underlying's close on
-  its actual expiry date, which may be 5–9 days after the snapshot — so the
-  resolver needs to look up a specific historical date, not just "the most
-  recent close."
-- The existing scheduler thread fires once per trading day near the close. A
-  weekly log needs entries to stay open across many scheduler runs and only
-  resolve when their own expiry date has passed.
-- Worth reusing `resolve_snipe_log`'s P&L math (intrinsic-at-close minus entry
-  ask, times 100) — that part is horizon-independent and already tested.
-
----
-
 ## 2. Kelly-fraction position sizing
 
 **What:** Every board currently models exactly 1 contract (`contract_cost`,
@@ -80,8 +56,9 @@ question a screener naturally raises and currently can't answer.
 - Requires an account-size input, which the app has never had. That's a new
   piece of user state to persist and a new (small) responsibility — worth
   being deliberate about rather than sneaking in a number field.
-- Depends on backlog item 1 for the weekly horizon (0DTE could use its
-  existing log today).
+- The weekly log this depended on now exists, so both boards can feed it —
+  but neither has a settled sample yet. The weekly board's first result
+  can't arrive until a logged pick reaches its expiry.
 
 ---
 
