@@ -7,6 +7,7 @@ Run:  python test_server.py
 """
 
 import contextlib
+import datetime as dt
 import io
 import json
 import math
@@ -1455,6 +1456,172 @@ class ItmScanEndpointHorizonRoutingTests(NetworkFreeTestCase):
         calls = self._record_calls()
         server.Handler._api_options_itm_scan_weekly(server.Handler, {})
         self.assertIn("weekly", calls)
+
+
+class ScanInputBoundsTests(NetworkFreeTestCase):
+    """The DTE window feeds earnings_map(), which issues one outbound
+    request per day of horizon. Unbounded, ?target_dte=100000 would attempt
+    ~100k requests to Nasdaq through a thread pool -- the same class of
+    amplification MAX_API_SYMBOLS already guards on the symbols axis.
+
+    These assert the cap holds at every layer: the function that actually
+    turns a number into requests, the two scan entry points, and the HTTP
+    handler that takes the value straight from a query param.
+    """
+    def setUp(self):
+        super().setUp()
+        self.days = []
+        self.patch_server("earnings_map", _REAL_EARNINGS_MAP)
+        self.patch_server("_nasdaq_earnings_for_date",
+                          lambda d: (self.days.append(d) or {}))
+        self.patch_server("get_quotes", lambda syms: {})
+        self.patch_server("_fetch_chain",
+                          lambda s: {"contracts": [], "call_vol": 0.0,
+                                     "put_vol": 0.0, "ts": None})
+
+    def _cap(self):
+        return server.MAX_EARNINGS_LOOKAHEAD_DAYS + 1  # inclusive of day 0
+
+    def test_earnings_map_clamps_absurd_horizons(self):
+        server.earnings_map(10 ** 6)
+        self.assertLessEqual(len(self.days), self._cap())
+
+    def test_earnings_map_is_exact_for_small_horizons(self):
+        server.earnings_map(7)
+        self.assertEqual(len(self.days), 8, "today + the next 7 days")
+
+    def test_earnings_map_negative_horizon_fetches_nothing(self):
+        server.earnings_map(-1)
+        self.assertEqual(self.days, [])
+
+    def test_weekly_scan_clamps_target_dte(self):
+        server.get_itm_scan_weekly(["SPY"], target_dte=100000, window=3)
+        self.assertLessEqual(len(self.days), self._cap())
+
+    def test_spreads_scan_clamps_window(self):
+        server.get_debit_spreads(["SPY"], target_dte=7, window=999999)
+        self.assertLessEqual(len(self.days), self._cap())
+
+    def test_http_handler_clamps_target_dte(self):
+        """The real attack path: the value arrives as an unvalidated query
+        param and is int()-parsed straight into the scan."""
+        server.Handler._api_options_itm_scan(server.Handler, {"target_dte": ["100000"]})
+        self.assertLessEqual(len(self.days), self._cap())
+
+    def test_negative_target_dte_does_not_invert_the_window(self):
+        server.get_itm_scan_weekly(["SPY"], target_dte=-500, window=3)
+        self.assertLessEqual(len(self.days), self._cap())
+
+    def test_clamp_int_helper(self):
+        self.assertEqual(server._clamp_int(5, 0, 10), 5)
+        self.assertEqual(server._clamp_int(-5, 0, 10), 0)
+        self.assertEqual(server._clamp_int(50, 0, 10), 10)
+
+
+class EasternDateTests(NetworkFreeTestCase):
+    """Anything deciding WHICH TRADING DAY something belongs to must use ET,
+    not the machine's local date. The two disagree for a window every night
+    as wide as the host's offset from Eastern, so on a non-ET host a
+    contract's DTE or a logged pick's date could land on the wrong trading
+    day -- producing a subtly wrong track record rather than an error.
+
+    Each test pins _now_et() to a FIXED PAST date rather than to "just after
+    midnight tonight". Anchoring to a real-world-relative moment would make
+    these pass or fail depending on the day they run: dt.date.today() only
+    differs from a pinned ET date when the machine's local date happens to
+    differ, so on the wrong day a reverted fix would sail through. A date in
+    2020 can never equal dt.date.today(), so a regression back to local time
+    fails here every time.
+    """
+    ET_NOW = dt.datetime(2020, 1, 2, 0, 30, tzinfo=dt.timezone(dt.timedelta(hours=-5)))
+    ET_DATE = "2020-01-02"
+
+    def _freeze_et(self):
+        self.patch_server("_now_et", lambda: self.ET_NOW)
+
+    def test_today_et_follows_eastern_not_local(self):
+        self._freeze_et()
+        self.assertEqual(server._today_et().isoformat(), self.ET_DATE)
+
+    def test_parse_chain_dte_is_measured_from_the_eastern_date(self):
+        self._freeze_et()
+        raw = _wrap_chain_json([{
+            "option": "SPY200117C00495000", "volume": 10, "open_interest": 5,
+            "bid": 1.0, "ask": 1.1,
+        }])
+        contract = server._parse_chain("SPY", raw)[0][0]
+        expected = (dt.date(2020, 1, 17) - dt.date(2020, 1, 2)).days
+        self.assertEqual(contract["dte"], expected)
+
+    def test_snapshot_dates_the_entry_by_the_eastern_day(self):
+        self._freeze_et()
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        self.patch_server("SNIPE_LOG_PATH", os.path.join(tmpdir, "log.json"))
+        self.patch_server("get_itm_scan", lambda *a, **k: {"contracts": [{
+            "underlying": "SPY", "type": "C", "strike": 495.0,
+            "expiry": "2020-01-02", "ask": 5.0, "delta": 0.9,
+            "spread_pct": 0.02, "score": 80.0, "contract_cost": 500.0,
+            "breakeven": 500.0,
+        }]})
+        entry = server.snapshot_snipe_pick()
+        self.assertEqual(entry["date"], self.ET_DATE)
+
+    def test_resolution_uses_the_eastern_day_to_decide_what_is_past(self):
+        """An entry dated the CURRENT ET day must stay open. Pinning ET to
+        just after midnight makes this fail loudly if local date is used,
+        since local is still the previous day."""
+        self._freeze_et()
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        path = os.path.join(tmpdir, "log.json")
+        self.patch_server("SNIPE_LOG_PATH", path)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([{"date": self.ET_DATE, "status": "open", "underlying": "SPY",
+                        "type": "C", "strike": 495.0, "entry_ask": 5.0,
+                        "contract_cost": 500.0}], f)
+        self.patch_server("_closing_price_on", lambda sym, d: 500.0)
+        entries = server.resolve_snipe_log()
+        self.assertEqual(entries[0]["status"], "open",
+                         "an entry from the current ET day is not settled yet")
+
+
+class BuildRiskFlagsTests(unittest.TestCase):
+    """_build_risk_flags() is the single place all three flags are assembled;
+    both the single-leg scan core and the spreads board go through it, so a
+    new flag type is one edit rather than one per board."""
+
+    def test_combines_all_three_flag_types(self):
+        flags, ratio = server._build_risk_flags(
+            volume=1, oi=2, iv=40.0, rvol=10.0,
+            earnings_date_iso="2026-08-17", expiry_iso="2026-08-21")
+        self.assertEqual({f["code"] for f in flags},
+                         {"THIN_VOL", "THIN_OI", "IV_RICH", "EARNINGS"})
+        self.assertEqual(ratio, 4.0)
+
+    def test_returns_the_ratio_even_when_it_does_not_trip_the_flag(self):
+        """The boards display iv_rv_ratio whether or not it's a red flag."""
+        flags, ratio = server._build_risk_flags(
+            volume=5000, oi=20000, iv=11.0, rvol=10.0,
+            earnings_date_iso=None, expiry_iso="2026-08-21")
+        self.assertEqual(flags, [])
+        self.assertEqual(ratio, 1.1)
+
+    def test_clean_contract_yields_no_flags(self):
+        flags, _ratio = server._build_risk_flags(
+            volume=5000, oi=20000, iv=10.0, rvol=10.0,
+            earnings_date_iso=None, expiry_iso="2026-08-21")
+        self.assertEqual(flags, [])
+
+    def test_both_boards_agree_on_identical_inputs(self):
+        """The point of the extraction: a single-leg contract and a spread
+        leg with the same characteristics must be flagged identically."""
+        args = dict(volume=1, oi=1, iv=40.0, rvol=10.0,
+                    earnings_date_iso="2026-08-17", expiry_iso="2026-08-21")
+        a, ra = server._build_risk_flags(**args)
+        b, rb = server._build_risk_flags(**args)
+        self.assertEqual([f["code"] for f in a], [f["code"] for f in b])
+        self.assertEqual(ra, rb)
 
 
 class SpreadScoreTests(unittest.TestCase):

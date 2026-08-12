@@ -188,6 +188,21 @@ def _now_et():
     return now_utc.astimezone(dt.timezone(dt.timedelta(hours=offset)))
 
 
+def _today_et():
+    """Today's date in US Eastern -- the calendar the market actually runs on.
+
+    Use this, never dt.date.today(), for anything that decides WHICH TRADING
+    DAY something belongs to: contract DTE, a log entry's date, whether an
+    entry is far enough in the past to settle. dt.date.today() is the
+    machine's local date, and the two disagree for a window every night whose
+    width is the offset between local time and ET -- so on a host outside
+    Eastern, an option's DTE or a logged pick's date can silently land on the
+    wrong trading day. That produces a subtly wrong track record rather than
+    an error, which is the worst way for this to fail.
+    """
+    return _now_et().date()
+
+
 def _et_date_from_ts(ts):
     """Unix timestamp -> the US-Eastern calendar date (YYYY-MM-DD) it falls
     on. Used to match a Yahoo daily-bar timestamp back to the trading day
@@ -201,6 +216,25 @@ def _et_date_from_ts(ts):
 # crafted ?symbols=... list can't trigger an unbounded burst of outbound
 # requests to Yahoo / CBOE (resource-exhaustion / amplification guard).
 MAX_API_SYMBOLS = 60
+
+# Same guard, for the OTHER axis a request can scale along. The DTE window
+# feeds earnings_map(), which fetches one calendar day per day of horizon --
+# so ?target_dte=100000 would otherwise attempt ~100k outbound requests to
+# Nasdaq through a thread pool. These bound it at values well past any real
+# screening horizon (CBOE chains run ~2y out, but nothing here is designed to
+# scan more than a couple of months).
+MAX_TARGET_DTE = 180
+MAX_DTE_WINDOW = 30
+
+# Separate, tighter cap on how far ahead the earnings calendar is consulted.
+# Not just a cost guard: past ~6 weeks the flag stops carrying information,
+# because essentially every contract that far out spans an earnings report,
+# so "earnings before expiry" would fire on everything and mean nothing.
+MAX_EARNINGS_LOOKAHEAD_DAYS = 45
+
+
+def _clamp_int(value, lo, hi):
+    return max(lo, min(hi, value))
 
 # ---------------------------------------------------------------------------
 # tiny TTL cache
@@ -531,7 +565,9 @@ def _parse_chain(symbol, raw):
     call_vol = put_vol = 0.0
     data = json.loads(raw)
     body = data.get("data") or {}
-    today = dt.date.today()  # one call per chain, not once per contract (chains run 100s of rows)
+    # ET, not local: dte decides which trading day a contract expires on.
+    # One call per chain, not once per contract (chains run 100s of rows).
+    today = _today_et()
     for opt in body.get("options", []):
         vol = opt.get("volume") or 0
         if not vol:
@@ -817,12 +853,18 @@ def earnings_map(days_ahead):
 
     Bounded deliberately: the calendar is queried per date, so the number of
     outbound requests equals the horizon being scanned (1 for a 0DTE board,
-    <=9 for a ~7-DTE one), fetched in parallel and cached 12h. A per-symbol
+    <=11 for a ~7-DTE one), fetched in parallel and cached 12h. A per-symbol
     lookahead would instead multiply that by the size of the scan universe.
+
+    `days_ahead` is clamped to MAX_EARNINGS_LOOKAHEAD_DAYS here as well as at
+    the callers -- this function is the thing that actually turns a number
+    into N outbound requests, so it owns the last word on that bound rather
+    than trusting every present and future caller to have clamped first.
     """
     if days_ahead < 0:
         return {}
-    today = _now_et().date()
+    days_ahead = min(days_ahead, MAX_EARNINGS_LOOKAHEAD_DAYS)
+    today = _today_et()
     dates = [(today + dt.timedelta(days=i)).isoformat()
              for i in range(days_ahead + 1)]
     merged = {}
@@ -882,6 +924,29 @@ def _iv_flag(iv, rvol):
         return None, round(ratio, 2)
     return ({"code": "IV_RICH", "penalty": _RISK_PENALTIES["IV_RICH"],
              "label": f"IV {ratio:.1f}x realized vol"}, round(ratio, 2))
+
+
+def _build_risk_flags(volume, oi, iv, rvol, earnings_date_iso, expiry_iso):
+    """Every risk flag for one contract, in one place.
+
+    The single-leg scan core and the spreads board both need the same three
+    checks, and previously each assembled them by hand -- so a new flag type
+    meant editing two call sites and a third board would have made three.
+    They differ only in what they feed in (spreads pass the WEAKER leg's
+    liquidity and the LONG leg's IV), which stays the caller's decision.
+
+    Returns:
+        (flags, iv_rv_ratio): the ratio comes back even when it doesn't
+        trip the flag, since the boards display it either way.
+    """
+    flags = _liquidity_flags(volume, oi)
+    iv_flag, iv_rv_ratio = _iv_flag(iv, rvol)
+    if iv_flag:
+        flags.append(iv_flag)
+    earnings_flag = _earnings_flag(earnings_date_iso, expiry_iso)
+    if earnings_flag:
+        flags.append(earnings_flag)
+    return flags, iv_rv_ratio
 
 
 def _apply_risk_flags(raw_score, flags):
@@ -977,13 +1042,9 @@ def _scan_itm_candidates(symbols, dte_lo, dte_hi):
                 breakeven = strike - ask
                 breakeven_cushion_pct = (breakeven - spot) / spot
 
-            iv_flag, iv_rv_ratio = _iv_flag(c.get("iv"), rvol)
-            flags = _liquidity_flags(c.get("volume"), c.get("oi"))
-            if iv_flag:
-                flags.append(iv_flag)
-            earnings_flag = _earnings_flag(earnings_date_iso, c.get("expiry"))
-            if earnings_flag:
-                flags.append(earnings_flag)
+            flags, iv_rv_ratio = _build_risk_flags(
+                c.get("volume"), c.get("oi"), c.get("iv"), rvol,
+                earnings_date_iso, c.get("expiry"))
 
             candidates.append((c, spot, {
                 "mid": mid,
@@ -1198,6 +1259,10 @@ def get_itm_scan_weekly(symbols=None, target_dte=7, window=_DEFAULT_DTE_WINDOW, 
         symbols = SNIPE_SCAN
     symbols = symbols[:MAX_API_SYMBOLS]  # see get_itm_scan's identical guard
     top = max(top, 0)  # see get_active_options' identical guard
+    # Clamped here, not only in the HTTP handler, so a direct caller can't
+    # bypass the outbound fan-out bound either (see MAX_TARGET_DTE).
+    target_dte = _clamp_int(target_dte, 0, MAX_TARGET_DTE)
+    window = _clamp_int(window, 0, MAX_DTE_WINDOW)
     dte_lo, dte_hi = target_dte - window, target_dte + window
     key = f"itm-weekly:{','.join(sorted(symbols))}:{dte_lo}:{dte_hi}:{top}"
     cached = cache_get(key)
@@ -1369,6 +1434,8 @@ def get_debit_spreads(symbols=None, target_dte=7, window=_DEFAULT_DTE_WINDOW, to
         symbols = SNIPE_SCAN
     symbols = symbols[:MAX_API_SYMBOLS]
     top = max(top, 0)
+    target_dte = _clamp_int(target_dte, 0, MAX_TARGET_DTE)  # see get_itm_scan_weekly
+    window = _clamp_int(window, 0, MAX_DTE_WINDOW)
     dte_lo, dte_hi = target_dte - window, target_dte + window
     key = f"spreads:{','.join(sorted(symbols))}:{dte_lo}:{dte_hi}:{top}"
     cached = cache_get(key)
@@ -1436,15 +1503,13 @@ def get_debit_spreads(symbols=None, target_dte=7, window=_DEFAULT_DTE_WINDOW, to
                                      (short_leg["ask"] - short_leg["bid"]))
                     cost_pct = combined_cost / net_debit if net_debit else None
 
-                    flags = _liquidity_flags(
+                    # Liquidity from the WEAKER leg (a spread is only as
+                    # fillable as its thinner side); IV from the long leg,
+                    # which is the one being paid for.
+                    flags, iv_rv_ratio = _build_risk_flags(
                         min(long_leg.get("volume") or 0, short_leg.get("volume") or 0),
-                        min(long_leg.get("oi") or 0, short_leg.get("oi") or 0))
-                    iv_flag, iv_rv_ratio = _iv_flag(long_leg.get("iv"), rvol)
-                    if iv_flag:
-                        flags.append(iv_flag)
-                    earnings_flag = _earnings_flag(earnings_date_iso, expiry)
-                    if earnings_flag:
-                        flags.append(earnings_flag)
+                        min(long_leg.get("oi") or 0, short_leg.get("oi") or 0),
+                        long_leg.get("iv"), rvol, earnings_date_iso, expiry)
 
                     raw_score = _spread_score(short_leg.get("delta"),
                                               reward_risk, cost_pct)
@@ -1566,7 +1631,7 @@ def snapshot_snipe_pick(late=False):
     """
     scan = get_itm_scan()
     contracts = scan.get("contracts") or []
-    today = dt.date.today().isoformat()
+    today = _today_et().isoformat()  # ET: this is the entry's TRADING day
 
     entries = _load_snipe_log()
     for existing in entries:
@@ -1637,7 +1702,7 @@ def resolve_snipe_log():
         list: the full (possibly updated) log, unsorted.
     """
     entries = _load_snipe_log()
-    today = dt.date.today().isoformat()
+    today = _today_et().isoformat()  # ET: "is this entry's trading day past?"
     changed = False
     for e in entries:
         if e.get("status") != "open":
