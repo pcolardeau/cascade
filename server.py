@@ -188,6 +188,21 @@ def _now_et():
     return now_utc.astimezone(dt.timezone(dt.timedelta(hours=offset)))
 
 
+def _today_et():
+    """Today's date in US Eastern -- the calendar the market actually runs on.
+
+    Use this, never dt.date.today(), for anything that decides WHICH TRADING
+    DAY something belongs to: contract DTE, a log entry's date, whether an
+    entry is far enough in the past to settle. dt.date.today() is the
+    machine's local date, and the two disagree for a window every night whose
+    width is the offset between local time and ET -- so on a host outside
+    Eastern, an option's DTE or a logged pick's date can silently land on the
+    wrong trading day. That produces a subtly wrong track record rather than
+    an error, which is the worst way for this to fail.
+    """
+    return _now_et().date()
+
+
 def _et_date_from_ts(ts):
     """Unix timestamp -> the US-Eastern calendar date (YYYY-MM-DD) it falls
     on. Used to match a Yahoo daily-bar timestamp back to the trading day
@@ -201,6 +216,25 @@ def _et_date_from_ts(ts):
 # crafted ?symbols=... list can't trigger an unbounded burst of outbound
 # requests to Yahoo / CBOE (resource-exhaustion / amplification guard).
 MAX_API_SYMBOLS = 60
+
+# Same guard, for the OTHER axis a request can scale along. The DTE window
+# feeds earnings_map(), which fetches one calendar day per day of horizon --
+# so ?target_dte=100000 would otherwise attempt ~100k outbound requests to
+# Nasdaq through a thread pool. These bound it at values well past any real
+# screening horizon (CBOE chains run ~2y out, but nothing here is designed to
+# scan more than a couple of months).
+MAX_TARGET_DTE = 180
+MAX_DTE_WINDOW = 30
+
+# Separate, tighter cap on how far ahead the earnings calendar is consulted.
+# Not just a cost guard: past ~6 weeks the flag stops carrying information,
+# because essentially every contract that far out spans an earnings report,
+# so "earnings before expiry" would fire on everything and mean nothing.
+MAX_EARNINGS_LOOKAHEAD_DAYS = 45
+
+
+def _clamp_int(value, lo, hi):
+    return max(lo, min(hi, value))
 
 # ---------------------------------------------------------------------------
 # tiny TTL cache
@@ -525,16 +559,28 @@ def _parse_occ_symbol(occ_str):
         return None
 
 
-def _parse_chain(symbol, raw):
-    """Return (contracts, call_vol, put_vol) for one underlying's CBOE chain."""
+def _parse_chain(symbol, raw, require_volume=True):
+    """Return (contracts, call_vol, put_vol) for one underlying's CBOE chain.
+
+    Args:
+        require_volume (bool): drop contracts that haven't traded today.
+            True for every trading board -- an untraded contract has no
+            meaningful market to screen. False for open-interest analysis
+            (see get_gamma_exposure), where untraded strikes are precisely
+            the point: measured on SPY's live chain, zero-volume rows hold
+            17% of all open interest, so filtering them would silently
+            discard a sixth of the positioning being measured.
+    """
     contracts = []
     call_vol = put_vol = 0.0
     data = json.loads(raw)
     body = data.get("data") or {}
-    today = dt.date.today()  # one call per chain, not once per contract (chains run 100s of rows)
+    # ET, not local: dte decides which trading day a contract expires on.
+    # One call per chain, not once per contract (chains run 100s of rows).
+    today = _today_et()
     for opt in body.get("options", []):
         vol = opt.get("volume") or 0
-        if not vol:
+        if require_volume and not vol:
             continue
         parsed = _parse_occ_symbol(opt.get("option", ""))
         if not parsed:
@@ -559,6 +605,7 @@ def _parse_chain(symbol, raw):
             "ask": opt.get("ask"),
             "delta": opt.get("delta"),  # signed: negative for puts, kept as-is (not abs'd)
             "theta": opt.get("theta"),
+            "gamma": opt.get("gamma"),
         })
     return contracts, call_vol, put_vol
 
@@ -573,8 +620,16 @@ def _cboe_chain_url(symbol):
             f"{urllib.parse.quote(symbol, safe='')}.json")
 
 
-def _fetch_chain(symbol):
-    key = f"o:{symbol}"
+def _fetch_chain(symbol, require_volume=True):
+    """Fetch and parse one underlying's chain, cached per (symbol, filter).
+
+    The two variants are cached under different keys deliberately: the
+    traded-only view is what every board wants and is far smaller, while the
+    full view (untraded strikes included) is only needed for open-interest
+    analysis. Sharing one cache entry would either bloat every board's
+    working set or silently give the OI analysis a filtered chain.
+    """
+    key = f"o:{symbol}" if require_volume else f"oall:{symbol}"
     cached = cache_get(key)
     if cached is not None:
         return cached
@@ -584,7 +639,7 @@ def _fetch_chain(symbol):
         raw = fetch(url, timeout=20)
         # capture the feed's own timestamp for the "as of" line
         ts = json.loads(raw).get("timestamp")
-        contracts, call_vol, put_vol = _parse_chain(symbol, raw)
+        contracts, call_vol, put_vol = _parse_chain(symbol, raw, require_volume)
         result = {"contracts": contracts, "call_vol": call_vol, "put_vol": put_vol, "ts": ts}
     except (urllib.error.URLError, IOError, json.JSONDecodeError, KeyError, ValueError):
         # Dead symbol or parsing error shouldn't kill the board; return empty result
@@ -817,12 +872,18 @@ def earnings_map(days_ahead):
 
     Bounded deliberately: the calendar is queried per date, so the number of
     outbound requests equals the horizon being scanned (1 for a 0DTE board,
-    <=9 for a ~7-DTE one), fetched in parallel and cached 12h. A per-symbol
+    <=11 for a ~7-DTE one), fetched in parallel and cached 12h. A per-symbol
     lookahead would instead multiply that by the size of the scan universe.
+
+    `days_ahead` is clamped to MAX_EARNINGS_LOOKAHEAD_DAYS here as well as at
+    the callers -- this function is the thing that actually turns a number
+    into N outbound requests, so it owns the last word on that bound rather
+    than trusting every present and future caller to have clamped first.
     """
     if days_ahead < 0:
         return {}
-    today = _now_et().date()
+    days_ahead = min(days_ahead, MAX_EARNINGS_LOOKAHEAD_DAYS)
+    today = _today_et()
     dates = [(today + dt.timedelta(days=i)).isoformat()
              for i in range(days_ahead + 1)]
     merged = {}
@@ -882,6 +943,29 @@ def _iv_flag(iv, rvol):
         return None, round(ratio, 2)
     return ({"code": "IV_RICH", "penalty": _RISK_PENALTIES["IV_RICH"],
              "label": f"IV {ratio:.1f}x realized vol"}, round(ratio, 2))
+
+
+def _build_risk_flags(volume, oi, iv, rvol, earnings_date_iso, expiry_iso):
+    """Every risk flag for one contract, in one place.
+
+    The single-leg scan core and the spreads board both need the same three
+    checks, and previously each assembled them by hand -- so a new flag type
+    meant editing two call sites and a third board would have made three.
+    They differ only in what they feed in (spreads pass the WEAKER leg's
+    liquidity and the LONG leg's IV), which stays the caller's decision.
+
+    Returns:
+        (flags, iv_rv_ratio): the ratio comes back even when it doesn't
+        trip the flag, since the boards display it either way.
+    """
+    flags = _liquidity_flags(volume, oi)
+    iv_flag, iv_rv_ratio = _iv_flag(iv, rvol)
+    if iv_flag:
+        flags.append(iv_flag)
+    earnings_flag = _earnings_flag(earnings_date_iso, expiry_iso)
+    if earnings_flag:
+        flags.append(earnings_flag)
+    return flags, iv_rv_ratio
 
 
 def _apply_risk_flags(raw_score, flags):
@@ -977,13 +1061,9 @@ def _scan_itm_candidates(symbols, dte_lo, dte_hi):
                 breakeven = strike - ask
                 breakeven_cushion_pct = (breakeven - spot) / spot
 
-            iv_flag, iv_rv_ratio = _iv_flag(c.get("iv"), rvol)
-            flags = _liquidity_flags(c.get("volume"), c.get("oi"))
-            if iv_flag:
-                flags.append(iv_flag)
-            earnings_flag = _earnings_flag(earnings_date_iso, c.get("expiry"))
-            if earnings_flag:
-                flags.append(earnings_flag)
+            flags, iv_rv_ratio = _build_risk_flags(
+                c.get("volume"), c.get("oi"), c.get("iv"), rvol,
+                earnings_date_iso, c.get("expiry"))
 
             candidates.append((c, spot, {
                 "mid": mid,
@@ -1198,6 +1278,10 @@ def get_itm_scan_weekly(symbols=None, target_dte=7, window=_DEFAULT_DTE_WINDOW, 
         symbols = SNIPE_SCAN
     symbols = symbols[:MAX_API_SYMBOLS]  # see get_itm_scan's identical guard
     top = max(top, 0)  # see get_active_options' identical guard
+    # Clamped here, not only in the HTTP handler, so a direct caller can't
+    # bypass the outbound fan-out bound either (see MAX_TARGET_DTE).
+    target_dte = _clamp_int(target_dte, 0, MAX_TARGET_DTE)
+    window = _clamp_int(window, 0, MAX_DTE_WINDOW)
     dte_lo, dte_hi = target_dte - window, target_dte + window
     key = f"itm-weekly:{','.join(sorted(symbols))}:{dte_lo}:{dte_hi}:{top}"
     cached = cache_get(key)
@@ -1312,6 +1396,23 @@ _SPREAD_REWARD_CEIL = 2.0     # max_gain/max_loss at/above this scores 1 on rewa
 _SPREAD_COST_CEIL = 0.25      # combined spread% at/above this scores 0 on cost
 _SPREAD_MAX_WIDTH_STEPS = 6   # how many strikes above/below the long leg to pair
 
+# Minimum max_gain/max_loss for a pairing to be worth listing at all.
+#
+# This is a VALIDITY guard, not a risk preference -- the same category as the
+# net_debit >= width rejection below, which drops spreads that mathematically
+# cannot profit. A pairing can also be structurally pointless without being
+# impossible: measured against the live chain, the worst real example was IWM
+# 200/284 offering a $2 max gain on $8,398 of risk, and six pairings had a max
+# gain under a realistic round-trip commission on two legs (~$2.60), so they
+# could not clear costs even when everything went right.
+#
+# 0.05 keeps ~92% of generated pairings (measured, not guessed) while dropping
+# that tail. The Spread Score already penalizes weak reward through its 40%
+# reward term, but score-based demotion alone doesn't help here: the "Safer"
+# sort ranks on short-leg delta only, which floats exactly these
+# near-certain/near-worthless pairings to the top.
+_SPREAD_MIN_REWARD_RISK = 0.05
+
 
 def _spread_score(short_delta, reward_risk, cost_pct):
     """0-100 score for one vertical debit spread.
@@ -1369,6 +1470,8 @@ def get_debit_spreads(symbols=None, target_dte=7, window=_DEFAULT_DTE_WINDOW, to
         symbols = SNIPE_SCAN
     symbols = symbols[:MAX_API_SYMBOLS]
     top = max(top, 0)
+    target_dte = _clamp_int(target_dte, 0, MAX_TARGET_DTE)  # see get_itm_scan_weekly
+    window = _clamp_int(window, 0, MAX_DTE_WINDOW)
     dte_lo, dte_hi = target_dte - window, target_dte + window
     key = f"spreads:{','.join(sorted(symbols))}:{dte_lo}:{dte_hi}:{top}"
     cached = cache_get(key)
@@ -1428,6 +1531,13 @@ def get_debit_spreads(symbols=None, target_dte=7, window=_DEFAULT_DTE_WINDOW, to
                     max_loss = net_debit * 100
                     max_gain = (width - net_debit) * 100
                     reward_risk = max_gain / max_loss if max_loss else None
+                    if reward_risk is None or reward_risk < _SPREAD_MIN_REWARD_RISK:
+                        # Structurally not worth listing -- see
+                        # _SPREAD_MIN_REWARD_RISK. Same family as the
+                        # rejection above: that one drops pairings that
+                        # cannot profit, this one drops pairings whose best
+                        # case doesn't justify the capital or clear costs.
+                        continue
                     breakeven = (long_strike + net_debit if typ == "C"
                                  else long_strike - net_debit)
                     breakeven_cushion_pct = ((spot - breakeven) / spot if typ == "C"
@@ -1436,15 +1546,13 @@ def get_debit_spreads(symbols=None, target_dte=7, window=_DEFAULT_DTE_WINDOW, to
                                      (short_leg["ask"] - short_leg["bid"]))
                     cost_pct = combined_cost / net_debit if net_debit else None
 
-                    flags = _liquidity_flags(
+                    # Liquidity from the WEAKER leg (a spread is only as
+                    # fillable as its thinner side); IV from the long leg,
+                    # which is the one being paid for.
+                    flags, iv_rv_ratio = _build_risk_flags(
                         min(long_leg.get("volume") or 0, short_leg.get("volume") or 0),
-                        min(long_leg.get("oi") or 0, short_leg.get("oi") or 0))
-                    iv_flag, iv_rv_ratio = _iv_flag(long_leg.get("iv"), rvol)
-                    if iv_flag:
-                        flags.append(iv_flag)
-                    earnings_flag = _earnings_flag(earnings_date_iso, expiry)
-                    if earnings_flag:
-                        flags.append(earnings_flag)
+                        min(long_leg.get("oi") or 0, short_leg.get("oi") or 0),
+                        long_leg.get("iv"), rvol, earnings_date_iso, expiry)
 
                     raw_score = _spread_score(short_leg.get("delta"),
                                               reward_risk, cost_pct)
@@ -1483,13 +1591,394 @@ def get_debit_spreads(symbols=None, target_dte=7, window=_DEFAULT_DTE_WINDOW, to
         "note": (f"CBOE delayed ~15min. Vertical debit spreads, ~{target_dte}-DTE "
                  f"(window +/-{window} days), long leg ITM. Priced at the worst "
                  "realistic fill (buy the ask, sell the bid), so net debit is an "
-                 "upper bound and max gain a lower bound. Ranked by Spread Score "
-                 "(probability of max profit + reward per dollar risked + "
-                 "execution cost). Screening tool, not a trade recommendation. "
+                 "upper bound and max gain a lower bound. Pairings returning under "
+                 f"{_SPREAD_MIN_REWARD_RISK:.0%} of the capital at risk are excluded "
+                 "— their best case doesn't clear transaction costs. Ranked by "
+                 "Spread Score (probability of max profit + reward per dollar risked "
+                 "+ execution cost). Screening tool, not a trade recommendation. "
                  "No trades are placed automatically."),
         "spreads": all_spreads[:top],
     }
     cache_put(key, out, ttl=300)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Gamma concentration by strike.
+#
+# WHAT THIS IS NOT: a dealer-positioning model. The common "GEX" treatment
+# signs call gamma positive and put gamma negative on the assumption that
+# dealers are long calls and short puts, then concludes where they'll be
+# forced to hedge. That assumption is not in this data -- open interest says
+# how many contracts exist at a strike, never who holds which side. Publishing
+# an inferred dealer position as fact would be the most overconfident thing in
+# this app.
+#
+# So this reports the measurable thing only: how much gamma sits at each
+# strike, calls and puts kept separate rather than netted. A strike with a
+# large concentration is where the most option-price convexity is anchored,
+# which is a real and useful observation; whether anyone is hedging it, and in
+# which direction, is left to the reader rather than asserted.
+# ---------------------------------------------------------------------------
+GAMMA_TOP_STRIKES = 12
+
+
+def get_gamma_exposure(symbol, target_dte=30, window=None, top=GAMMA_TOP_STRIKES):
+    """Gamma concentration per strike for one underlying.
+
+    Uses the FULL chain including untraded strikes -- open interest is the
+    quantity being measured, and untraded rows hold a sixth of it (see
+    _parse_chain's require_volume note).
+
+    Per strike, per side, the reported figure is:
+
+        gamma * open_interest * 100 * spot^2 * 0.01
+
+    i.e. the dollar change in aggregate delta for a 1% move in the
+    underlying. gamma is per-share, a contract covers 100 shares, and
+    spot^2 * 0.01 converts "delta per $1" into "dollars per 1%" -- so the
+    number is directly comparable across underlyings at different prices.
+
+    Args:
+        symbol (str): underlying to analyze.
+        target_dte (int): include expiries out to this many days. Gamma is
+            concentrated in near-dated contracts, and far-dated OI mostly
+            adds noise, so this defaults to a month rather than the whole
+            chain.
+        window (int): unused placeholder kept out of the signature's way --
+            the DTE filter here is one-sided (0..target_dte), unlike the
+            boards' centered window.
+        top (int): how many strikes to return, ranked by total concentration.
+
+    Returns:
+        dict: {symbol, spot, as_of, delayed, note, strikes: [...],
+               peak_strike, total_call, total_put}.
+    """
+    target_dte = _clamp_int(target_dte, 0, MAX_TARGET_DTE)
+    top = max(top, 0)
+    key = f"gamma:{symbol}:{target_dte}:{top}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    quotes = get_quotes([symbol])
+    spot = (quotes.get(symbol) or {}).get("price")
+    res = _fetch_chain(symbol, require_volume=False)
+    contracts = res.get("contracts") or []
+
+    by_strike = {}
+    for c in contracts:
+        dte = c.get("dte")
+        if dte is None or dte < 0 or dte > target_dte:
+            continue
+        gamma, oi = c.get("gamma"), c.get("oi")
+        if not gamma or not oi:
+            continue
+        # dollars of delta per 1% move -- see the docstring
+        exposure = abs(gamma) * oi * 100 * (spot ** 2) * 0.01 if spot else 0.0
+        row = by_strike.setdefault(c["strike"], {
+            "strike": c["strike"], "call": 0.0, "put": 0.0,
+            "call_oi": 0, "put_oi": 0,
+        })
+        if c.get("type") == "C":
+            row["call"] += exposure
+            row["call_oi"] += oi
+        else:
+            row["put"] += exposure
+            row["put_oi"] += oi
+
+    rows = []
+    for row in by_strike.values():
+        row["total"] = row["call"] + row["put"]
+        # Kept separate rather than netted: netting encodes an assumption
+        # about who is long which side, which this data cannot support.
+        rows.append({k: (round(v, 2) if isinstance(v, float) else v)
+                     for k, v in row.items()})
+    rows.sort(key=lambda r: r["total"], reverse=True)
+    peak = rows[0]["strike"] if rows else None
+
+    out = {
+        "symbol": symbol,
+        "spot": spot,
+        "as_of": res.get("ts"),
+        "delayed": True,
+        "target_dte": target_dte,
+        "peak_strike": peak,
+        "total_call": round(sum(r["call"] for r in rows), 2),
+        "total_put": round(sum(r["put"] for r in rows), 2),
+        "strikes": sorted(rows[:top], key=lambda r: r["strike"]),
+        "note": ("CBOE delayed ~15min. Gamma concentration = gamma x open interest, "
+                 "expressed as dollars of delta per 1% move, for expiries within "
+                 f"{target_dte} days. Calls and puts are reported SEPARATELY, not "
+                 "netted: open interest says how many contracts exist at a strike, "
+                 "never who holds which side, so any dealer-positioning reading is "
+                 "an assumption this data cannot support. A high-concentration "
+                 "strike is where option convexity is anchored -- not a prediction "
+                 "that price will pin there. Screening tool, not a trade "
+                 "recommendation."),
+    }
+    cache_put(key, out, ttl=300)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Modeled historical simulation of the weekly ITM strategy.
+#
+# READ THIS BEFORE TRUSTING ANY NUMBER IT RETURNS. This is NOT a backtest.
+# There is no historical intraday options data on this free feed -- that is
+# precisely why the Snipe Log records forward, one trade at a time, instead.
+# What follows prices hypothetical contracts with Black-Scholes from daily
+# underlying bars, so every result inherits the model's assumptions rather
+# than reporting what could actually have been filled.
+#
+# Three specific ways it flatters the strategy, all of them structural:
+#
+#   1. Volatility. Entry is priced off REALIZED vol from trailing bars,
+#      because implied vol history doesn't exist here. Implied normally
+#      trades above realized (that gap IS the variance risk premium), so
+#      modeled entries are systematically CHEAPER than real ones, which
+#      inflates returns. get_modeled_backtest reports a vol-premium
+#      sensitivity row precisely so this isn't buried in prose.
+#   2. Spread. A modeled price has no bid/ask. Live weekly ITM spreads on
+#      these names measured 2.7% median / 3.6% mean of premium, so entry
+#      gets a haircut -- without one the results are materially better than
+#      anything fillable.
+#   3. Model shape. Black-Scholes assumes constant vol, no skew, and
+#      European exercise. Real ITM equity options are American and skewed.
+#
+# It is included because a forward log accumulates one trade per day and
+# calibrating a scoring formula needs a sample far larger than that. Treat
+# the output as "does this strategy shape have any edge at all", never as a
+# performance claim.
+# ---------------------------------------------------------------------------
+_BS_RATE = 0.04             # flat risk-free rate; the app has no yield-curve feed
+_MODELED_SPREAD_PCT = 0.03  # measured live median 2.7% / mean 3.6% of premium
+_VOL_PREMIUM_SENSITIVITY = (1.0, 1.1, 1.25)
+
+# Implied-vol proxies. Pricing entries off realized vol was the single
+# largest source of optimism in this simulation (implied normally trades
+# above realized, so modeled entries came out too cheap); these indices are
+# actual traded implied vol, which removes the guess rather than scaling it.
+#
+# Only symbols with a REAL proxy appear here. ^RVX (the Russell 2000 vol
+# index, the natural match for IWM) 404s on this feed, and ^VXD carries one
+# usable bar -- so IWM has no proxy and falls back to realized rather than
+# borrowing SPY's volatility, which would be a different underlying's risk
+# dressed up as IWM's.
+#
+# Two approximations remain, and they're documented rather than hidden:
+# these track the INDEX (SPX/NDX), not the ETF, and they quote 30-day
+# implied vol while the simulated contracts are ~7-day, so term structure
+# is ignored.
+_IV_PROXY = {"SPY": "^VIX", "QQQ": "^VXN"}
+
+
+def _norm_cdf(x):
+    """Standard normal CDF via math.erf -- keeps this stdlib-only."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def black_scholes_price(spot, strike, years, sigma, rate=_BS_RATE, is_call=True):
+    """Black-Scholes price for a European option. Returns intrinsic value at
+    (or past) expiry, or when volatility is degenerate, rather than dividing
+    by zero."""
+    intrinsic = max(0.0, spot - strike) if is_call else max(0.0, strike - spot)
+    if years <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
+        return intrinsic
+    sqrt_t = math.sqrt(years)
+    d1 = (math.log(spot / strike) + (rate + 0.5 * sigma ** 2) * years) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+    discount = math.exp(-rate * years)
+    if is_call:
+        return spot * _norm_cdf(d1) - strike * discount * _norm_cdf(d2)
+    return strike * discount * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+
+
+def _realized_vol_from(closes):
+    """Annualized realized vol from a list of closes, or None if too short.
+    Separate from realized_vol() (which fetches) so the simulation can
+    compute it over a trailing slice with no lookahead."""
+    rets = [math.log(closes[i] / closes[i - 1])
+            for i in range(1, len(closes))
+            if closes[i - 1] > 0 and closes[i] > 0]
+    if len(rets) < 2:
+        return None
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    return math.sqrt(var) * math.sqrt(252)
+
+
+def implied_vol_series(symbol, rng):
+    """{date: sigma} from `symbol`'s implied-vol proxy index, or None when no
+    proxy exists for it.
+
+    The index quotes annualized implied vol in percent (VIX 15.4 -> 0.154).
+    Returning None rather than an empty dict lets callers distinguish "this
+    symbol has no proxy" from "the proxy fetch came back empty", which
+    matter differently: the first is permanent, the second is retryable.
+    """
+    proxy = _IV_PROXY.get(symbol.upper())
+    if not proxy:
+        return None
+    hist = get_history(proxy, rng)
+    ts, closes = hist.get("t") or [], hist.get("c") or []
+    return {_et_date_from_ts(t): c / 100.0 for t, c in zip(ts, closes) if c}
+
+
+def _simulate_weekly_itm(bars, hold_days, moneyness, vol_lookback,
+                         vol_premium, spread_pct, is_call=True, iv_by_date=None):
+    """One pass of the simulation. `bars` is [(date, close), ...] ascending.
+
+    Buys a hypothetical ITM option `moneyness` in the money, holds to
+    expiry, settles at intrinsic.
+
+    Volatility comes from `iv_by_date` (real traded implied vol) when a
+    date is available there, otherwise from realized vol over the trailing
+    window. Either way it uses only data at or before the entry bar, so
+    there is no lookahead.
+    """
+    trades = []
+    for i in range(vol_lookback, len(bars) - hold_days):
+        entry_date, spot = bars[i]
+        exit_date, exit_spot = bars[i + hold_days]
+        sigma = (iv_by_date or {}).get(entry_date)
+        if not sigma:
+            sigma = _realized_vol_from([c for _d, c in bars[i - vol_lookback:i + 1]])
+        if not sigma:
+            continue
+        sigma *= vol_premium
+        # Strike placed `moneyness` in the money, rounded to a plausible
+        # $1 grid so strikes look like ones that would really list.
+        strike = round(spot * (1 - moneyness)) if is_call else round(spot * (1 + moneyness))
+        years = hold_days / 365.0
+        theo = black_scholes_price(spot, strike, years, sigma, is_call=is_call)
+        if theo <= 0:
+            continue
+        entry = theo * (1 + spread_pct / 2)  # pay the modeled ask, not the mid
+        payoff = (max(0.0, exit_spot - strike) if is_call
+                  else max(0.0, strike - exit_spot))
+        pnl = (payoff - entry) * 100
+        trades.append({
+            "entry_date": entry_date, "exit_date": exit_date,
+            "spot": round(spot, 2), "strike": strike, "exit_spot": round(exit_spot, 2),
+            "sigma": round(sigma, 4), "entry": round(entry, 4),
+            "payoff": round(payoff, 4),
+            "pnl_dollars": round(pnl, 2),
+            "pnl_pct": round(pnl / (entry * 100), 4),
+        })
+    return trades
+
+
+def _summarize_trades(trades):
+    n = len(trades)
+    if not n:
+        return {"trades": 0, "wins": 0, "win_rate": None,
+                "total_pnl_dollars": 0.0, "avg_pnl_pct": 0.0,
+                "best_pnl_pct": None, "worst_pnl_pct": None}
+    wins = sum(1 for t in trades if t["pnl_dollars"] > 0)
+    return {
+        "trades": n,
+        "wins": wins,
+        "win_rate": round(wins / n, 4),
+        "total_pnl_dollars": round(sum(t["pnl_dollars"] for t in trades), 2),
+        "avg_pnl_pct": round(sum(t["pnl_pct"] for t in trades) / n, 4),
+        "best_pnl_pct": max(t["pnl_pct"] for t in trades),
+        "worst_pnl_pct": min(t["pnl_pct"] for t in trades),
+    }
+
+
+def get_modeled_backtest(symbol, rng="2y", hold_days=7, moneyness=0.01,
+                         vol_lookback=30, spread_pct=_MODELED_SPREAD_PCT,
+                         option_type="C", vol_source="implied"):
+    """Model the weekly ITM strategy over historical daily bars.
+
+    See the module comment above this function for why the result is a
+    model rather than a backtest, and the three structural ways it flatters
+    the strategy.
+
+    Returns a headline result plus a `sensitivity` block pricing the same
+    trades at higher volatility assumptions. That block is the point: the
+    single biggest unknown is how far implied would have sat above the
+    realized vol used for entry, and showing the result collapse (or not)
+    as that gap widens is more honest than one number with a disclaimer.
+    """
+    is_call = option_type.upper() == "C"
+    hold_days = _clamp_int(hold_days, 1, MAX_TARGET_DTE)
+    vol_lookback = _clamp_int(vol_lookback, 5, 250)
+    key = (f"mbt:{symbol}:{rng}:{hold_days}:{moneyness}:{vol_lookback}:"
+           f"{spread_pct}:{option_type}:{vol_source}")
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    hist = get_history(symbol, rng)
+    ts, closes = hist.get("t") or [], hist.get("c") or []
+    bars = [(_et_date_from_ts(t), c) for t, c in zip(ts, closes)]
+
+    iv_by_date = implied_vol_series(symbol, rng) if vol_source == "implied" else None
+    proxy = _IV_PROXY.get(symbol.upper())
+    if vol_source == "implied" and iv_by_date:
+        vol_source_used = f"implied ({proxy})"
+    elif vol_source == "implied":
+        # Asked for implied, none exists for this symbol. Say so rather than
+        # silently reporting realized-vol results under an "implied" label.
+        vol_source_used = f"realized (no implied-vol proxy for {symbol})"
+    else:
+        vol_source_used = f"realized ({vol_lookback}d trailing)"
+
+    def _run(premium, spread):
+        return _simulate_weekly_itm(bars, hold_days, moneyness, vol_lookback,
+                                    premium, spread, is_call, iv_by_date)
+
+    headline = _run(1.0, spread_pct)
+    sensitivity = []
+    for premium in _VOL_PREMIUM_SENSITIVITY:
+        s = _summarize_trades(_run(premium, spread_pct))
+        s["vol_premium"] = premium
+        sensitivity.append(s)
+    # Same trades with no spread haircut, to size how much execution costs
+    # actually matter rather than asserting that they do.
+    no_spread = _summarize_trades(_run(1.0, 0.0))
+    # And the same trades priced off realized vol, so the difference the
+    # implied-vol input makes is a visible number rather than a claim.
+    realized_only = _summarize_trades(_simulate_weekly_itm(
+        bars, hold_days, moneyness, vol_lookback, 1.0, spread_pct, is_call, None))
+
+    out = {
+        "symbol": symbol,
+        "range": rng,
+        "hold_days": hold_days,
+        "moneyness": moneyness,
+        "option_type": "C" if is_call else "P",
+        "spread_pct": spread_pct,
+        "bars": len(bars),
+        "vol_source": vol_source_used,
+        "summary": _summarize_trades(headline),
+        "sensitivity": sensitivity,
+        "no_spread_summary": no_spread,
+        "realized_vol_summary": realized_only,
+        "trades": headline[-20:],  # a tail sample, not the whole series
+        "modeled": True,
+        "note": ("MODELED, NOT A BACKTEST. No historical options prices exist on "
+                 "this feed, so entries are priced with Black-Scholes from daily "
+                 f"underlying bars. Entry volatility: {vol_source_used}. "
+                 + ("A traded implied-vol index removes the largest guess here, but "
+                    "it tracks the INDEX rather than the ETF and quotes 30-day vol "
+                    "against ~7-day contracts, so term structure is ignored. "
+                    if iv_by_date else
+                    "Realized vol is NOT what an option would really have cost -- "
+                    "implied normally trades above it, so these returns are "
+                    "optimistic. ")
+                 + "`sensitivity` reprices the same trades at higher volatility, "
+                 f"`no_spread_summary` drops the {spread_pct:.0%} execution "
+                 "haircut, and `realized_vol_summary` prices them off realized "
+                 "vol for comparison. Black-Scholes also assumes constant vol, no "
+                 "skew and European exercise; real ITM equity options are American "
+                 "and skewed. Held to expiry, settled at intrinsic. Use this to ask "
+                 "whether the strategy shape has any edge at all, never as a "
+                 "performance claim."),
+    }
+    cache_put(key, out, ttl=900)
     return out
 
 
@@ -1542,35 +2031,73 @@ def _save_snipe_log(entries):
         os.replace(tmp_path, SNIPE_LOG_PATH)
 
 
-def snapshot_snipe_pick(late=False):
-    """Log today's top-scored Snipe candidate (contracts[0] of a fresh
-    get_itm_scan() over all of SNIPE_SCAN) as a new open paper-trade entry.
+# The boards that keep a forward paper-trading record, and how to scan each.
+# Adding a board here is all it takes for the scheduler, the resolver and the
+# API to cover it -- the settlement rule below is horizon-independent.
+SNIPE_LOG_BOARDS = {
+    "0dte": {"scan": lambda: get_itm_scan(), "score_key": "score"},
+    "weekly": {"scan": lambda: get_itm_scan_weekly(), "score_key": "weekly_score"},
+}
+DEFAULT_SNIPE_BOARD = "0dte"
 
-    Idempotent per calendar day: if today's date already has a logged entry,
-    that existing entry is returned unchanged rather than duplicated (this
-    makes the startup catch-up call and the scheduler's own daily call, or
-    two clicks of the manual "snapshot now" button, all safe to run more
-    than once on the same day). If the scan currently has zero candidates
-    (e.g. no live two-sided market yet), nothing is logged and None is
-    returned -- there's nothing honest to record.
+
+def _entry_board(entry):
+    """The board an entry belongs to, defaulting to 0DTE.
+
+    Entries written before the weekly board existed have no `board` field;
+    they were all 0DTE picks, so that's the correct reading of a missing
+    value rather than a reason to migrate the file.
+    """
+    return entry.get("board") or DEFAULT_SNIPE_BOARD
+
+
+def _entry_settle_date(entry):
+    """The date an entry can first be settled against: the contract's expiry.
+
+    This is what makes one resolver serve both boards. A 0DTE pick expires
+    the same day it's logged, so its expiry EQUALS its date and the rule is
+    identical to the original "settle the day after it was logged". A weekly
+    pick expires 5-10 days later, and the same rule waits for that date
+    instead -- no per-board branching needed.
+
+    Falls back to the entry date if `expiry` is somehow absent, which keeps
+    a malformed or hand-edited entry resolvable rather than stuck open.
+    """
+    return entry.get("expiry") or entry.get("date")
+
+
+def snapshot_snipe_pick(late=False, board=DEFAULT_SNIPE_BOARD):
+    """Log a board's top-scored candidate as a new open paper-trade entry.
+
+    Idempotent per calendar day PER BOARD: if this board already has an
+    entry dated today, that entry is returned unchanged rather than
+    duplicated (so the startup catch-up, the scheduler's own daily call, and
+    repeated clicks of the manual "snapshot now" button are all safe). If the
+    scan currently has zero candidates (e.g. no live two-sided market yet),
+    nothing is logged and None is returned -- there's nothing honest to
+    record.
 
     Args:
-        late (bool): True when this snapshot is a startup catch-up (server
-            wasn't running at the scheduled 15:30 ET time) rather than the
-            regular on-schedule snapshot. Stored on the entry for visibility;
-            doesn't change the logging logic itself.
+        late (bool): True when this is a startup catch-up (the server wasn't
+            running at the scheduled 15:30 ET time) rather than the regular
+            on-schedule snapshot. Stored for visibility; doesn't change the
+            logging logic.
+        board (str): which board to snapshot -- see SNIPE_LOG_BOARDS.
 
     Returns:
         dict or None: the (new or pre-existing) log entry, or None if there
         was nothing to log.
     """
-    scan = get_itm_scan()
+    cfg = SNIPE_LOG_BOARDS.get(board)
+    if cfg is None:
+        return None
+    scan = cfg["scan"]()
     contracts = scan.get("contracts") or []
-    today = dt.date.today().isoformat()
+    today = _today_et().isoformat()  # ET: this is the entry's TRADING day
 
     entries = _load_snipe_log()
     for existing in entries:
-        if existing.get("date") == today:
+        if existing.get("date") == today and _entry_board(existing) == board:
             return existing
 
     if not contracts:
@@ -1579,17 +2106,22 @@ def snapshot_snipe_pick(late=False):
     c = contracts[0]
     logged_at = _now_et().isoformat(timespec="seconds")
     entry = {
-        "id": f"{today}-{c.get('underlying')}",
+        # board is part of the id so the two boards' same-day picks on the
+        # same underlying stay distinguishable
+        "id": f"{today}-{board}-{c.get('underlying')}",
+        "board": board,
         "date": today,
         "logged_at": logged_at,
         "underlying": c.get("underlying"),
         "type": c.get("type"),
         "strike": c.get("strike"),
         "expiry": c.get("expiry"),
+        "dte": c.get("dte"),
         "entry_ask": c.get("ask"),
         "entry_delta": c.get("delta"),
         "entry_spread_pct": c.get("spread_pct"),
-        "entry_score": c.get("score"),
+        "entry_score": c.get(cfg["score_key"]),
+        "entry_flags": [f.get("code") for f in (c.get("flags") or [])],
         "contract_cost": c.get("contract_cost"),
         "breakeven": c.get("breakeven"),
         "late_snapshot": bool(late),
@@ -1624,27 +2156,30 @@ def _closing_price_on(symbol, date_str):
 
 
 def resolve_snipe_log():
-    """Settle every open Snipe Log entry whose date is a strictly-past
-    trading day against that day's real closing price.
+    """Settle every open Snipe Log entry whose contract has expired, against
+    the underlying's real closing price on that expiry date.
 
-    A same-day entry is deliberately left open -- "sold at the close" hasn't
-    happened yet on the same day the pick was logged, so it only resolves
-    the next time this is called on a LATER date. If the close price for an
-    entry's date can't be found yet, that entry is left open and skipped
-    rather than resolved with bad data.
+    Settling on EXPIRY (not on the day the pick was logged) is what lets one
+    resolver serve every board: a 0DTE pick expires the same day it's logged,
+    so this is identical to the original "settle it the next day" rule, while
+    a weekly pick simply waits the 5-10 days until its own expiry. An entry
+    whose expiry is today or later stays open -- the contract hasn't settled
+    yet. If the close price for that date can't be found, the entry is left
+    open and retried later rather than resolved with bad data.
 
     Returns:
         list: the full (possibly updated) log, unsorted.
     """
     entries = _load_snipe_log()
-    today = dt.date.today().isoformat()
+    today = _today_et().isoformat()  # ET: "has this contract's expiry passed?"
     changed = False
     for e in entries:
         if e.get("status") != "open":
             continue
-        if e.get("date") >= today:
-            continue  # today (or, shouldn't happen, a future date) -- not settled yet
-        close = _closing_price_on(e.get("underlying"), e.get("date"))
+        settle_date = _entry_settle_date(e)
+        if not settle_date or settle_date >= today:
+            continue  # not expired yet (or a future date) -- not settled
+        close = _closing_price_on(e.get("underlying"), settle_date)
         if close is None:
             continue  # can't resolve yet (feed hiccup / stale cache) -- try again later
         strike = e.get("strike")
@@ -1668,17 +2203,44 @@ def resolve_snipe_log():
     return entries
 
 
-def get_snipe_log():
-    """Return the Snipe Log, freshly resolved, most-recent-first, plus a
-    summary computed only over closed (settled) trades.
+def get_snipe_log(board=DEFAULT_SNIPE_BOARD):
+    """Return one board's Snipe Log, freshly resolved, most-recent-first,
+    plus a summary computed only over that board's closed (settled) trades.
+
+    Scoped per board deliberately: the whole point of the log is to say
+    whether a given board's scoring picks winners, and pooling two boards'
+    records would produce a number that describes neither. Resolution still
+    runs across every entry regardless of the board asked for -- settling is
+    independent of who's reading.
+
+    Args:
+        board (str): which board's record to return. Pass None for all
+            boards pooled (the entries, at least; the summary then spans
+            them and should be read with that in mind).
 
     Returns:
-        dict: {entries: [...], summary: {trades, wins, win_rate,
+        dict: {board, entries: [...], summary: {trades, wins, win_rate,
             total_pnl_dollars, avg_pnl_dollars, avg_pnl_pct}}. summary
             fields are all 0/None-ish when there are zero closed trades yet.
     """
-    entries = resolve_snipe_log()
+    all_entries = resolve_snipe_log()
+    entries = ([e for e in all_entries if _entry_board(e) == board]
+               if board else all_entries)
     ordered = sorted(entries, key=lambda e: e.get("date", ""), reverse=True)
+    # Annotate open entries with when they'll settle. A weekly pick sits open
+    # for 5-10 days, which without this reads as a stalled or broken log
+    # rather than one that is simply waiting -- the 0DTE board settles
+    # overnight and set that expectation.
+    today = _today_et()
+    for e in ordered:
+        if e.get("status") != "open":
+            continue
+        settle_date = _entry_settle_date(e)
+        e["settles_on"] = settle_date
+        try:
+            e["days_to_settle"] = (dt.date.fromisoformat(settle_date) - today).days
+        except (ValueError, TypeError):
+            e["days_to_settle"] = None
     closed = [e for e in entries if e.get("status") == "closed"]
     n = len(closed)
     if n == 0:
@@ -1698,7 +2260,7 @@ def get_snipe_log():
             "avg_pnl_dollars": round(total_pnl / n, 2),
             "avg_pnl_pct": round(avg_pct, 4),
         }
-    return {"entries": ordered, "summary": summary}
+    return {"board": board, "entries": ordered, "summary": summary}
 
 
 def _next_snipe_snapshot_time(now=None):
@@ -1730,21 +2292,27 @@ def _snipe_scheduler_loop():
     (network hiccup, CBOE outage, etc.) is logged to stderr and the loop
     keeps running rather than the whole background thread dying silently.
     """
+    def _snapshot_all(late=False):
+        """Snapshot every board, isolating failures per board: a CBOE hiccup
+        on one must not cost the other its record for the day."""
+        for board in SNIPE_LOG_BOARDS:
+            try:
+                snapshot_snipe_pick(late=late, board=board)
+            except Exception as e:  # noqa: BLE001
+                print(f"[snipe scheduler] {board} snapshot failed: {e}", file=sys.stderr)
+
     now = _now_et()
     if now.weekday() < 5 and now.time() >= dt.time(15, 30):
-        try:
-            snapshot_snipe_pick(late=True)
-        except Exception as e:  # noqa: BLE001 -- one bad catch-up must not kill the thread
-            print(f"[snipe scheduler] catch-up snapshot failed: {e}", file=sys.stderr)
+        _snapshot_all(late=True)
     while True:
         try:
             target = _next_snipe_snapshot_time()
             sleep_s = (target - _now_et()).total_seconds()
             if sleep_s > 0:
                 time.sleep(sleep_s)
-            snapshot_snipe_pick()
+            _snapshot_all()
         except Exception as e:  # noqa: BLE001 -- keep the daemon loop alive across bad runs
-            print(f"[snipe scheduler] snapshot failed: {e}", file=sys.stderr)
+            print(f"[snipe scheduler] scheduling failed: {e}", file=sys.stderr)
             time.sleep(60)  # avoid a tight crash loop if something's persistently broken
 
 
@@ -1870,8 +2438,32 @@ class Handler(BaseHTTPRequestHandler):
         window = int(self._qparam(query, "window", str(_DEFAULT_DTE_WINDOW)))
         return get_debit_spreads(syms, target_dte, window, top)
 
+    def _api_options_gamma(self, query):
+        sym = self._qparam(query, "symbol")
+        if not sym:
+            return {"_error": "no symbol"}
+        target_dte = int(self._qparam(query, "target_dte", "30"))
+        top = int(self._qparam(query, "top", str(GAMMA_TOP_STRIKES)))
+        return get_gamma_exposure(sym, target_dte=target_dte, top=top)
+
+    def _api_options_modeled_backtest(self, query):
+        sym = self._qparam(query, "symbol")
+        if not sym:
+            return {"_error": "no symbol"}
+        return get_modeled_backtest(
+            sym,
+            rng=self._qparam(query, "range", "2y"),
+            hold_days=int(self._qparam(query, "hold_days", "7")),
+            moneyness=float(self._qparam(query, "moneyness", "0.01")),
+            option_type=self._qparam(query, "type", "C"),
+            vol_source=self._qparam(query, "vol_source", "implied"),
+        )
+
     def _api_snipe_log(self, query):
-        return get_snipe_log()
+        board = self._qparam(query, "board", DEFAULT_SNIPE_BOARD)
+        if board not in SNIPE_LOG_BOARDS:
+            return {"_error": f"unknown board {board!r}"}
+        return get_snipe_log(board)
 
     # path -> (self, query) -> response-dict. Keeps do_GET itself pure routing:
     # "which endpoint is this" is separated from "how is its response computed",
@@ -1886,6 +2478,8 @@ class Handler(BaseHTTPRequestHandler):
         "/api/options/itm-scan": _api_options_itm_scan,
         "/api/options/itm-scan-weekly": _api_options_itm_scan_weekly,
         "/api/options/debit-spreads": _api_options_debit_spreads,
+        "/api/options/gamma": _api_options_gamma,
+        "/api/options/modeled-backtest": _api_options_modeled_backtest,
         "/api/snipe-log": _api_snipe_log,
     }
 
@@ -1920,9 +2514,14 @@ class Handler(BaseHTTPRequestHandler):
         if length:
             self.rfile.read(length)  # drain any body so HTTP/1.1 keep-alive stays in sync
         parsed_url = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed_url.query)
         try:
             if parsed_url.path == "/api/snipe-log/snapshot":
-                entry = snapshot_snipe_pick()
+                board = self._qparam(query, "board", DEFAULT_SNIPE_BOARD)
+                if board not in SNIPE_LOG_BOARDS:
+                    self._send_json({"_error": f"unknown board {board!r}"}, status=400)
+                    return
+                entry = snapshot_snipe_pick(board=board)
                 if entry is None:
                     self._send_json({"_error": "No live two-sided market to snapshot right now"})
                 else:

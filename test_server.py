@@ -7,6 +7,7 @@ Run:  python test_server.py
 """
 
 import contextlib
+import datetime as dt
 import io
 import json
 import math
@@ -258,6 +259,8 @@ class ApiRoutesTests(unittest.TestCase):
             "/api/options/itm-scan": server.Handler._api_options_itm_scan,
             "/api/options/itm-scan-weekly": server.Handler._api_options_itm_scan_weekly,
             "/api/options/debit-spreads": server.Handler._api_options_debit_spreads,
+            "/api/options/gamma": server.Handler._api_options_gamma,
+            "/api/options/modeled-backtest": server.Handler._api_options_modeled_backtest,
             "/api/snipe-log": server.Handler._api_snipe_log,
         }
         self.assertEqual(server.Handler._API_ROUTES, expected)
@@ -1457,6 +1460,666 @@ class ItmScanEndpointHorizonRoutingTests(NetworkFreeTestCase):
         self.assertIn("weekly", calls)
 
 
+class ScanInputBoundsTests(NetworkFreeTestCase):
+    """The DTE window feeds earnings_map(), which issues one outbound
+    request per day of horizon. Unbounded, ?target_dte=100000 would attempt
+    ~100k requests to Nasdaq through a thread pool -- the same class of
+    amplification MAX_API_SYMBOLS already guards on the symbols axis.
+
+    These assert the cap holds at every layer: the function that actually
+    turns a number into requests, the two scan entry points, and the HTTP
+    handler that takes the value straight from a query param.
+    """
+    def setUp(self):
+        super().setUp()
+        self.days = []
+        self.patch_server("earnings_map", _REAL_EARNINGS_MAP)
+        self.patch_server("_nasdaq_earnings_for_date",
+                          lambda d: (self.days.append(d) or {}))
+        self.patch_server("get_quotes", lambda syms: {})
+        self.patch_server("_fetch_chain",
+                          lambda s: {"contracts": [], "call_vol": 0.0,
+                                     "put_vol": 0.0, "ts": None})
+
+    def _cap(self):
+        return server.MAX_EARNINGS_LOOKAHEAD_DAYS + 1  # inclusive of day 0
+
+    def test_earnings_map_clamps_absurd_horizons(self):
+        server.earnings_map(10 ** 6)
+        self.assertLessEqual(len(self.days), self._cap())
+
+    def test_earnings_map_is_exact_for_small_horizons(self):
+        server.earnings_map(7)
+        self.assertEqual(len(self.days), 8, "today + the next 7 days")
+
+    def test_earnings_map_negative_horizon_fetches_nothing(self):
+        server.earnings_map(-1)
+        self.assertEqual(self.days, [])
+
+    def test_weekly_scan_clamps_target_dte(self):
+        server.get_itm_scan_weekly(["SPY"], target_dte=100000, window=3)
+        self.assertLessEqual(len(self.days), self._cap())
+
+    def test_spreads_scan_clamps_window(self):
+        server.get_debit_spreads(["SPY"], target_dte=7, window=999999)
+        self.assertLessEqual(len(self.days), self._cap())
+
+    def test_http_handler_clamps_target_dte(self):
+        """The real attack path: the value arrives as an unvalidated query
+        param and is int()-parsed straight into the scan."""
+        server.Handler._api_options_itm_scan(server.Handler, {"target_dte": ["100000"]})
+        self.assertLessEqual(len(self.days), self._cap())
+
+    def test_negative_target_dte_does_not_invert_the_window(self):
+        server.get_itm_scan_weekly(["SPY"], target_dte=-500, window=3)
+        self.assertLessEqual(len(self.days), self._cap())
+
+    def test_clamp_int_helper(self):
+        self.assertEqual(server._clamp_int(5, 0, 10), 5)
+        self.assertEqual(server._clamp_int(-5, 0, 10), 0)
+        self.assertEqual(server._clamp_int(50, 0, 10), 10)
+
+
+class EasternDateTests(NetworkFreeTestCase):
+    """Anything deciding WHICH TRADING DAY something belongs to must use ET,
+    not the machine's local date. The two disagree for a window every night
+    as wide as the host's offset from Eastern, so on a non-ET host a
+    contract's DTE or a logged pick's date could land on the wrong trading
+    day -- producing a subtly wrong track record rather than an error.
+
+    Each test pins _now_et() to a FIXED PAST date rather than to "just after
+    midnight tonight". Anchoring to a real-world-relative moment would make
+    these pass or fail depending on the day they run: dt.date.today() only
+    differs from a pinned ET date when the machine's local date happens to
+    differ, so on the wrong day a reverted fix would sail through. A date in
+    2020 can never equal dt.date.today(), so a regression back to local time
+    fails here every time.
+    """
+    ET_NOW = dt.datetime(2020, 1, 2, 0, 30, tzinfo=dt.timezone(dt.timedelta(hours=-5)))
+    ET_DATE = "2020-01-02"
+
+    def _freeze_et(self):
+        self.patch_server("_now_et", lambda: self.ET_NOW)
+
+    def test_today_et_follows_eastern_not_local(self):
+        self._freeze_et()
+        self.assertEqual(server._today_et().isoformat(), self.ET_DATE)
+
+    def test_parse_chain_dte_is_measured_from_the_eastern_date(self):
+        self._freeze_et()
+        raw = _wrap_chain_json([{
+            "option": "SPY200117C00495000", "volume": 10, "open_interest": 5,
+            "bid": 1.0, "ask": 1.1,
+        }])
+        contract = server._parse_chain("SPY", raw)[0][0]
+        expected = (dt.date(2020, 1, 17) - dt.date(2020, 1, 2)).days
+        self.assertEqual(contract["dte"], expected)
+
+    def test_snapshot_dates_the_entry_by_the_eastern_day(self):
+        self._freeze_et()
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        self.patch_server("SNIPE_LOG_PATH", os.path.join(tmpdir, "log.json"))
+        self.patch_server("get_itm_scan", lambda *a, **k: {"contracts": [{
+            "underlying": "SPY", "type": "C", "strike": 495.0,
+            "expiry": "2020-01-02", "ask": 5.0, "delta": 0.9,
+            "spread_pct": 0.02, "score": 80.0, "contract_cost": 500.0,
+            "breakeven": 500.0,
+        }]})
+        entry = server.snapshot_snipe_pick()
+        self.assertEqual(entry["date"], self.ET_DATE)
+
+    def test_resolution_uses_the_eastern_day_to_decide_what_is_past(self):
+        """An entry dated the CURRENT ET day must stay open. Pinning ET to
+        just after midnight makes this fail loudly if local date is used,
+        since local is still the previous day."""
+        self._freeze_et()
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        path = os.path.join(tmpdir, "log.json")
+        self.patch_server("SNIPE_LOG_PATH", path)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([{"date": self.ET_DATE, "status": "open", "underlying": "SPY",
+                        "type": "C", "strike": 495.0, "entry_ask": 5.0,
+                        "contract_cost": 500.0}], f)
+        self.patch_server("_closing_price_on", lambda sym, d: 500.0)
+        entries = server.resolve_snipe_log()
+        self.assertEqual(entries[0]["status"], "open",
+                         "an entry from the current ET day is not settled yet")
+
+
+class BuildRiskFlagsTests(unittest.TestCase):
+    """_build_risk_flags() is the single place all three flags are assembled;
+    both the single-leg scan core and the spreads board go through it, so a
+    new flag type is one edit rather than one per board."""
+
+    def test_combines_all_three_flag_types(self):
+        flags, ratio = server._build_risk_flags(
+            volume=1, oi=2, iv=40.0, rvol=10.0,
+            earnings_date_iso="2026-08-17", expiry_iso="2026-08-21")
+        self.assertEqual({f["code"] for f in flags},
+                         {"THIN_VOL", "THIN_OI", "IV_RICH", "EARNINGS"})
+        self.assertEqual(ratio, 4.0)
+
+    def test_returns_the_ratio_even_when_it_does_not_trip_the_flag(self):
+        """The boards display iv_rv_ratio whether or not it's a red flag."""
+        flags, ratio = server._build_risk_flags(
+            volume=5000, oi=20000, iv=11.0, rvol=10.0,
+            earnings_date_iso=None, expiry_iso="2026-08-21")
+        self.assertEqual(flags, [])
+        self.assertEqual(ratio, 1.1)
+
+    def test_clean_contract_yields_no_flags(self):
+        flags, _ratio = server._build_risk_flags(
+            volume=5000, oi=20000, iv=10.0, rvol=10.0,
+            earnings_date_iso=None, expiry_iso="2026-08-21")
+        self.assertEqual(flags, [])
+
+    def test_both_boards_agree_on_identical_inputs(self):
+        """The point of the extraction: a single-leg contract and a spread
+        leg with the same characteristics must be flagged identically."""
+        args = dict(volume=1, oi=1, iv=40.0, rvol=10.0,
+                    earnings_date_iso="2026-08-17", expiry_iso="2026-08-21")
+        a, ra = server._build_risk_flags(**args)
+        b, rb = server._build_risk_flags(**args)
+        self.assertEqual([f["code"] for f in a], [f["code"] for f in b])
+        self.assertEqual(ra, rb)
+
+
+class ParseChainVolumeFilterTests(unittest.TestCase):
+    """`require_volume` gates whether untraded strikes survive parsing.
+
+    Every trading board wants them gone -- an untraded contract has no
+    market to screen. Open-interest analysis needs them kept: on SPY's live
+    chain, zero-volume rows hold ~17% of all open interest, so filtering
+    them would silently discard a sixth of the positioning being measured.
+    """
+    @staticmethod
+    def _rows():
+        return _wrap_chain_json([
+            {"option": "SPY260821C00500000", "volume": 10, "open_interest": 100,
+             "bid": 1.0, "ask": 1.1, "gamma": 0.02},
+            {"option": "SPY260821C00505000", "volume": 0, "open_interest": 9000,
+             "bid": 1.0, "ask": 1.1, "gamma": 0.03},
+        ])
+
+    def test_traded_only_by_default(self):
+        contracts, _cv, _pv = server._parse_chain("SPY", self._rows())
+        self.assertEqual([c["strike"] for c in contracts], [500.0])
+
+    def test_untraded_strikes_kept_when_volume_not_required(self):
+        contracts, _cv, _pv = server._parse_chain("SPY", self._rows(),
+                                                  require_volume=False)
+        self.assertEqual(sorted(c["strike"] for c in contracts), [500.0, 505.0])
+
+    def test_gamma_is_surfaced_on_parsed_contracts(self):
+        contracts, _cv, _pv = server._parse_chain("SPY", self._rows())
+        self.assertEqual(contracts[0]["gamma"], 0.02)
+
+    def test_volume_totals_ignore_untraded_rows_either_way(self):
+        """A zero-volume row contributes nothing to call/put volume even when
+        it's kept -- otherwise the Flow board's put/call ratio would shift."""
+        _c, call_vol, _pv = server._parse_chain("SPY", self._rows(),
+                                                 require_volume=False)
+        self.assertEqual(call_vol, 10)
+
+
+class GammaExposureTests(NetworkFreeTestCase):
+    """get_gamma_exposure() reports where gamma is concentrated, deliberately
+    WITHOUT inferring dealer positioning -- open interest says how many
+    contracts exist at a strike, never who holds which side."""
+
+    def _patch(self, contracts, spot=500.0):
+        self.patch_server("get_quotes", lambda syms: {"SPY": {"price": spot}})
+        self.patch_server("_fetch_chain", lambda s, require_volume=True: {
+            "contracts": contracts, "call_vol": 0.0, "put_vol": 0.0, "ts": 1700000000,
+        })
+
+    @staticmethod
+    def _c(strike, typ="C", gamma=0.01, oi=100, dte=10):
+        return {"underlying": "SPY", "type": typ, "strike": strike, "dte": dte,
+                "gamma": gamma, "oi": oi, "expiry": "2026-08-21"}
+
+    def test_exposure_math_matches_the_documented_formula(self):
+        """gamma * OI * 100 * spot^2 * 0.01 = dollars of delta per 1% move."""
+        self._patch([self._c(500.0, gamma=0.01, oi=100)], spot=500.0)
+        out = server.get_gamma_exposure("SPY")
+        expected = 0.01 * 100 * 100 * (500.0 ** 2) * 0.01
+        self.assertAlmostEqual(out["strikes"][0]["call"], round(expected, 2))
+
+    def test_calls_and_puts_are_reported_separately_not_netted(self):
+        """Netting would encode an assumption about who is long which side."""
+        self._patch([self._c(500.0, "C", oi=100), self._c(500.0, "P", oi=100)])
+        row = server.get_gamma_exposure("SPY")["strikes"][0]
+        self.assertGreater(row["call"], 0)
+        self.assertGreater(row["put"], 0)
+        self.assertAlmostEqual(row["total"], row["call"] + row["put"])
+
+    def test_peak_strike_is_the_highest_total_concentration(self):
+        self._patch([self._c(500.0, oi=100), self._c(510.0, oi=5000),
+                     self._c(520.0, oi=50)])
+        self.assertEqual(server.get_gamma_exposure("SPY")["peak_strike"], 510.0)
+
+    def test_strikes_are_returned_in_strike_order(self):
+        self._patch([self._c(520.0, oi=90), self._c(500.0, oi=100),
+                     self._c(510.0, oi=95)])
+        strikes = [r["strike"] for r in server.get_gamma_exposure("SPY")["strikes"]]
+        self.assertEqual(strikes, sorted(strikes))
+
+    def test_top_limits_strikes_by_concentration_not_by_strike(self):
+        self._patch([self._c(500.0, oi=1), self._c(510.0, oi=9999),
+                     self._c(520.0, oi=5000)])
+        out = server.get_gamma_exposure("SPY", top=2)
+        self.assertEqual(sorted(r["strike"] for r in out["strikes"]), [510.0, 520.0])
+
+    def test_expiries_beyond_the_horizon_are_excluded(self):
+        self._patch([self._c(500.0, dte=10), self._c(510.0, dte=400)])
+        out = server.get_gamma_exposure("SPY", target_dte=30)
+        self.assertEqual([r["strike"] for r in out["strikes"]], [500.0])
+
+    def test_rows_without_gamma_or_open_interest_are_skipped(self):
+        self._patch([self._c(500.0, gamma=None), self._c(505.0, oi=0),
+                     self._c(510.0, gamma=0.02, oi=10)])
+        out = server.get_gamma_exposure("SPY")
+        self.assertEqual([r["strike"] for r in out["strikes"]], [510.0])
+
+    def test_missing_spot_does_not_crash(self):
+        self.patch_server("get_quotes", lambda syms: {})
+        self.patch_server("_fetch_chain", lambda s, require_volume=True: {
+            "contracts": [self._c(500.0)], "call_vol": 0.0, "put_vol": 0.0, "ts": None})
+        out = server.get_gamma_exposure("SPY")
+        self.assertIsNone(out["spot"])
+
+    def test_uses_the_unfiltered_chain(self):
+        """Untraded strikes are the point -- the analysis must request the
+        full chain, not the traded-only view every board uses."""
+        seen = {}
+        self.patch_server("get_quotes", lambda syms: {"SPY": {"price": 500.0}})
+        def fake(sym, require_volume=True):
+            seen["require_volume"] = require_volume
+            return {"contracts": [], "call_vol": 0.0, "put_vol": 0.0, "ts": None}
+        self.patch_server("_fetch_chain", fake)
+        server.get_gamma_exposure("SPY")
+        self.assertIs(seen["require_volume"], False)
+
+    def test_note_refuses_to_claim_dealer_positioning(self):
+        self._patch([self._c(500.0)])
+        note = server.get_gamma_exposure("SPY")["note"]
+        self.assertIn("never who holds which side", note)
+        self.assertIn("not a prediction", note)
+
+    def test_target_dte_is_clamped_like_the_other_scans(self):
+        self._patch([self._c(500.0, dte=10)])
+        out = server.get_gamma_exposure("SPY", target_dte=10 ** 6)
+        self.assertLessEqual(out["target_dte"], server.MAX_TARGET_DTE)
+
+
+class BlackScholesTests(unittest.TestCase):
+    """The pricer underpinning the modeled simulation. Checked against
+    textbook reference values and put-call parity, because a subtly wrong
+    Black-Scholes produces plausible-looking garbage rather than an error --
+    every downstream number would be wrong and nothing would complain."""
+
+    def test_matches_reference_call_and_put(self):
+        # S=100 K=100 T=1 sigma=0.20 r=0.05 -> C=10.4506, P=5.5735
+        self.assertAlmostEqual(
+            server.black_scholes_price(100, 100, 1, 0.20, 0.05, True), 10.4506, places=4)
+        self.assertAlmostEqual(
+            server.black_scholes_price(100, 100, 1, 0.20, 0.05, False), 5.5735, places=4)
+
+    def test_put_call_parity_holds(self):
+        c = server.black_scholes_price(100, 95, 0.5, 0.25, 0.05, True)
+        p = server.black_scholes_price(100, 95, 0.5, 0.25, 0.05, False)
+        self.assertAlmostEqual(c - p, 100 - 95 * math.exp(-0.05 * 0.5), places=8)
+
+    def test_expiry_and_zero_vol_return_intrinsic(self):
+        self.assertAlmostEqual(server.black_scholes_price(150, 100, 0, 0.2, 0.04, True), 50.0)
+        self.assertAlmostEqual(server.black_scholes_price(150, 100, 1, 0.0, 0.04, True), 50.0)
+        self.assertAlmostEqual(server.black_scholes_price(80, 100, 0, 0.2, 0.04, True), 0.0)
+
+    def test_higher_volatility_is_never_cheaper(self):
+        lo = server.black_scholes_price(100, 100, 0.25, 0.15, 0.04, True)
+        hi = server.black_scholes_price(100, 100, 0.25, 0.45, 0.04, True)
+        self.assertGreater(hi, lo)
+
+    def test_norm_cdf_anchors(self):
+        self.assertAlmostEqual(server._norm_cdf(0), 0.5, places=10)
+        self.assertAlmostEqual(server._norm_cdf(-8), 0.0, places=10)
+        self.assertAlmostEqual(server._norm_cdf(8), 1.0, places=10)
+
+
+class ModeledBacktestTests(NetworkFreeTestCase):
+    """The simulation is explicitly a MODEL, not a backtest. These pin the
+    properties that keep it honest -- no lookahead, execution costs applied,
+    and the vol-premium sensitivity actually present -- rather than pinning
+    any particular return, which is a function of whatever history the feed
+    happens to return."""
+
+    def _patch_history(self, closes, vix=None):
+        """Symbol-aware stub: the underlying and its implied-vol proxy must
+        return different series, or the proxy would be fed price levels as
+        volatility (a $200 close becoming 200% vol) and quietly invalidate
+        every implied-vol test."""
+        base = 1700000000
+        def fake(sym, rng="6mo"):
+            series = closes
+            if sym.startswith("^"):
+                if vix is None:
+                    return {"t": [], "c": []}       # no proxy data
+                series = [vix] * len(closes)         # flat implied vol, in percent
+            return {"t": [base + i * 86400 for i in range(len(series))], "c": series}
+        self.patch_server("get_history", fake)
+
+    @staticmethod
+    def _drifting(n=200, start=100.0, step=0.004):
+        # deterministic zigzag with upward drift -- no RNG in tests
+        out, price = [], start
+        for i in range(n):
+            price *= (1 + step) if i % 3 else (1 - step / 2)
+            out.append(round(price, 4))
+        return out
+
+    def test_realized_vol_from_slice(self):
+        self.assertAlmostEqual(server._realized_vol_from([100.0] * 30), 0.0)
+        self.assertIsNone(server._realized_vol_from([100.0]))
+        self.assertGreater(server._realized_vol_from(self._drifting(60)), 0)
+
+    def test_simulation_uses_only_prior_bars_for_volatility(self):
+        """No lookahead: the sigma for a trade entered at bar i must be
+        computable from bars <= i. Feeding a series whose tail volatility
+        explodes must not change earlier trades."""
+        calm = self._drifting(120)
+        wild = calm[:100] + [calm[99] * (1.5 if i % 2 else 0.6) for i in range(20)]
+        a = server._simulate_weekly_itm([(f"d{i}", c) for i, c in enumerate(calm)],
+                                        7, 0.01, 30, 1.0, 0.03)
+        b = server._simulate_weekly_itm([(f"d{i}", c) for i, c in enumerate(wild)],
+                                        7, 0.01, 30, 1.0, 0.03)
+        early_a = [t for t in a if int(t["entry_date"][1:]) < 60]
+        early_b = [t for t in b if int(t["entry_date"][1:]) < 60]
+        self.assertEqual([t["entry"] for t in early_a], [t["entry"] for t in early_b])
+
+    def test_spread_haircut_makes_entries_more_expensive(self):
+        bars = [(f"d{i}", c) for i, c in enumerate(self._drifting(120))]
+        free = server._simulate_weekly_itm(bars, 7, 0.01, 30, 1.0, 0.0)
+        costed = server._simulate_weekly_itm(bars, 7, 0.01, 30, 1.0, 0.10)
+        self.assertGreater(costed[0]["entry"], free[0]["entry"])
+        self.assertLess(costed[0]["pnl_dollars"], free[0]["pnl_dollars"])
+
+    def test_higher_vol_premium_raises_entry_cost(self):
+        bars = [(f"d{i}", c) for i, c in enumerate(self._drifting(120))]
+        cheap = server._simulate_weekly_itm(bars, 7, 0.01, 30, 1.0, 0.03)
+        dear = server._simulate_weekly_itm(bars, 7, 0.01, 30, 1.5, 0.03)
+        self.assertGreater(dear[0]["entry"], cheap[0]["entry"])
+
+    def test_summary_math(self):
+        trades = [{"pnl_dollars": 100.0, "pnl_pct": 0.5},
+                  {"pnl_dollars": -50.0, "pnl_pct": -0.25}]
+        s = server._summarize_trades(trades)
+        self.assertEqual((s["trades"], s["wins"], s["win_rate"]), (2, 1, 0.5))
+        self.assertAlmostEqual(s["total_pnl_dollars"], 50.0)
+        self.assertAlmostEqual(s["avg_pnl_pct"], 0.125)
+        self.assertEqual((s["best_pnl_pct"], s["worst_pnl_pct"]), (0.5, -0.25))
+
+    def test_summary_of_no_trades_is_not_a_crash(self):
+        s = server._summarize_trades([])
+        self.assertEqual(s["trades"], 0)
+        self.assertIsNone(s["win_rate"])
+
+    def test_result_carries_the_sensitivity_and_no_spread_comparison(self):
+        """These exist so the two biggest sources of optimism are visible as
+        numbers rather than buried in a disclaimer nobody reads."""
+        self._patch_history(self._drifting(200))
+        out = server.get_modeled_backtest("SPY")
+        self.assertEqual([r["vol_premium"] for r in out["sensitivity"]],
+                         list(server._VOL_PREMIUM_SENSITIVITY))
+        self.assertIn("no_spread_summary", out)
+        self.assertTrue(out["modeled"])
+
+    def test_result_is_labeled_a_model_not_a_backtest(self):
+        self._patch_history(self._drifting(200), vix=18.0)
+        note = server.get_modeled_backtest("SPY")["note"]
+        self.assertIn("MODELED, NOT A BACKTEST", note)
+        self.assertIn("never as a performance claim", note)
+
+    def test_realized_vol_run_is_labeled_optimistic(self):
+        """When entries are priced off realized vol the note must say so --
+        that's the run whose returns are systematically flattered."""
+        self._patch_history(self._drifting(200))
+        note = server.get_modeled_backtest("SPY", vol_source="realized")["note"]
+        self.assertIn("optimistic", note)
+        self.assertIn("realized", note)
+
+    # -- implied-vol proxy -------------------------------------------------
+
+    def test_implied_vol_series_scales_percent_to_a_fraction(self):
+        """VIX quotes annualized vol in percent; the pricer wants a fraction."""
+        self._patch_history(self._drifting(50), vix=20.0)
+        series = server.implied_vol_series("SPY", "2y")
+        self.assertTrue(series)
+        self.assertAlmostEqual(next(iter(series.values())), 0.20)
+
+    def test_symbols_without_a_proxy_return_none_not_empty(self):
+        """None means 'no proxy exists' (permanent); an empty dict would mean
+        'the fetch came back empty' (retryable). Callers treat them
+        differently, so the distinction has to survive."""
+        self.assertIsNone(server.implied_vol_series("IWM", "2y"))
+        self.assertIsNone(server.implied_vol_series("NOT-A-TICKER", "2y"))
+
+    def test_implied_vol_is_used_when_a_proxy_exists(self):
+        self._patch_history(self._drifting(200), vix=20.0)
+        out = server.get_modeled_backtest("SPY", vol_source="implied")
+        self.assertIn("implied", out["vol_source"])
+        self.assertIn("^VIX", out["vol_source"])
+
+    def test_falls_back_to_realized_and_says_so_when_no_proxy_exists(self):
+        """IWM has no working vol index (^RVX 404s). Borrowing SPY's would be
+        a different underlying's risk relabelled, so it must fall back AND
+        report that it did rather than claiming an implied-vol run."""
+        self._patch_history(self._drifting(200), vix=20.0)
+        out = server.get_modeled_backtest("IWM", vol_source="implied")
+        self.assertIn("realized", out["vol_source"])
+        self.assertIn("no implied-vol proxy", out["vol_source"])
+
+    def test_implied_and_realized_runs_are_both_reported(self):
+        """The point of keeping both: the difference the vol input makes is
+        a visible number rather than an assertion."""
+        self._patch_history(self._drifting(200), vix=35.0)
+        out = server.get_modeled_backtest("SPY", vol_source="implied")
+        self.assertIn("realized_vol_summary", out)
+        self.assertIn("summary", out)
+
+    def test_higher_implied_vol_produces_worse_results(self):
+        """Sanity: pricier entries must reduce returns, all else equal."""
+        self._patch_history(self._drifting(200), vix=12.0)
+        cheap = server.get_modeled_backtest("SPY")["summary"]["avg_pnl_pct"]
+        server._cache.clear()
+        self._patch_history(self._drifting(200), vix=45.0)
+        dear = server.get_modeled_backtest("SPY")["summary"]["avg_pnl_pct"]
+        self.assertGreater(cheap, dear)
+
+    def test_short_history_yields_no_trades_rather_than_an_error(self):
+        self._patch_history([100.0, 101.0, 102.0])
+        out = server.get_modeled_backtest("SPY")
+        self.assertEqual(out["summary"]["trades"], 0)
+
+    def test_hold_days_and_lookback_are_clamped(self):
+        self._patch_history(self._drifting(200))
+        out = server.get_modeled_backtest("SPY", hold_days=10 ** 6, vol_lookback=10 ** 6)
+        self.assertLessEqual(out["hold_days"], server.MAX_TARGET_DTE)
+
+
+class WeeklySnipeLogTests(NetworkFreeTestCase):
+    """The forward paper-trading log now covers both boards.
+
+    The generalization rests on settling by EXPIRY rather than by the date
+    the pick was logged. For a 0DTE pick those are the same date, so the
+    original behavior is unchanged; a weekly pick simply waits until its own
+    expiry. These tests pin both halves of that, plus the backward
+    compatibility that matters most: entries written before the weekly board
+    existed carry no `board` field and must keep working untouched.
+    """
+    def setUp(self):
+        super().setUp()
+        self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
+        self.patch_server("SNIPE_LOG_PATH", os.path.join(self._tmpdir, "snipe_log.json"))
+
+    @staticmethod
+    def _entry(**kw):
+        base = {
+            "id": "x", "date": "2026-08-03", "underlying": "SPY", "type": "C",
+            "strike": 495.0, "expiry": "2026-08-03", "entry_ask": 5.0,
+            "contract_cost": 500.0, "status": "open",
+        }
+        base.update(kw)
+        return base
+
+    def _write(self, entries):
+        with open(server.SNIPE_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(entries, f)
+
+    # -- board tagging ----------------------------------------------------
+
+    def test_legacy_entry_without_board_reads_as_0dte(self):
+        """Real entries predating the weekly board have no `board` key. They
+        were all 0DTE picks, so that's the correct reading of a missing
+        value -- not a reason to rewrite the user's file."""
+        self.assertEqual(server._entry_board({"date": "2026-08-07"}), "0dte")
+        self.assertEqual(server._entry_board({"board": None}), "0dte")
+        self.assertEqual(server._entry_board({"board": "weekly"}), "weekly")
+
+    def test_snapshot_tags_the_board_and_scans_the_right_one(self):
+        self.patch_server("get_itm_scan", lambda *a, **k: {"contracts": [
+            {"underlying": "SPY", "type": "C", "strike": 1.0, "expiry": "2026-08-11",
+             "ask": 1.0, "contract_cost": 100.0, "score": 10.0}]})
+        self.patch_server("get_itm_scan_weekly", lambda *a, **k: {"contracts": [
+            {"underlying": "IWM", "type": "P", "strike": 2.0, "expiry": "2026-08-21",
+             "ask": 2.0, "contract_cost": 200.0, "weekly_score": 20.0}]})
+        a = server.snapshot_snipe_pick(board="0dte")
+        b = server.snapshot_snipe_pick(board="weekly")
+        self.assertEqual((a["board"], a["underlying"], a["entry_score"]), ("0dte", "SPY", 10.0))
+        self.assertEqual((b["board"], b["underlying"], b["entry_score"]), ("weekly", "IWM", 20.0))
+
+    def test_each_board_dedupes_independently_on_the_same_day(self):
+        """Two boards may both log on one day; neither may log twice."""
+        self.patch_server("get_itm_scan", lambda *a, **k: {"contracts": [
+            {"underlying": "SPY", "type": "C", "strike": 1.0, "expiry": "2026-08-11",
+             "ask": 1.0, "contract_cost": 100.0, "score": 10.0}]})
+        self.patch_server("get_itm_scan_weekly", lambda *a, **k: {"contracts": [
+            {"underlying": "IWM", "type": "P", "strike": 2.0, "expiry": "2026-08-21",
+             "ask": 2.0, "contract_cost": 200.0, "weekly_score": 20.0}]})
+        server.snapshot_snipe_pick(board="0dte")
+        server.snapshot_snipe_pick(board="weekly")
+        server.snapshot_snipe_pick(board="0dte")   # repeat
+        server.snapshot_snipe_pick(board="weekly")  # repeat
+        self.assertEqual(len(server._load_snipe_log()), 2)
+
+    def test_unknown_board_logs_nothing(self):
+        self.assertIsNone(server.snapshot_snipe_pick(board="not-a-board"))
+
+    # -- settlement by expiry ---------------------------------------------
+
+    def test_settle_date_is_the_expiry(self):
+        self.assertEqual(server._entry_settle_date(
+            {"date": "2026-08-03", "expiry": "2026-08-21"}), "2026-08-21")
+
+    def test_settle_date_falls_back_to_the_entry_date(self):
+        """A hand-edited or malformed entry without an expiry stays
+        resolvable rather than stuck open forever."""
+        self.assertEqual(server._entry_settle_date({"date": "2026-08-03"}), "2026-08-03")
+
+    def test_weekly_entry_stays_open_until_its_expiry_passes(self):
+        self.patch_server("_today_et", lambda: dt.date(2026, 8, 14))
+        self.patch_server("_closing_price_on", lambda s, d: 500.0)
+        self._write([self._entry(board="weekly", date="2026-08-10",
+                                 expiry="2026-08-21")])
+        entries = server.resolve_snipe_log()
+        self.assertEqual(entries[0]["status"], "open",
+                         "a weekly pick must not settle just because a day passed")
+
+    def test_weekly_entry_settles_against_the_close_on_its_expiry(self):
+        self.patch_server("_today_et", lambda: dt.date(2026, 8, 24))
+        seen = []
+        self.patch_server("_closing_price_on",
+                          lambda s, d: (seen.append(d), 505.0)[1])
+        self._write([self._entry(board="weekly", date="2026-08-10",
+                                 expiry="2026-08-21")])
+        entries = server.resolve_snipe_log()
+        self.assertEqual(seen, ["2026-08-21"], "settles on the EXPIRY date, not the log date")
+        e = entries[0]
+        self.assertEqual(e["status"], "closed")
+        self.assertAlmostEqual(e["exit_value"], 10.0)          # 505 - 495
+        self.assertAlmostEqual(e["pnl_dollars"], 500.0)        # (10 - 5) * 100
+        self.assertTrue(e["correct"])
+
+    def test_0dte_settlement_is_unchanged_by_the_generalization(self):
+        """Regression guard for the real data on disk: for a 0DTE pick
+        expiry == date, so settling by expiry must behave exactly as
+        settling by date always did."""
+        self.patch_server("_today_et", lambda: dt.date(2026, 8, 4))
+        self.patch_server("_closing_price_on", lambda s, d: 502.0)
+        self._write([self._entry(date="2026-08-03", expiry="2026-08-03")])
+        e = server.resolve_snipe_log()[0]
+        self.assertEqual(e["status"], "closed")
+        self.assertAlmostEqual(e["pnl_dollars"], 200.0)  # (7 - 5) * 100
+
+    # -- per-board reporting ----------------------------------------------
+
+    def test_log_is_scoped_and_summarized_per_board(self):
+        """Pooling two boards' records would produce a win rate that
+        describes neither."""
+        self.patch_server("_today_et", lambda: dt.date(2026, 9, 1))
+        self.patch_server("_closing_price_on", lambda s, d: 600.0)
+        self._write([
+            self._entry(id="a", board="0dte", date="2026-08-03", expiry="2026-08-03"),
+            self._entry(id="b", board="weekly", date="2026-08-03", expiry="2026-08-14"),
+            self._entry(id="c", board="weekly", date="2026-08-04", expiry="2026-08-14"),
+        ])
+        zero = server.get_snipe_log("0dte")
+        weekly = server.get_snipe_log("weekly")
+        self.assertEqual(zero["board"], "0dte")
+        self.assertEqual(len(zero["entries"]), 1)
+        self.assertEqual(zero["summary"]["trades"], 1)
+        self.assertEqual(len(weekly["entries"]), 2)
+        self.assertEqual(weekly["summary"]["trades"], 2)
+
+    def test_open_entries_report_when_they_will_settle(self):
+        """A weekly pick sits open for 5-10 days. Without a countdown that
+        reads as a stalled log rather than a pending one, since the 0DTE
+        board settles overnight and sets the opposite expectation."""
+        self.patch_server("_today_et", lambda: dt.date(2026, 8, 14))
+        self._write([self._entry(board="weekly", date="2026-08-10",
+                                 expiry="2026-08-21")])
+        e = server.get_snipe_log("weekly")["entries"][0]
+        self.assertEqual(e["settles_on"], "2026-08-21")
+        self.assertEqual(e["days_to_settle"], 7)
+
+    def test_closed_entries_get_no_countdown(self):
+        self.patch_server("_today_et", lambda: dt.date(2026, 9, 1))
+        self.patch_server("_closing_price_on", lambda s, d: 600.0)
+        self._write([self._entry(board="weekly", date="2026-08-03",
+                                 expiry="2026-08-14")])
+        e = server.get_snipe_log("weekly")["entries"][0]
+        self.assertEqual(e["status"], "closed")
+        self.assertNotIn("days_to_settle", e)
+
+    def test_malformed_expiry_does_not_break_the_countdown(self):
+        self.patch_server("_today_et", lambda: dt.date(2026, 8, 14))
+        self._write([self._entry(board="weekly", date="2026-08-10",
+                                 expiry="not-a-date")])
+        e = server.get_snipe_log("weekly")["entries"][0]
+        self.assertIsNone(e["days_to_settle"])
+
+    def test_resolution_runs_across_all_boards_regardless_of_who_asks(self):
+        """Settling is independent of which board is being read."""
+        self.patch_server("_today_et", lambda: dt.date(2026, 9, 1))
+        self.patch_server("_closing_price_on", lambda s, d: 600.0)
+        self._write([self._entry(id="w", board="weekly", date="2026-08-03",
+                                 expiry="2026-08-14")])
+        server.get_snipe_log("0dte")  # ask for the OTHER board
+        self.assertEqual(server._load_snipe_log()[0]["status"], "closed")
+
+
 class SpreadScoreTests(unittest.TestCase):
     """Tests _spread_score(): 40% probability of MAX profit (short-leg
     delta, 0.40->0.85) + 40% reward per dollar risked (0->2.0x) + 20%
@@ -1615,6 +2278,34 @@ class GetDebitSpreadsTests(NetworkFreeTestCase):
                             self._leg(500.0, 3.0, 3.2, delta=0.50)])
         self.assertEqual(len(server.get_debit_spreads(["SPY"], top=1)["spreads"]), 1)
 
+    def test_rejects_pairings_below_the_minimum_reward_risk(self):
+        """A validity guard, not a preference: width 5.00 bought for a 4.90
+        debit -> $10 max gain on $490 of risk (0.02x). Its best case doesn't
+        clear a round-trip commission on two legs."""
+        self._patch(500.0, [self._leg(495.0, 5.9, 6.0, delta=0.75),
+                            self._leg(500.0, 1.1, 1.2, delta=0.50)])
+        self.assertEqual(server.get_debit_spreads(["SPY"])["spreads"], [])
+
+    def test_keeps_pairings_at_or_above_the_minimum(self):
+        """Boundary: the rule is `< floor` rejects, so exactly at the floor
+        must survive. width 5.00, debit 4.7619 -> reward:risk exactly 0.05."""
+        debit = 5.0 / (1 + server._SPREAD_MIN_REWARD_RISK)
+        self._patch(500.0, [self._leg(495.0, debit + 2.0 - 0.01, debit + 2.0, delta=0.75),
+                            self._leg(500.0, 2.0, 2.1, delta=0.50)])
+        spreads = server.get_debit_spreads(["SPY"])["spreads"]
+        self.assertEqual(len(spreads), 1)
+        self.assertAlmostEqual(spreads[0]["reward_risk"],
+                               server._SPREAD_MIN_REWARD_RISK, places=3)
+
+    def test_exclusion_is_disclosed_in_the_note(self):
+        """Filtering silently would make an empty board look like a broken
+        feed; the note says what was removed and why."""
+        self._patch(500.0, [self._leg(495.0, 5.8, 6.0, delta=0.75),
+                            self._leg(500.0, 3.0, 3.2, delta=0.50)])
+        note = server.get_debit_spreads(["SPY"])["note"]
+        self.assertIn("excluded", note)
+        self.assertIn("transaction costs", note)
+
     def test_note_carries_the_screening_disclaimer(self):
         self._patch(500.0, [self._leg(495.0, 5.8, 6.0, delta=0.75),
                             self._leg(500.0, 3.0, 3.2, delta=0.50)])
@@ -1649,7 +2340,7 @@ class SnipeLogTests(NetworkFreeTestCase):
         hardcoded date string so these tests stay correct on any run date
         (a negative `days` is always strictly in the past, which is all the
         resolve-path tests actually need)."""
-        return (server.dt.date.today() + server.dt.timedelta(days=days)).isoformat()
+        return (server._today_et() + server.dt.timedelta(days=days)).isoformat()
 
     @staticmethod
     def _hist_for_date(date_str, close):
@@ -1698,9 +2389,12 @@ class SnipeLogTests(NetworkFreeTestCase):
     def test_snapshot_creates_one_entry_with_expected_fields(self):
         self.patch_server("get_itm_scan", lambda *a, **k: self._scan_with([self._pick()]))
         entry = server.snapshot_snipe_pick()
-        today = server.dt.date.today().isoformat()
+        today = server._today_et().isoformat()
         self.assertIsNotNone(entry)
-        self.assertEqual(entry["id"], f"{today}-SPY")
+        self.assertEqual(entry["id"], f"{today}-0dte-SPY",
+                         "id carries the board, so two boards' same-day picks on the"
+                         " same underlying stay distinct")
+        self.assertEqual(entry["board"], "0dte")
         self.assertEqual(entry["date"], today)
         self.assertEqual(entry["underlying"], "SPY")
         self.assertEqual(entry["type"], "C")
@@ -1779,7 +2473,7 @@ class SnipeLogTests(NetworkFreeTestCase):
         """Even with a matching close price available, a same-day entry must
         stay open -- it only resolves the NEXT time the log is read on a
         later date."""
-        today = server.dt.date.today().isoformat()
+        today = server._today_et().isoformat()
         server._save_snipe_log([self._raw_entry(date=today)])
         self.patch_server("get_history", lambda symbol, rng="1mo": self._hist_for_date(today, 502.0))
         out = server.resolve_snipe_log()
@@ -1816,7 +2510,7 @@ class SnipeLogTests(NetworkFreeTestCase):
     # -- get_snipe_log() summary --------------------------------------------
 
     def test_summary_zero_trades_when_none_closed(self):
-        today = server.dt.date.today().isoformat()
+        today = server._today_et().isoformat()
         server._save_snipe_log([self._raw_entry(date=today)])
         out = server.get_snipe_log()
         self.assertEqual(out["summary"], {
@@ -1826,7 +2520,7 @@ class SnipeLogTests(NetworkFreeTestCase):
 
     def test_summary_only_counts_closed_trades_and_computes_correctly(self):
         yest = self._date_offset(-1)
-        today = server.dt.date.today().isoformat()
+        today = server._today_et().isoformat()
         win_entry = self._raw_entry(date=yest, underlying="SPY")
         still_open = self._raw_entry(date=today, underlying="QQQ", id_suffix="QQQ")
         server._save_snipe_log([win_entry, still_open])

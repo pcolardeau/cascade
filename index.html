@@ -383,6 +383,36 @@ table.opt tr.body:hover { background: var(--surface-3); cursor: pointer; }
   color: var(--accent); border-color: var(--accent); background: var(--accent-dim);
 }
 
+/* sort toggle, right-aligned in the mode row. A view control only — it
+   reorders rows, it does not change any score or what the log records. */
+.snipe-sort { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; }
+.snipe-sort-label {
+  font-size: 8.5px; letter-spacing: 1px; text-transform: uppercase;
+  color: var(--ink-muted); margin-right: 2px;
+}
+/* return-on-capital shown next to the dollar figure on the magnitude column,
+   because that's the quantity "Biggest swing" actually ranks by */
+.snipe-pnl-pct { color: var(--ink-muted); font-size: 9px; }
+
+/* gamma concentration — calls and puts drawn as SEPARATE opposed bars, never
+   netted into one signed value. Netting would encode an assumption about who
+   holds which side of the open interest, which the data never says; the whole
+   point of the backend's design is to not make that claim, and a chart that
+   quietly re-introduces it would undo that. */
+.gx-section { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--grid); }
+.gx-section h3 { font-size: 10px; letter-spacing: 1.4px; color: var(--ink-muted); text-transform: uppercase; margin-bottom: 4px; }
+.gx-row { display: grid; grid-template-columns: 62px 1fr 1fr 92px; align-items: center; gap: 6px; height: 17px; }
+.gx-strike { font-size: 10px; text-align: right; color: var(--ink-2); }
+.gx-strike.peak { color: var(--accent); font-weight: 800; }
+.gx-strike.atm { color: var(--ink); }
+.gx-bar { height: 9px; position: relative; background: var(--surface-3); border-radius: 2px; }
+.gx-bar > span { position: absolute; top: 0; height: 100%; border-radius: 2px; }
+.gx-bar.call > span { right: 0; background: var(--up); }
+.gx-bar.put  > span { left: 0;  background: var(--down); }
+.gx-val { font-size: 9px; color: var(--ink-muted); }
+.gx-legend { display: flex; gap: 14px; font-size: 9px; color: var(--ink-muted); margin: 6px 0 8px; }
+.gx-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
+
 /* risk flags — penalties are shown, never silently applied. Each badge is a
    visible reason the score was reduced, so a low score is always legible. */
 .snipe-flags { display: inline-flex; flex-wrap: wrap; gap: 3px; }
@@ -1456,7 +1486,8 @@ tabs.forEach(b=>b.addEventListener("click",()=>{
   if(b.dataset.tab==="snipe"){
     const st = snipeState(snipeMode);
     if(!st.loaded && !st.loading) fetchSnipe(snipeMode); else renderSnipe();
-    if(!snipeLogLoaded && !snipeLogLoading) fetchSnipeLog();
+    const ls = snipeLogState(snipeMode);
+    if(LOGGED_BOARDS.includes(snipeMode) && !ls.loaded && !ls.loading) fetchSnipeLog(snipeMode);
   }
 }));
 
@@ -2171,11 +2202,59 @@ const SNIPE_MODES = {
     ranked: "Spreads · ranked by Spread Score (probability of max profit + reward per dollar risked + execution cost)",
   },
 };
+/* Probability and profit magnitude genuinely pull against each other in
+   options pricing — deeper ITM is likelier but less leveraged, nearer the
+   money is the reverse — so no single composite honestly answers both. The
+   server already returns both axes unscaled alongside the blended score
+   precisely so the client can rank by either one. This is a VIEW control:
+   it reorders rows you can already see, and changes neither the scores
+   themselves nor what the Snipe Log records. */
+const SNIPE_SORTS = {
+  score:     { label: "Balanced",     hint: "the board's blended score" },
+  prob:      { label: "Safer",        hint: "highest probability first (delta)" },
+  magnitude: { label: "Biggest swing", hint: "largest payoff first" },
+};
+/* Per-board accessors, since "probability" and "magnitude" live in different
+   fields on each board (and on spreads, probability is the SHORT leg's delta
+   — that's the leg whose outcome decides whether max profit is reached). */
+const SNIPE_SORT_KEYS = {
+  "0dte": {
+    score: o => o.score,
+    prob: o => Math.abs(o.delta ?? 0),
+    magnitude: o => (o.scenarios?.up?.pnl_pct ?? -Infinity),
+  },
+  "weekly": {
+    score: o => o.weekly_score,
+    prob: o => Math.abs(o.delta ?? 0),
+    magnitude: o => (o.scenarios?.favorable?.pnl_pct ?? -Infinity),
+  },
+  "spreads": {
+    score: s => s.spread_score,
+    prob: s => Math.abs(s.short_delta ?? 0),
+    magnitude: s => (s.reward_risk ?? -Infinity),
+  },
+};
 let snipeMode = "0dte";
+let snipeSort = "score";
 const snipeCache = {};  // mode -> {data, loading, loaded}
 const snipeState = m => (snipeCache[m] ||= {data:null, loading:false, loaded:false});
 
-let snipeLogData=null, snipeLogLoading=false, snipeLogLoaded=false, snipeSnapshotInFlight=false;
+/* Client-side re-sort of already-fetched rows: the list is capped at ~20, so
+   a round trip to re-rank server-side would add latency for nothing. */
+function sortSnipeRows(rows){
+  const key = (SNIPE_SORT_KEYS[snipeMode] || {})[snipeSort];
+  if(!key) return rows;
+  return [...rows].sort((a,b) => (key(b) ?? -Infinity) - (key(a) ?? -Infinity));
+}
+
+/* The log is per-board: it exists to say whether THAT board's scoring picks
+   winners, so pooling the two would give a number describing neither.
+   Spreads has no log yet (settling a two-leg position needs its own math),
+   so LOGGED_BOARDS is deliberately a subset of SNIPE_MODES. */
+const LOGGED_BOARDS = ["0dte", "weekly"];
+const snipeLogCache = {};  // board -> {data, loading, loaded}
+const snipeLogState = b => (snipeLogCache[b] ||= {data:null, loading:false, loaded:false});
+let snipeSnapshotInFlight=false;
 const fmtUsd = v => (v==null ? "—" : (v<0?"-":"")+"$"+Math.abs(v).toFixed(2));
 const fmtPct1 = v => v==null ? "—" : (v*100).toFixed(1)+"%";
 
@@ -2226,21 +2305,28 @@ function scoreCell(score, rawScore){
    real trade). Its own fetch/render pair, but rendered as a sub-section
    inside renderSnipe() (see renderSnipeLogSection below) rather than a
    separate tab -- it's the same feature, just a second view onto it. */
-async function fetchSnipeLog(){
-  if(snipeLogLoading) return;
-  snipeLogLoading=true; renderSnipe();
-  try{ const r=await fetch("/api/snipe-log"); snipeLogData=await r.json(); snipeLogLoaded=true; }
-  catch(e){ snipeLogData={_error:String(e)}; }
-  snipeLogLoading=false; renderSnipe();
+async function fetchSnipeLog(board){
+  board = board || snipeMode;
+  if(!LOGGED_BOARDS.includes(board)) return;
+  const st = snipeLogState(board);
+  if(st.loading) return;
+  st.loading=true; renderSnipe();
+  try{
+    const r=await fetch("/api/snipe-log?board="+encodeURIComponent(board));
+    st.data=await r.json(); st.loaded=true;
+  }
+  catch(e){ st.data={_error:String(e)}; }
+  st.loading=false; renderSnipe();
 }
 
-async function doSnipeSnapshot(){
+async function doSnipeSnapshot(board){
+  board = board || snipeMode;
   if(snipeSnapshotInFlight) return;
   snipeSnapshotInFlight=true; renderSnipe();
-  try{ await fetch("/api/snipe-log/snapshot", {method:"POST"}); }
-  catch(e){ /* surfaced through the refetch below via snipeLogData._error if it truly failed */ }
+  try{ await fetch("/api/snipe-log/snapshot?board="+encodeURIComponent(board), {method:"POST"}); }
+  catch(e){ /* surfaced through the refetch below via the log's _error if it truly failed */ }
   snipeSnapshotInFlight=false;
-  await fetchSnipeLog();
+  await fetchSnipeLog(board);
 }
 
 function renderSnipe(){
@@ -2271,9 +2357,28 @@ function renderSnipe(){
       snipeMode=id;
       const s=snipeState(id);
       if(!s.loaded && !s.loading) fetchSnipe(id); else renderSnipe();
+      // The log is per-board too, and switching modes is the only other way
+      // to reach a board besides opening the tab -- without this the new
+      // board's log stays null and renders as "unavailable" even though the
+      // endpoint is fine.
+      const ls=snipeLogState(id);
+      if(LOGGED_BOARDS.includes(id) && !ls.loaded && !ls.loading) fetchSnipeLog(id);
     });
     modes.append(b);
   }
+  const sortWrap=document.createElement("span"); sortWrap.className="snipe-sort";
+  const sortLbl=document.createElement("span"); sortLbl.className="snipe-sort-label";
+  sortLbl.textContent="sort";
+  sortWrap.append(sortLbl);
+  for(const [id,s] of Object.entries(SNIPE_SORTS)){
+    const b=document.createElement("button");
+    b.textContent=s.label;
+    b.title=s.hint;
+    if(id===snipeSort) b.className="on";
+    b.addEventListener("click",()=>{ if(snipeSort!==id){ snipeSort=id; renderSnipe(); } });
+    sortWrap.append(b);
+  }
+  modes.append(sortWrap);
   box.append(modes);
 
   if(snipeLoading && !snipeData){
@@ -2289,7 +2394,7 @@ function renderSnipe(){
 
   if(snipeMode==="spreads"){ renderSpreadsTable(box, snipeData, cfg); return; }
 
-  const contracts = snipeData.contracts||[];
+  const contracts = sortSnipeRows(snipeData.contracts||[]);
   if(!contracts.length){
     const e=document.createElement("div"); e.className="empty-note";
     e.textContent=cfg.empty;
@@ -2336,9 +2441,20 @@ function renderSnipe(){
       const tdFlags=document.createElement("td"); tdFlags.append(renderFlags(o.flags));
 
       const sc = o.scenarios||{};
-      const pnlCell = v => {
+      /* `pct` is shown alongside the dollars on the MAGNITUDE column only.
+         That column is what "Biggest swing" sorts by, and it sorts on return
+         on capital (pnl_pct), not raw dollars — a $1412 contract returning
+         $1245 is a worse trade than a $1017 one returning $934. Without the
+         percentage visible the rows look mis-sorted, because the eye reads
+         the dollar figure and the ranking is on the ratio. */
+      const pnlCell = (v, pct) => {
         const td=document.createElement("td"); td.className="num";
         td.textContent = v!=null ? fmtUsd(v) : "—";
+        if(v!=null && pct!=null){
+          const p=document.createElement("span"); p.className="snipe-pnl-pct";
+          p.textContent = " " + (pct*100).toFixed(0) + "%";
+          td.append(p);
+        }
         if(v!=null) td.style.color = v<0 ? "var(--down)" : "var(--up)";
         return td;
       };
@@ -2352,7 +2468,8 @@ function renderSnipe(){
         const tdExtr=document.createElement("td"); tdExtr.className="num"; tdExtr.textContent=fmtPct1(o.extrinsic_ratio);
         tr.append(td1,td2,tdScore,td3,tdDte,tdDelta,tdIvRv,tdSpread,tdBidAsk,tdCost,tdBe,tdMove,
                   pnlCell(sc.flat?sc.flat.pnl_dollars:null),
-                  pnlCell(sc.favorable?sc.favorable.pnl_dollars:null),
+                  pnlCell(sc.favorable?sc.favorable.pnl_dollars:null,
+                          sc.favorable?sc.favorable.pnl_pct:null),
                   tdExtr,tdFlags);
       } else {
         const tdCushion=document.createElement("td"); tdCushion.className="num"; tdCushion.textContent=fmtPct1(o.breakeven_cushion_pct);
@@ -2362,7 +2479,8 @@ function renderSnipe(){
         tr.append(td1,td2,tdScore,td3,tdDelta,tdSpread,tdBidAsk,tdCost,tdBe,tdCushion,
                   pnlCell(sc.down?sc.down.pnl_dollars:null),
                   pnlCell(sc.flat?sc.flat.pnl_dollars:null),
-                  pnlCell(sc.up?sc.up.pnl_dollars:null),
+                  pnlCell(sc.up?sc.up.pnl_dollars:null,
+                          sc.up?sc.up.pnl_pct:null),
                   tdTier,tdFlags);
       }
       if(fromY[o.underlying]!=null) tr.addEventListener("click",()=>selectNode(fromY[o.underlying]));
@@ -2376,7 +2494,17 @@ function renderSnipe(){
   // The Snipe Log tracks the 0DTE board's own daily pick and settles at the
   // next close; it is not a record of the weekly or spreads boards, so it
   // only belongs under the mode it actually describes.
-  if(snipeMode==="0dte") renderSnipeLogSection(box);
+  if(LOGGED_BOARDS.includes(snipeMode)) renderSnipeLogSection(box, snipeMode);
+
+  // Gamma is a property of the underlying, not of any one board's scoring,
+  // so it hangs off the tab rather than a mode. Keyed to the first scanned
+  // symbol so it always has a concrete subject.
+  const gxSym = (snipeData.contracts && snipeData.contracts[0] && snipeData.contracts[0].underlying)
+             || (snipeData.spreads && snipeData.spreads[0] && snipeData.spreads[0].underlying)
+             || "SPY";
+  const gst = gammaState(gxSym);
+  if(!gst.loaded && !gst.loading) fetchGamma(gxSym);
+  renderGammaSection(box, gxSym);
 }
 
 /* Shared footer note. Prefers the server's own note (which spells out the
@@ -2395,7 +2523,7 @@ function snipeDisclaimer(data){
    with the single-leg columns -- there is no "P&L at +0.5%" for a position
    whose entire economics are the two strikes and the net debit. */
 function renderSpreadsTable(box, data, cfg){
-  const spreads = data.spreads||[];
+  const spreads = sortSnipeRows(data.spreads||[]);
   if(!spreads.length){
     const e=document.createElement("div"); e.className="empty-note";
     e.textContent=cfg.empty;
@@ -2450,22 +2578,116 @@ function renderSpreadsTable(box, data, cfg){
   box.append(snipeDisclaimer(data));
 }
 
+/* Gamma concentration sub-section.
+
+   Renders calls and puts as two opposed bars per strike, deliberately NOT
+   netted. The common "GEX" chart signs calls positive and puts negative and
+   draws a single flip level, which asserts that dealers are long calls and
+   short puts — open interest never says who holds which side. The backend
+   refuses to make that claim; drawing one merged bar here would smuggle it
+   back in through the visualization, so the two sides stay visually
+   separate and the caption says what the peak does and doesn't mean. */
+let gammaCache = {};  // symbol -> {data, loading, loaded}
+const gammaState = s => (gammaCache[s] ||= {data:null, loading:false, loaded:false});
+
+async function fetchGamma(symbol){
+  const st = gammaState(symbol);
+  if(st.loading) return;
+  st.loading=true; renderSnipe();
+  try{
+    const r=await fetch("/api/options/gamma?symbol="+encodeURIComponent(symbol)+"&top=14");
+    st.data=await r.json(); st.loaded=true;
+  }catch(e){ st.data={_error:String(e)}; }
+  st.loading=false; renderSnipe();
+}
+
+function renderGammaSection(box, symbol){
+  const st = gammaState(symbol);
+  const sec=document.createElement("div"); sec.className="gx-section";
+  const h=document.createElement("h3");
+  h.textContent="Gamma concentration by strike · "+symbol;
+  sec.append(h);
+
+  if(st.loading && !st.data){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="Loading gamma concentration…"; sec.append(e); box.append(sec); return;
+  }
+  if(!st.data || st.data._error){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="Gamma data unavailable"+(st.data&&st.data._error?" ("+st.data._error+")":"")+".";
+    sec.append(e); box.append(sec); return;
+  }
+  const d=st.data, strikes=d.strikes||[];
+  if(!strikes.length){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="No open interest with gamma in range."; sec.append(e); box.append(sec); return;
+  }
+
+  const legend=document.createElement("div"); legend.className="gx-legend";
+  const mk=(cls,label)=>{ const s=document.createElement("span");
+    const i=document.createElement("i"); i.style.background=cls; s.append(i,document.createTextNode(label)); return s; };
+  legend.append(mk("var(--up)","call gamma × OI"), mk("var(--down)","put gamma × OI"));
+  const spotNote=document.createElement("span");
+  spotNote.textContent = "spot "+(d.spot!=null?d.spot.toFixed(2):"—");
+  legend.append(spotNote);
+  sec.append(legend);
+
+  const peakVal = Math.max(...strikes.map(s=>Math.max(s.call,s.put)), 1);
+  const fmtB = v => v>=1e9 ? "$"+(v/1e9).toFixed(1)+"B"
+                  : v>=1e6 ? "$"+(v/1e6).toFixed(0)+"M" : "$"+v.toFixed(0);
+  for(const s of strikes){
+    const row=document.createElement("div"); row.className="gx-row";
+    const stk=document.createElement("div"); stk.className="gx-strike";
+    if(s.strike===d.peak_strike) stk.classList.add("peak");
+    if(d.spot && Math.abs(s.strike-d.spot)/d.spot < 0.005) stk.classList.add("atm");
+    stk.textContent=s.strike.toFixed(s.strike>=100?0:2);
+
+    // puts extend leftward, calls rightward, from a shared centre line
+    const putBar=document.createElement("div"); putBar.className="gx-bar put";
+    const pb=document.createElement("span"); pb.style.width=(100*s.put/peakVal).toFixed(1)+"%";
+    putBar.append(pb); putBar.title=`put gamma×OI ${fmtB(s.put)} · ${s.put_oi.toLocaleString()} OI`;
+
+    const callBar=document.createElement("div"); callBar.className="gx-bar call";
+    const cb=document.createElement("span"); cb.style.width=(100*s.call/peakVal).toFixed(1)+"%";
+    callBar.append(cb); callBar.title=`call gamma×OI ${fmtB(s.call)} · ${s.call_oi.toLocaleString()} OI`;
+
+    const val=document.createElement("div"); val.className="gx-val";
+    val.textContent = fmtB(s.call)+" / "+fmtB(s.put);
+    row.append(stk, putBar, callBar, val);
+    sec.append(row);
+  }
+
+  const note=document.createElement("div"); note.className="flow-note";
+  note.textContent = d.note || "";
+  sec.append(note);
+  box.append(sec);
+}
+
 /* Snipe Log sub-section, appended to the bottom of the Snipe tab (not its
    own top-level tab -- same feature, same fetch cadence). Renders the
    summary strip + entries table from snipeLogData, or an appropriate
    loading/error/empty state, plus the manual "snapshot now" button. */
-function renderSnipeLogSection(box){
+function renderSnipeLogSection(box, board){
+  const logSt = snipeLogState(board);
+  const snipeLogData = logSt.data, snipeLogLoading = logSt.loading;
   const sec=document.createElement("div"); sec.className="snipe-log-section";
-  const sh=document.createElement("h3"); sh.textContent="Snipe Log — forward paper-trading track record"; sec.append(sh);
+  const sh=document.createElement("h3");
+  sh.textContent = SNIPE_MODES[board].label + " Snipe Log — forward paper-trading track record";
+  sec.append(sh);
 
   const top=document.createElement("div"); top.className="flow-top";
   const left=document.createElement("div");
-  const k=document.createElement("div"); k.className="k"; k.textContent="Top pick logged daily · settled at next close";
+  const k=document.createElement("div"); k.className="k";
+  // Both boards settle on the contract's EXPIRY; for 0DTE that IS the day it
+  // was logged, which is why the two read differently.
+  k.textContent = board==="weekly"
+    ? "Top pick logged daily · settled at the underlying's close on expiry (~7d later)"
+    : "Top pick logged daily · settled at next close";
   left.append(k);
   const snapBtn=document.createElement("button"); snapBtn.className="flow-refresh";
   snapBtn.textContent = snipeSnapshotInFlight ? "SNAPSHOTTING…" : "SNAPSHOT TODAY'S PICK NOW";
   snapBtn.disabled = snipeSnapshotInFlight;
-  snapBtn.addEventListener("click", doSnipeSnapshot);
+  snapBtn.addEventListener("click", ()=>doSnipeSnapshot(board));
   top.append(left, snapBtn);
   sec.append(top);
 
@@ -2499,7 +2721,8 @@ function renderSnipeLogSection(box){
   const entries = snipeLogData.entries || [];
   if(!entries.length){
     const e=document.createElement("div"); e.className="empty-note";
-    e.textContent="No picks logged yet — the scheduler snapshots the top Snipe candidate ~30min before the close on weekdays, or use Snapshot now.";
+    e.textContent="No "+SNIPE_MODES[board].label+" picks logged yet — the scheduler snapshots each board's top candidate ~30min before the close on weekdays, or use Snapshot now."
+      + (board==="weekly" ? " Weekly picks stay OPEN until their expiry (~7 days), so the first settled result takes a week to arrive." : "");
     sec.append(e);
   } else {
     const tbl=document.createElement("table"); tbl.className="opt";
@@ -2531,7 +2754,15 @@ function renderSnipeLogSection(box){
 
       const td6=document.createElement("td");
       const pill=document.createElement("span"); pill.className="snipe-log-status "+e.status;
-      pill.textContent = e.status==="open" ? "OPEN" : "CLOSED";
+      // An open weekly pick waits 5-10 days for its expiry. Without the
+      // countdown that reads as a stalled log rather than a pending one --
+      // the 0DTE board settles overnight and sets the opposite expectation.
+      if(e.status==="open" && e.days_to_settle!=null){
+        pill.textContent = e.days_to_settle>0 ? "OPEN · "+e.days_to_settle+"D" : "OPEN";
+        pill.title = "settles at the underlying's close on "+(e.settles_on||"expiry");
+      } else {
+        pill.textContent = e.status==="open" ? "OPEN" : "CLOSED";
+      }
       td6.append(pill);
 
       const td7=document.createElement("td"); td7.className="num";
@@ -2590,7 +2821,7 @@ if(qp.get("tab")==="flow") fetchFlow();
 if(qp.get("tab")==="snipe"){
   document.querySelector("main").classList.add("snipe-active");
   fetchSnipe();
-  fetchSnipeLog();
+  fetchSnipeLog(snipeMode);
 }
 </script>
 </body>

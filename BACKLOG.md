@@ -4,35 +4,17 @@ Ideas that are worth doing but aren't being built yet. Each entry says what it
 is, why it's valuable, and what actually stands in the way — the blockers are
 the point, since several of these look cheaper than they are.
 
-Items 1–5 of the original Snipe-improvement list are being implemented now and
-so aren't repeated here. This file is 6–10 of that list.
-
----
-
-## 1. Weekly Snipe Log — forward track record for the ~7-DTE board
-
-**What:** The 0DTE Snipe board has a forward paper-trading log (`snipe_log.json`)
-— a daemon thread snapshots the top-scored pick ~30 min before the close, and
-the next read on a later day settles it against the underlying's real closing
-price. The Weekly board (`get_itm_scan_weekly`) has no equivalent, so there's
-no honest record of whether its scoring actually picks winners.
-
-**Why:** Without it, the Weekly Score is an untested hypothesis. The 0DTE log is
-the only reason the 0DTE score's calibration can be argued about with evidence
-instead of taste.
-
-**Blockers / notes:**
-- Settlement is genuinely different: the 0DTE log settles against *the next
-  day's* close, which works because the option expires the same day it was
-  logged. A weekly pick has to be settled against the underlying's close on
-  its actual expiry date, which may be 5–9 days after the snapshot — so the
-  resolver needs to look up a specific historical date, not just "the most
-  recent close."
-- The existing scheduler thread fires once per trading day near the close. A
-  weekly log needs entries to stay open across many scheduler runs and only
-  resolve when their own expiry date has passed.
-- Worth reusing `resolve_snipe_log`'s P&L math (intrinsic-at-close minus entry
-  ask, times 100) — that part is horizon-independent and already tested.
+**Done since this file was written:**
+- The probability/profit-magnitude sort toggle (was item 3) — Balanced /
+  Safer / Biggest swing, client-side, on all three boards.
+- The minimum reward:risk floor on spreads (was item 0) — framed as a
+  validity guard, not a risk preference, and disclosed in the board's note.
+- Gamma concentration by strike, backend only (was half of item 4).
+- The modeled historical simulation (was item 5). Its headline number is
+  not the finding; the vol-premium sensitivity is. See below.
+- The weekly forward paper-trading log (was item 1). One resolver now serves
+  both boards by settling on the contract's expiry rather than the log date;
+  for 0DTE those are the same day, so existing records were unaffected.
 
 ---
 
@@ -55,84 +37,85 @@ question a screener naturally raises and currently can't answer.
 - Requires an account-size input, which the app has never had. That's a new
   piece of user state to persist and a new (small) responsibility — worth
   being deliberate about rather than sneaking in a number field.
-- Depends on backlog item 1 for the weekly horizon (0DTE could use its
-  existing log today).
+- The weekly log this depended on now exists, so both boards can feed it —
+  but neither has a settled sample yet. The weekly board's first result
+  can't arrive until a logged pick reaches its expiry.
 
 ---
 
-## 3. Expose the probability/profit-magnitude split in the UI
+## 4. Gamma overlay — UI half
 
-**What:** `get_itm_scan_weekly` already returns `abs(delta)` (probability) and
-`scenarios.favorable.pnl_pct` (profit magnitude) unscaled, alongside the
-blended `weekly_score` — deliberately, because those two axes pull against each
-other and a single number can't honestly collapse them. Nothing in the UI
-surfaces that yet. Add a "Safer / Balanced / Biggest swing" sort toggle.
+**What:** `/api/options/gamma` and `get_gamma_exposure()` now exist: gamma
+concentration per strike, calls and puts separate, in dollars of delta per 1%
+move. Nothing in the UI shows it yet. Options: a panel on the Snipe tab, or
+markers on the existing network/price visualizations at the high-concentration
+strikes.
 
-**Why:** Cheapest item on this list by a wide margin — the backend data already
-exists and is already returned. It's pure front-end work in `renderSnipe()`.
+**Why:** It's positioning context nothing else in the app provides, and it's
+the piece that ties the options work back to CASCADE's actual thesis rather
+than being a bolted-on screener.
 
 **Blockers / notes:**
-- The Weekly board isn't wired into the UI at all yet (only
-  `/api/options/itm-scan` is fetched). That has to happen first, and is
-  arguably part of implementing item 1 of the active list.
-- Design question worth settling: does the toggle re-sort client-side from
-  data already fetched (simple, instant) or re-request with a sort param
-  (server authoritative, one more round trip)? Client-side re-sort is
-  probably right given the row count is capped at ~20.
+- Both original blockers are resolved. Gamma is present in CBOE's payload
+  (all 14,672 SPY rows; non-zero on 11,074), so no delta-difference
+  approximation is needed. And `_parse_chain` now takes `require_volume`,
+  so the untraded strikes holding 17% of open interest are reachable.
+- The remaining risk is presentational, and it's the important one. The
+  backend deliberately refuses to net calls against puts or infer dealer
+  positioning, because open interest never says who holds which side. A UI
+  that draws a single "gamma flip level" or labels a strike as a magnet
+  would smuggle that claim back in through the visualization after the API
+  carefully avoided making it. Show the two sides separately.
+- Worth deciding: is the peak strike genuinely useful to a user screening
+  single contracts, or is this a separate analytical view? On SPY it lands
+  near the money and mostly restates "the most open interest is near the
+  money", which may not earn its screen space on the candidate board.
 
 ---
 
-## 4. Dealer-positioning / gamma overlay near candidate strikes
+## 5. What the modeled simulation actually said
 
-**What:** Compute open-interest-weighted gamma exposure across the *full*
-chain (not just the ITM subset the Snipe boards filter to) to flag likely
-pin levels and support/resistance, then overlay those levels on the candidate
-list and/or the existing network visualization.
+Not a to-do — a result worth not losing, and one that inverted once the
+volatility input was fixed.
 
-**Why:** It's positioning context nothing else in the app provides, and it ties
-the options work back into CASCADE's actual thesis (cross-asset effects and
-propagation) rather than being a bolted-on screener.
+Buying a ~1% ITM weekly call over 2 years of daily bars, held to expiry,
+3% execution haircut. The two columns are the SAME trades priced off
+different volatility:
 
-**Blockers / notes:**
-- The full chain is already fetched per underlying, so the raw data is there
-  — but `_parse_chain` currently drops zero-volume contracts, and pin
-  analysis specifically cares about high-OI/low-volume strikes. That filter
-  would need to become conditional.
-- CBOE's feed carries `delta` and `theta` but gamma isn't confirmed present
-  in the payload — needs verification before designing around it. If absent,
-  it can be approximated from delta across adjacent strikes, with the
-  accuracy caveat that implies.
-- Genuine interpretation risk: dealer-positioning inference from public OI
-  is a heuristic built on assumptions about who's long vs short, which the
-  data doesn't actually say. Presenting it as fact would be the most
-  overconfident thing in the app. Label accordingly.
+| underlying | trades | win rate | priced off REALIZED vol | priced off REAL implied vol |
+|---|---|---|---|---|
+| SPY | 464 | 46.1% | +21.6% | **+5.8%** (^VIX) |
+| QQQ | 464 | 47.6% | +26.8% | **+14.5%** (^VXN) |
+| IWM | 464 | 46.8% | +21.5% | *no proxy — realized only* |
 
----
+**The realized-vol number was an artifact, and it was most of the result.**
+Options trade at implied, not realized; implied normally sits above it, so
+pricing entries off realized bought them too cheaply. Correcting that
+removed ~73% of SPY's apparent edge.
 
-## 5. Modeled historical backtest for the Weekly board
+What survives is thin. On SPY, at real implied vol:
 
-**What:** Simulate "buy the top-scored setup every Monday for the past N
-years" using Yahoo daily history (already fetched for the correlation feature)
-plus a stdlib Black-Scholes approximation to price the option at entry and
-exit.
+| vol premium | avg / trade | total |
+|---|---|---|
+| ×1.00 | +5.8% | +$41,334 |
+| ×1.10 | −0.0% | +$12,899 |
+| ×1.25 | −7.7% | −$30,466 |
 
-**Why:** Years of statistical signal immediately, versus one paper trade per
-day from the forward log. It's the only path to a sample size large enough to
-actually calibrate the scoring weights rather than guess them.
+So a 10% error in the volatility assumption — or equivalently, execution
+slightly worse than the 3% modeled — erases it entirely, and a 25% error
+makes it a losing strategy. Win rate is below 50% throughout, meaning
+what profit exists rides on a few large winners rather than consistency.
 
-**Blockers / notes:**
-- **This is a model, not a backtest, and must be labeled that way.** The
-  README is already explicit that no historical intraday options data exists
-  on this free feed — that's why the 0DTE board has a forward log instead.
-  Modeled prices inherit every assumption of the pricing model (constant vol,
-  no skew, no early exercise) and will systematically disagree with what
-  could actually have been filled.
-- Needs a historical volatility input per date to price with. Realized vol
-  from trailing daily bars is the honest choice, but it is *not* the implied
-  vol the contract would really have traded at, and the gap between them is
-  exactly the variance risk premium the strategy is exposed to. Overstating
-  results here is the default failure mode.
-- No bid/ask spread exists in a modeled price. Since spread is 15–25% of
-  every live score in this app, a modeled backtest that ignores it will look
-  materially better than reality. Apply a modeled spread haircut.
-- Depends on active-list item 2 (realized-vol computation) for the vol input.
+**Caveats that remain, in order of how much they'd move the number:**
+
+- IWM still has no implied-vol proxy (^RVX 404s on this feed, ^VXD returns
+  one bar), so its column is still the optimistic realized-vol figure and
+  is not comparable to the other two.
+- ^VIX/^VXN track the INDEX, not the ETF, and quote 30-day vol against
+  ~7-day contracts — term structure is ignored, and short-dated vol is
+  usually the more expensive end.
+- Two years is one regime, with no sustained bear market.
+
+**If anyone picks this up next:** a real IWM vol source, and short-dated
+rather than 30-day implied vol. Both push the same direction — toward the
+strategy looking worse, which is the direction worth being sure about.
