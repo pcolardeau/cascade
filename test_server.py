@@ -2083,6 +2083,33 @@ class WeeklySnipeLogTests(NetworkFreeTestCase):
         self.assertEqual(len(weekly["entries"]), 2)
         self.assertEqual(weekly["summary"]["trades"], 2)
 
+    def test_open_entries_report_when_they_will_settle(self):
+        """A weekly pick sits open for 5-10 days. Without a countdown that
+        reads as a stalled log rather than a pending one, since the 0DTE
+        board settles overnight and sets the opposite expectation."""
+        self.patch_server("_today_et", lambda: dt.date(2026, 8, 14))
+        self._write([self._entry(board="weekly", date="2026-08-10",
+                                 expiry="2026-08-21")])
+        e = server.get_snipe_log("weekly")["entries"][0]
+        self.assertEqual(e["settles_on"], "2026-08-21")
+        self.assertEqual(e["days_to_settle"], 7)
+
+    def test_closed_entries_get_no_countdown(self):
+        self.patch_server("_today_et", lambda: dt.date(2026, 9, 1))
+        self.patch_server("_closing_price_on", lambda s, d: 600.0)
+        self._write([self._entry(board="weekly", date="2026-08-03",
+                                 expiry="2026-08-14")])
+        e = server.get_snipe_log("weekly")["entries"][0]
+        self.assertEqual(e["status"], "closed")
+        self.assertNotIn("days_to_settle", e)
+
+    def test_malformed_expiry_does_not_break_the_countdown(self):
+        self.patch_server("_today_et", lambda: dt.date(2026, 8, 14))
+        self._write([self._entry(board="weekly", date="2026-08-10",
+                                 expiry="not-a-date")])
+        e = server.get_snipe_log("weekly")["entries"][0]
+        self.assertIsNone(e["days_to_settle"])
+
     def test_resolution_runs_across_all_boards_regardless_of_who_asks(self):
         """Settling is independent of which board is being read."""
         self.patch_server("_today_et", lambda: dt.date(2026, 9, 1))

@@ -394,6 +394,25 @@ table.opt tr.body:hover { background: var(--surface-3); cursor: pointer; }
    because that's the quantity "Biggest swing" actually ranks by */
 .snipe-pnl-pct { color: var(--ink-muted); font-size: 9px; }
 
+/* gamma concentration — calls and puts drawn as SEPARATE opposed bars, never
+   netted into one signed value. Netting would encode an assumption about who
+   holds which side of the open interest, which the data never says; the whole
+   point of the backend's design is to not make that claim, and a chart that
+   quietly re-introduces it would undo that. */
+.gx-section { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--grid); }
+.gx-section h3 { font-size: 10px; letter-spacing: 1.4px; color: var(--ink-muted); text-transform: uppercase; margin-bottom: 4px; }
+.gx-row { display: grid; grid-template-columns: 62px 1fr 1fr 92px; align-items: center; gap: 6px; height: 17px; }
+.gx-strike { font-size: 10px; text-align: right; color: var(--ink-2); }
+.gx-strike.peak { color: var(--accent); font-weight: 800; }
+.gx-strike.atm { color: var(--ink); }
+.gx-bar { height: 9px; position: relative; background: var(--surface-3); border-radius: 2px; }
+.gx-bar > span { position: absolute; top: 0; height: 100%; border-radius: 2px; }
+.gx-bar.call > span { right: 0; background: var(--up); }
+.gx-bar.put  > span { left: 0;  background: var(--down); }
+.gx-val { font-size: 9px; color: var(--ink-muted); }
+.gx-legend { display: flex; gap: 14px; font-size: 9px; color: var(--ink-muted); margin: 6px 0 8px; }
+.gx-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
+
 /* risk flags — penalties are shown, never silently applied. Each badge is a
    visible reason the score was reduced, so a low score is always legible. */
 .snipe-flags { display: inline-flex; flex-wrap: wrap; gap: 3px; }
@@ -2476,6 +2495,16 @@ function renderSnipe(){
   // next close; it is not a record of the weekly or spreads boards, so it
   // only belongs under the mode it actually describes.
   if(LOGGED_BOARDS.includes(snipeMode)) renderSnipeLogSection(box, snipeMode);
+
+  // Gamma is a property of the underlying, not of any one board's scoring,
+  // so it hangs off the tab rather than a mode. Keyed to the first scanned
+  // symbol so it always has a concrete subject.
+  const gxSym = (snipeData.contracts && snipeData.contracts[0] && snipeData.contracts[0].underlying)
+             || (snipeData.spreads && snipeData.spreads[0] && snipeData.spreads[0].underlying)
+             || "SPY";
+  const gst = gammaState(gxSym);
+  if(!gst.loaded && !gst.loading) fetchGamma(gxSym);
+  renderGammaSection(box, gxSym);
 }
 
 /* Shared footer note. Prefers the server's own note (which spells out the
@@ -2547,6 +2576,91 @@ function renderSpreadsTable(box, data, cfg){
   }
   cc.append(tbl); box.append(cc);
   box.append(snipeDisclaimer(data));
+}
+
+/* Gamma concentration sub-section.
+
+   Renders calls and puts as two opposed bars per strike, deliberately NOT
+   netted. The common "GEX" chart signs calls positive and puts negative and
+   draws a single flip level, which asserts that dealers are long calls and
+   short puts — open interest never says who holds which side. The backend
+   refuses to make that claim; drawing one merged bar here would smuggle it
+   back in through the visualization, so the two sides stay visually
+   separate and the caption says what the peak does and doesn't mean. */
+let gammaCache = {};  // symbol -> {data, loading, loaded}
+const gammaState = s => (gammaCache[s] ||= {data:null, loading:false, loaded:false});
+
+async function fetchGamma(symbol){
+  const st = gammaState(symbol);
+  if(st.loading) return;
+  st.loading=true; renderSnipe();
+  try{
+    const r=await fetch("/api/options/gamma?symbol="+encodeURIComponent(symbol)+"&top=14");
+    st.data=await r.json(); st.loaded=true;
+  }catch(e){ st.data={_error:String(e)}; }
+  st.loading=false; renderSnipe();
+}
+
+function renderGammaSection(box, symbol){
+  const st = gammaState(symbol);
+  const sec=document.createElement("div"); sec.className="gx-section";
+  const h=document.createElement("h3");
+  h.textContent="Gamma concentration by strike · "+symbol;
+  sec.append(h);
+
+  if(st.loading && !st.data){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="Loading gamma concentration…"; sec.append(e); box.append(sec); return;
+  }
+  if(!st.data || st.data._error){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="Gamma data unavailable"+(st.data&&st.data._error?" ("+st.data._error+")":"")+".";
+    sec.append(e); box.append(sec); return;
+  }
+  const d=st.data, strikes=d.strikes||[];
+  if(!strikes.length){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="No open interest with gamma in range."; sec.append(e); box.append(sec); return;
+  }
+
+  const legend=document.createElement("div"); legend.className="gx-legend";
+  const mk=(cls,label)=>{ const s=document.createElement("span");
+    const i=document.createElement("i"); i.style.background=cls; s.append(i,document.createTextNode(label)); return s; };
+  legend.append(mk("var(--up)","call gamma × OI"), mk("var(--down)","put gamma × OI"));
+  const spotNote=document.createElement("span");
+  spotNote.textContent = "spot "+(d.spot!=null?d.spot.toFixed(2):"—");
+  legend.append(spotNote);
+  sec.append(legend);
+
+  const peakVal = Math.max(...strikes.map(s=>Math.max(s.call,s.put)), 1);
+  const fmtB = v => v>=1e9 ? "$"+(v/1e9).toFixed(1)+"B"
+                  : v>=1e6 ? "$"+(v/1e6).toFixed(0)+"M" : "$"+v.toFixed(0);
+  for(const s of strikes){
+    const row=document.createElement("div"); row.className="gx-row";
+    const stk=document.createElement("div"); stk.className="gx-strike";
+    if(s.strike===d.peak_strike) stk.classList.add("peak");
+    if(d.spot && Math.abs(s.strike-d.spot)/d.spot < 0.005) stk.classList.add("atm");
+    stk.textContent=s.strike.toFixed(s.strike>=100?0:2);
+
+    // puts extend leftward, calls rightward, from a shared centre line
+    const putBar=document.createElement("div"); putBar.className="gx-bar put";
+    const pb=document.createElement("span"); pb.style.width=(100*s.put/peakVal).toFixed(1)+"%";
+    putBar.append(pb); putBar.title=`put gamma×OI ${fmtB(s.put)} · ${s.put_oi.toLocaleString()} OI`;
+
+    const callBar=document.createElement("div"); callBar.className="gx-bar call";
+    const cb=document.createElement("span"); cb.style.width=(100*s.call/peakVal).toFixed(1)+"%";
+    callBar.append(cb); callBar.title=`call gamma×OI ${fmtB(s.call)} · ${s.call_oi.toLocaleString()} OI`;
+
+    const val=document.createElement("div"); val.className="gx-val";
+    val.textContent = fmtB(s.call)+" / "+fmtB(s.put);
+    row.append(stk, putBar, callBar, val);
+    sec.append(row);
+  }
+
+  const note=document.createElement("div"); note.className="flow-note";
+  note.textContent = d.note || "";
+  sec.append(note);
+  box.append(sec);
 }
 
 /* Snipe Log sub-section, appended to the bottom of the Snipe tab (not its
@@ -2640,7 +2754,15 @@ function renderSnipeLogSection(box, board){
 
       const td6=document.createElement("td");
       const pill=document.createElement("span"); pill.className="snipe-log-status "+e.status;
-      pill.textContent = e.status==="open" ? "OPEN" : "CLOSED";
+      // An open weekly pick waits 5-10 days for its expiry. Without the
+      // countdown that reads as a stalled log rather than a pending one --
+      // the 0DTE board settles overnight and sets the opposite expectation.
+      if(e.status==="open" && e.days_to_settle!=null){
+        pill.textContent = e.days_to_settle>0 ? "OPEN · "+e.days_to_settle+"D" : "OPEN";
+        pill.title = "settles at the underlying's close on "+(e.settles_on||"expiry");
+      } else {
+        pill.textContent = e.status==="open" ? "OPEN" : "CLOSED";
+      }
       td6.append(pill);
 
       const td7=document.createElement("td"); td7.className="num";

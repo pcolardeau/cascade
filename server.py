@@ -2227,6 +2227,20 @@ def get_snipe_log(board=DEFAULT_SNIPE_BOARD):
     entries = ([e for e in all_entries if _entry_board(e) == board]
                if board else all_entries)
     ordered = sorted(entries, key=lambda e: e.get("date", ""), reverse=True)
+    # Annotate open entries with when they'll settle. A weekly pick sits open
+    # for 5-10 days, which without this reads as a stalled or broken log
+    # rather than one that is simply waiting -- the 0DTE board settles
+    # overnight and set that expectation.
+    today = _today_et()
+    for e in ordered:
+        if e.get("status") != "open":
+            continue
+        settle_date = _entry_settle_date(e)
+        e["settles_on"] = settle_date
+        try:
+            e["days_to_settle"] = (dt.date.fromisoformat(settle_date) - today).days
+        except (ValueError, TypeError):
+            e["days_to_settle"] = None
     closed = [e for e in entries if e.get("status") == "closed"]
     n = len(closed)
     if n == 0:
