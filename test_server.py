@@ -1034,15 +1034,32 @@ class GetItmScanWeeklyTests(NetworkFreeTestCase):
                                expected_pnl_dollars / 600.0, places=4)
 
     def test_dte_within_default_window_is_included(self):
-        """target_dte=7, window=2 (defaults) -> dte in [5,9] included."""
-        self._patch(500.0, [_snipe_contract(dte=5), _snipe_contract(dte=9)])
+        """target_dte=7, window=3 (defaults) -> dte in [4,10] included."""
+        self._patch(500.0, [_snipe_contract(dte=4), _snipe_contract(dte=10)])
         out = server.get_itm_scan_weekly(["SPY"])
         self.assertEqual(len(out["contracts"]), 2)
 
     def test_dte_outside_default_window_is_excluded(self):
-        self._patch(500.0, [_snipe_contract(dte=4), _snipe_contract(dte=10)])
+        self._patch(500.0, [_snipe_contract(dte=3), _snipe_contract(dte=11)])
         out = server.get_itm_scan_weekly(["SPY"])
         self.assertEqual(out["contracts"], [])
+
+    def test_default_window_spans_a_full_weekly_expiry_cycle(self):
+        """Regression guard for the reason the default is 3 and not 2:
+        weekly expiries are 7 calendar days apart, so the window has to
+        span 7 days to be guaranteed to contain one. Names carrying only
+        Friday weeklies (verified live on SMCI/WMT/COIN) list expiries at
+        3/10/17 DTE with nothing between, which a [5,9] window misses
+        entirely -- returning an empty board rather than a real answer."""
+        lo, hi = 7 - server._DEFAULT_DTE_WINDOW, 7 + server._DEFAULT_DTE_WINDOW
+        self.assertGreaterEqual(hi - lo + 1, 7,
+                                "window must span a full weekly expiry cycle")
+        friday_only = [_snipe_contract(dte=d) for d in (3, 10, 17)]
+        self._patch(500.0, friday_only)
+        out = server.get_itm_scan_weekly(["SPY"])
+        self.assertEqual(len(out["contracts"]), 1,
+                         "a Friday-weeklies-only chain must still yield a candidate")
+        self.assertEqual(out["contracts"][0]["dte"], 10)
 
     def test_custom_target_dte_and_window(self):
         self._patch(500.0, [_snipe_contract(dte=13), _snipe_contract(dte=20)])
@@ -1423,7 +1440,8 @@ class ItmScanEndpointHorizonRoutingTests(NetworkFreeTestCase):
         self.assertNotIn("0dte", calls)
         args, _kw = calls["weekly"]
         self.assertEqual(args[1], 7, "target_dte is threaded through")
-        self.assertEqual(args[2], 2, "window defaults to 2")
+        self.assertEqual(args[2], server._DEFAULT_DTE_WINDOW,
+                         "window falls back to the shared default")
 
     def test_custom_window_is_threaded_through(self):
         calls = self._record_calls()

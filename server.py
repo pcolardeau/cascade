@@ -133,6 +133,20 @@ OPTION_SCAN = [
 # end-to-end. Add it later if CBOE's index-option support turns out sturdier.
 SNIPE_SCAN = ["SPY", "QQQ", "IWM"]
 
+# Default +/- tolerance, in calendar days, around a target DTE (see
+# get_itm_scan_weekly / get_debit_spreads). 3, not 2, because [target-3,
+# target+3] spans exactly 7 calendar days and weekly option expiries are 7
+# days apart -- so any 7-day span contains exactly one Friday, which makes 3
+# the smallest window that GUARANTEES a hit for names carrying only Friday
+# weeklies. At 2 the window is [5,9] and misses them outright: SMCI, WMT and
+# COIN were all verified to list expiries at 3/10/17 DTE with nothing in
+# between, so a ~7-DTE scan of any of them returned zero candidates. Going
+# wider than 3 buys no additional coverage on the names checked (4 caught
+# nothing 3 didn't) and only mixes more disparate horizons into one board,
+# so this stops at the principled minimum rather than padding for safety.
+# SPY/QQQ/IWM list near-daily expiries and are unaffected either way.
+_DEFAULT_DTE_WINDOW = 3
+
 # Forward paper-trading log for the Snipe board's top-scored pick each day --
 # see snapshot_snipe_pick()/resolve_snipe_log() below. Lives next to server.py
 # (not under a data/ subdir) to match this project's flat, no-build-step layout.
@@ -1153,7 +1167,7 @@ def _weekly_itm_scan_score(delta, spread_pct, magnitude_pnl_pct, extrinsic_ratio
                          _WEEKLY_THETA_WEIGHT * theta), 1)
 
 
-def get_itm_scan_weekly(symbols=None, target_dte=7, window=2, top=20):
+def get_itm_scan_weekly(symbols=None, target_dte=7, window=_DEFAULT_DTE_WINDOW, top=20):
     """Scan SNIPE_SCAN underlyings for ~week-out deep-ITM candidates ranked
     by probability blended with profit magnitude, not the 0DTE board's
     "small and repeatable" goal -- see _weekly_itm_scan_score.
@@ -1326,7 +1340,7 @@ def _spread_score(short_delta, reward_risk, cost_pct):
                          _SPREAD_COST_WEIGHT * cost), 1)
 
 
-def get_debit_spreads(symbols=None, target_dte=7, window=2, top=20):
+def get_debit_spreads(symbols=None, target_dte=7, window=_DEFAULT_DTE_WINDOW, top=20):
     """Build and rank vertical debit spreads (long ITM leg + short leg
     further out) across the scanned underlyings.
 
@@ -1835,7 +1849,7 @@ class Handler(BaseHTTPRequestHandler):
         top = int(self._qparam(query, "top", "20"))
         target_dte = int(self._qparam(query, "target_dte", "0"))
         if target_dte > 0:
-            window = int(self._qparam(query, "window", "2"))
+            window = int(self._qparam(query, "window", str(_DEFAULT_DTE_WINDOW)))
             return get_itm_scan_weekly(syms, target_dte, window, top)
         down = float(self._qparam(query, "down", "-0.005"))
         flat = float(self._qparam(query, "flat", "0.0"))
@@ -1846,14 +1860,14 @@ class Handler(BaseHTTPRequestHandler):
         syms = self._qsymbols(query, default=SNIPE_SCAN)
         top = int(self._qparam(query, "top", "20"))
         target_dte = int(self._qparam(query, "target_dte", "7"))
-        window = int(self._qparam(query, "window", "2"))
+        window = int(self._qparam(query, "window", str(_DEFAULT_DTE_WINDOW)))
         return get_itm_scan_weekly(syms, target_dte, window, top)
 
     def _api_options_debit_spreads(self, query):
         syms = self._qsymbols(query, default=SNIPE_SCAN)
         top = int(self._qparam(query, "top", "20"))
         target_dte = int(self._qparam(query, "target_dte", "7"))
-        window = int(self._qparam(query, "window", "2"))
+        window = int(self._qparam(query, "window", str(_DEFAULT_DTE_WINDOW)))
         return get_debit_spreads(syms, target_dte, window, top)
 
     def _api_snipe_log(self, query):
