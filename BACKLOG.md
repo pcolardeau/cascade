@@ -4,8 +4,33 @@ Ideas that are worth doing but aren't being built yet. Each entry says what it
 is, why it's valuable, and what actually stands in the way — the blockers are
 the point, since several of these look cheaper than they are.
 
-Items 1–5 of the original Snipe-improvement list are being implemented now and
-so aren't repeated here. This file is 6–10 of that list.
+**Done since this file was written:** the probability/profit-magnitude sort
+toggle (was item 3) shipped — Balanced / Safer / Biggest swing, client-side,
+on all three boards.
+
+---
+
+## 0. Minimum reward:risk floor on the spreads board
+
+**What:** `get_debit_spreads` accepts any pairing where `0 < net_debit <
+width`. That admits spreads like SPY 735/740 at a $498 debit for a $2 max
+gain — a 0.00× reward:risk. Technically a valid debit spread; economically
+pointless, since it needs a ~99.6% win rate just to cover the debit, before
+commission.
+
+**Why:** They're invisible under the default Balanced sort (the Spread Score
+buries them on the reward term), but "Safer" ranks by short-leg delta alone
+and floats them straight to the top — so the sort toggle that just shipped
+made a pre-existing wart newly prominent.
+
+**Blockers / notes:**
+- Mostly a question of what the floor should be, not how to implement it. A
+  fixed minimum (say 0.15×) is crude but honest; scaling it with DTE would be
+  better-founded, since a longer hold needs more edge to be worth the capital.
+- Alternative to filtering: keep them but flag them, consistent with how
+  every other risk signal on these boards behaves. That may be the more
+  in-keeping answer — the boards' whole design is "penalize and explain,
+  don't hide."
 
 ---
 
@@ -57,28 +82,6 @@ question a screener naturally raises and currently can't answer.
   being deliberate about rather than sneaking in a number field.
 - Depends on backlog item 1 for the weekly horizon (0DTE could use its
   existing log today).
-
----
-
-## 3. Expose the probability/profit-magnitude split in the UI
-
-**What:** `get_itm_scan_weekly` already returns `abs(delta)` (probability) and
-`scenarios.favorable.pnl_pct` (profit magnitude) unscaled, alongside the
-blended `weekly_score` — deliberately, because those two axes pull against each
-other and a single number can't honestly collapse them. Nothing in the UI
-surfaces that yet. Add a "Safer / Balanced / Biggest swing" sort toggle.
-
-**Why:** Cheapest item on this list by a wide margin — the backend data already
-exists and is already returned. It's pure front-end work in `renderSnipe()`.
-
-**Blockers / notes:**
-- The Weekly board isn't wired into the UI at all yet (only
-  `/api/options/itm-scan` is fetched). That has to happen first, and is
-  arguably part of implementing item 1 of the active list.
-- Design question worth settling: does the toggle re-sort client-side from
-  data already fetched (simple, instant) or re-request with a sort param
-  (server authoritative, one more round trip)? Client-side re-sort is
-  probably right given the row count is capped at ~20.
 
 ---
 
@@ -135,4 +138,5 @@ actually calibrate the scoring weights rather than guess them.
 - No bid/ask spread exists in a modeled price. Since spread is 15–25% of
   every live score in this app, a modeled backtest that ignores it will look
   materially better than reality. Apply a modeled spread haircut.
-- Depends on active-list item 2 (realized-vol computation) for the vol input.
+- The realized-vol input this needs now exists (`realized_vol()` in server.py),
+  so that dependency is cleared.

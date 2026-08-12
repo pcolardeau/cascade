@@ -383,6 +383,17 @@ table.opt tr.body:hover { background: var(--surface-3); cursor: pointer; }
   color: var(--accent); border-color: var(--accent); background: var(--accent-dim);
 }
 
+/* sort toggle, right-aligned in the mode row. A view control only — it
+   reorders rows, it does not change any score or what the log records. */
+.snipe-sort { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; }
+.snipe-sort-label {
+  font-size: 8.5px; letter-spacing: 1px; text-transform: uppercase;
+  color: var(--ink-muted); margin-right: 2px;
+}
+/* return-on-capital shown next to the dollar figure on the magnitude column,
+   because that's the quantity "Biggest swing" actually ranks by */
+.snipe-pnl-pct { color: var(--ink-muted); font-size: 9px; }
+
 /* risk flags — penalties are shown, never silently applied. Each badge is a
    visible reason the score was reduced, so a low score is always legible. */
 .snipe-flags { display: inline-flex; flex-wrap: wrap; gap: 3px; }
@@ -2171,9 +2182,50 @@ const SNIPE_MODES = {
     ranked: "Spreads · ranked by Spread Score (probability of max profit + reward per dollar risked + execution cost)",
   },
 };
+/* Probability and profit magnitude genuinely pull against each other in
+   options pricing — deeper ITM is likelier but less leveraged, nearer the
+   money is the reverse — so no single composite honestly answers both. The
+   server already returns both axes unscaled alongside the blended score
+   precisely so the client can rank by either one. This is a VIEW control:
+   it reorders rows you can already see, and changes neither the scores
+   themselves nor what the Snipe Log records. */
+const SNIPE_SORTS = {
+  score:     { label: "Balanced",     hint: "the board's blended score" },
+  prob:      { label: "Safer",        hint: "highest probability first (delta)" },
+  magnitude: { label: "Biggest swing", hint: "largest payoff first" },
+};
+/* Per-board accessors, since "probability" and "magnitude" live in different
+   fields on each board (and on spreads, probability is the SHORT leg's delta
+   — that's the leg whose outcome decides whether max profit is reached). */
+const SNIPE_SORT_KEYS = {
+  "0dte": {
+    score: o => o.score,
+    prob: o => Math.abs(o.delta ?? 0),
+    magnitude: o => (o.scenarios?.up?.pnl_pct ?? -Infinity),
+  },
+  "weekly": {
+    score: o => o.weekly_score,
+    prob: o => Math.abs(o.delta ?? 0),
+    magnitude: o => (o.scenarios?.favorable?.pnl_pct ?? -Infinity),
+  },
+  "spreads": {
+    score: s => s.spread_score,
+    prob: s => Math.abs(s.short_delta ?? 0),
+    magnitude: s => (s.reward_risk ?? -Infinity),
+  },
+};
 let snipeMode = "0dte";
+let snipeSort = "score";
 const snipeCache = {};  // mode -> {data, loading, loaded}
 const snipeState = m => (snipeCache[m] ||= {data:null, loading:false, loaded:false});
+
+/* Client-side re-sort of already-fetched rows: the list is capped at ~20, so
+   a round trip to re-rank server-side would add latency for nothing. */
+function sortSnipeRows(rows){
+  const key = (SNIPE_SORT_KEYS[snipeMode] || {})[snipeSort];
+  if(!key) return rows;
+  return [...rows].sort((a,b) => (key(b) ?? -Infinity) - (key(a) ?? -Infinity));
+}
 
 let snipeLogData=null, snipeLogLoading=false, snipeLogLoaded=false, snipeSnapshotInFlight=false;
 const fmtUsd = v => (v==null ? "—" : (v<0?"-":"")+"$"+Math.abs(v).toFixed(2));
@@ -2274,6 +2326,19 @@ function renderSnipe(){
     });
     modes.append(b);
   }
+  const sortWrap=document.createElement("span"); sortWrap.className="snipe-sort";
+  const sortLbl=document.createElement("span"); sortLbl.className="snipe-sort-label";
+  sortLbl.textContent="sort";
+  sortWrap.append(sortLbl);
+  for(const [id,s] of Object.entries(SNIPE_SORTS)){
+    const b=document.createElement("button");
+    b.textContent=s.label;
+    b.title=s.hint;
+    if(id===snipeSort) b.className="on";
+    b.addEventListener("click",()=>{ if(snipeSort!==id){ snipeSort=id; renderSnipe(); } });
+    sortWrap.append(b);
+  }
+  modes.append(sortWrap);
   box.append(modes);
 
   if(snipeLoading && !snipeData){
@@ -2289,7 +2354,7 @@ function renderSnipe(){
 
   if(snipeMode==="spreads"){ renderSpreadsTable(box, snipeData, cfg); return; }
 
-  const contracts = snipeData.contracts||[];
+  const contracts = sortSnipeRows(snipeData.contracts||[]);
   if(!contracts.length){
     const e=document.createElement("div"); e.className="empty-note";
     e.textContent=cfg.empty;
@@ -2336,9 +2401,20 @@ function renderSnipe(){
       const tdFlags=document.createElement("td"); tdFlags.append(renderFlags(o.flags));
 
       const sc = o.scenarios||{};
-      const pnlCell = v => {
+      /* `pct` is shown alongside the dollars on the MAGNITUDE column only.
+         That column is what "Biggest swing" sorts by, and it sorts on return
+         on capital (pnl_pct), not raw dollars — a $1412 contract returning
+         $1245 is a worse trade than a $1017 one returning $934. Without the
+         percentage visible the rows look mis-sorted, because the eye reads
+         the dollar figure and the ranking is on the ratio. */
+      const pnlCell = (v, pct) => {
         const td=document.createElement("td"); td.className="num";
         td.textContent = v!=null ? fmtUsd(v) : "—";
+        if(v!=null && pct!=null){
+          const p=document.createElement("span"); p.className="snipe-pnl-pct";
+          p.textContent = " " + (pct*100).toFixed(0) + "%";
+          td.append(p);
+        }
         if(v!=null) td.style.color = v<0 ? "var(--down)" : "var(--up)";
         return td;
       };
@@ -2352,7 +2428,8 @@ function renderSnipe(){
         const tdExtr=document.createElement("td"); tdExtr.className="num"; tdExtr.textContent=fmtPct1(o.extrinsic_ratio);
         tr.append(td1,td2,tdScore,td3,tdDte,tdDelta,tdIvRv,tdSpread,tdBidAsk,tdCost,tdBe,tdMove,
                   pnlCell(sc.flat?sc.flat.pnl_dollars:null),
-                  pnlCell(sc.favorable?sc.favorable.pnl_dollars:null),
+                  pnlCell(sc.favorable?sc.favorable.pnl_dollars:null,
+                          sc.favorable?sc.favorable.pnl_pct:null),
                   tdExtr,tdFlags);
       } else {
         const tdCushion=document.createElement("td"); tdCushion.className="num"; tdCushion.textContent=fmtPct1(o.breakeven_cushion_pct);
@@ -2362,7 +2439,8 @@ function renderSnipe(){
         tr.append(td1,td2,tdScore,td3,tdDelta,tdSpread,tdBidAsk,tdCost,tdBe,tdCushion,
                   pnlCell(sc.down?sc.down.pnl_dollars:null),
                   pnlCell(sc.flat?sc.flat.pnl_dollars:null),
-                  pnlCell(sc.up?sc.up.pnl_dollars:null),
+                  pnlCell(sc.up?sc.up.pnl_dollars:null,
+                          sc.up?sc.up.pnl_pct:null),
                   tdTier,tdFlags);
       }
       if(fromY[o.underlying]!=null) tr.addEventListener("click",()=>selectNode(fromY[o.underlying]));
@@ -2395,7 +2473,7 @@ function snipeDisclaimer(data){
    with the single-leg columns -- there is no "P&L at +0.5%" for a position
    whose entire economics are the two strikes and the net debit. */
 function renderSpreadsTable(box, data, cfg){
-  const spreads = data.spreads||[];
+  const spreads = sortSnipeRows(data.spreads||[]);
   if(!spreads.length){
     const e=document.createElement("div"); e.className="empty-note";
     e.textContent=cfg.empty;
