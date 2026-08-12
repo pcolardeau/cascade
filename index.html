@@ -27,6 +27,10 @@
   --s-health:    #9085e9;
   --s-consumer:  #c46dc4;
   --s-indus:     #d55181;
+  --s-utilities: #4aa3a3;
+  --s-realestate:#8d7b5a;
+  --s-materials: #a2703c;
+  --s-comms:     #5b74c9;
   --s-macro:     #d95926;
   /* diverging pair for correlation: blue(+) / red(−), neutral midpoint */
   --div-pos:     #3987e5;
@@ -184,6 +188,29 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
 .order-key.show { display: flex; }
 .order-key .li { display: flex; align-items: center; gap: 8px; font-size: 10px; color: var(--ink-2); }
 .order-key svg { flex: 0 0 auto; }
+
+/* index view (cosmos.gl, all 503) — a sibling layer to the SVG, not a
+   replacement, so the curated graph keeps everything cosmos.gl can't do:
+   per-node text labels, dashed hop-order edges, and the pinned radial
+   cascade. Labels here are on-demand only, which is the right call at 503
+   nodes regardless of renderer. */
+#index-stage { position: absolute; inset: 0; display: none; }
+#index-stage.on { display: block; }
+#index-label {
+  position: absolute; z-index: 20; pointer-events: none; display: none;
+  background: rgba(26,26,25,0.97); border: 1px solid var(--border); border-radius: 5px;
+  padding: 5px 8px; font-size: 11px; box-shadow: 0 6px 24px rgba(0,0,0,0.5);
+}
+#index-label .tk { font-weight: 800; }
+#index-label .sec { color: var(--ink-muted); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.6px; }
+#index-note {
+  position: absolute; left: 12px; bottom: 12px; z-index: 15; display: none;
+  background: rgba(20,20,19,0.88); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; font-size: 10px; color: var(--ink-2); max-width: 430px;
+  line-height: 1.5; backdrop-filter: blur(6px);
+}
+#index-note.on { display: block; }
+.tbtn.on { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
 
 /* node/edge svg styling */
 .edge { stroke: var(--baseline); fill: none; transition: stroke 0.3s, opacity 0.3s, stroke-width 0.3s; }
@@ -501,6 +528,13 @@ footer b { color: var(--ink-2); font-weight: 600; }
   <!-- center: network -->
   <section id="stage-wrap">
     <svg id="stage"></svg>
+    <!-- Index view: all 503 S&P names on the GPU. Hidden until asked for, and
+         it renders into its own canvas rather than replacing the SVG, so the
+         curated graph keeps its labels, dashed hop-order edges and radial
+         cascade layout untouched. -->
+    <div id="index-stage"></div>
+    <div id="index-label"></div>
+    <div id="index-note"></div>
     <div class="toolbar">
       <div class="tool-group">
         <span class="tool-label">Shock</span>
@@ -516,6 +550,7 @@ footer b { color: var(--ink-2); font-weight: 600; }
       <button class="tbtn" id="btn-clear">CLEAR</button>
       <button class="tbtn" id="btn-reheat">RE-LAYOUT</button>
       <button class="tbtn" id="btn-sync-corr" title="Rebuild the correlation network from 6mo live daily history">SYNC HISTORY</button>
+      <button class="tbtn" id="btn-index-view" title="Render all 503 S&amp;P 500 names on the GPU. The curated graph keeps labels and hop-order edges; this view trades those for scale.">INDEX VIEW</button>
       <span class="badge" id="corr-status">CORRELATION MODEL SYNTHETIC</span>
     </div>
     <div class="legend" id="legend"></div>
@@ -562,6 +597,7 @@ footer b { color: var(--ink-2); font-weight: 600; }
 
 <div id="tip"></div>
 
+<script src="/vendor/cosmos.umd.js"></script>
 <script>
 "use strict";
 /* ============================================================================
@@ -583,6 +619,15 @@ const SECTORS = [
   { id:"health",   label:"Healthcare",     color:"var(--s-health)",   hex:"#9085e9" },
   { id:"consumer", label:"Consumer",       color:"var(--s-consumer)", hex:"#c46dc4" },
   { id:"indus",    label:"Industrials",    color:"var(--s-indus)",    hex:"#d55181" },
+  // Added with the S&P 500 library: these four GICS sectors cover 110 index
+  // members (22%), which previously had no bucket at all. Folding them into
+  // the nearest existing sector would have mislabelled a fifth of the index
+  // AND distorted the synthetic correlations, since sector drives the factor
+  // exposure below.
+  { id:"utilities", label:"Utilities",     color:"var(--s-utilities)", hex:"#4aa3a3" },
+  { id:"realestate",label:"Real Estate",   color:"var(--s-realestate)",hex:"#8d7b5a" },
+  { id:"materials", label:"Materials",     color:"var(--s-materials)", hex:"#a2703c" },
+  { id:"comms",     label:"Communication", color:"var(--s-comms)",     hex:"#5b74c9" },
   { id:"macro",    label:"Markets / Macro",color:"var(--s-macro)",    hex:"#d95926" },
 ];
 const SECTOR_BY_ID = Object.fromEntries(SECTORS.map(s=>[s.id,s]));
@@ -607,6 +652,530 @@ const UNIVERSE = [
   ["XAU","Gold Spot","macro",3],["US10Y","10-Yr Treasury Yield","macro",3],["DXY","US Dollar Index","macro",3],
 ];
 
+/* ---------- searchable S&P 500 library ----------------------------------
+   [ticker, name, sector] for every S&P 500 constituent. This is the SEARCH
+   library, not the graph: the rendered universe stays curated (UNIVERSE
+   above plus whatever the user saves), because 503 nodes of thresholded
+   correlation is a hairball, and a live correlation sync across 503 symbols
+   measures at ~6 minutes serialized behind Yahoo's rate limiter.
+
+   Baked in as a literal rather than fetched: the app has no build step, and
+   a runtime fetch would add both a dependency and a failure mode for data
+   that changes a handful of times a year. Sectors are mapped from GICS,
+   with semiconductors split out of Information Technology by sub-industry
+   to match the existing `semi` bucket. Regenerate from
+   datasets/s-and-p-500-companies when it drifts.
+
+   Tickers use Yahoo's dash form (BRK-B, not BRK.B) so they resolve against
+   the quote and history endpoints without translation. */
+const SP500 = [
+  ["A","Agilent Technologies","health"],
+  ["AAPL","Apple Inc.","tech"],
+  ["ABBV","AbbVie","health"],
+  ["ABNB","Airbnb","consumer"],
+  ["ABT","Abbott Laboratories","health"],
+  ["ACGL","Arch Capital Group","fin"],
+  ["ACN","Accenture","tech"],
+  ["ADBE","Adobe Inc.","tech"],
+  ["ADI","Analog Devices","semi"],
+  ["ADM","Archer Daniels Midland","consumer"],
+  ["ADP","Automatic Data Processing","indus"],
+  ["ADSK","Autodesk","tech"],
+  ["AEE","Ameren","utilities"],
+  ["AEP","American Electric Power","utilities"],
+  ["AES","AES Corporation","utilities"],
+  ["AFL","Aflac","fin"],
+  ["AIG","American International Group","fin"],
+  ["AIZ","Assurant","fin"],
+  ["AJG","Arthur J. Gallagher & Co.","fin"],
+  ["AKAM","Akamai Technologies","tech"],
+  ["ALB","Albemarle Corporation","materials"],
+  ["ALGN","Align Technology","health"],
+  ["ALL","Allstate","fin"],
+  ["ALLE","Allegion","indus"],
+  ["AMAT","Applied Materials","semi"],
+  ["AMCR","Amcor","materials"],
+  ["AMD","Advanced Micro Devices","semi"],
+  ["AME","Ametek","indus"],
+  ["AMGN","Amgen","health"],
+  ["AMP","Ameriprise Financial","fin"],
+  ["AMT","American Tower","realestate"],
+  ["AMZN","Amazon","consumer"],
+  ["ANET","Arista Networks","tech"],
+  ["AON","Aon plc","fin"],
+  ["AOS","A. O. Smith","indus"],
+  ["APA","APA Corporation","energy"],
+  ["APD","Air Products","materials"],
+  ["APH","Amphenol","tech"],
+  ["APO","Apollo Global Management","fin"],
+  ["APP","AppLovin","comms"],
+  ["APTV","Aptiv","consumer"],
+  ["ARE","Alexandria Real Estate Equities","realestate"],
+  ["ARES","Ares Management","fin"],
+  ["ATO","Atmos Energy","utilities"],
+  ["AVB","AvalonBay Communities","realestate"],
+  ["AVGO","Broadcom","semi"],
+  ["AVY","Avery Dennison","materials"],
+  ["AWK","American Water Works","utilities"],
+  ["AXON","Axon Enterprise","indus"],
+  ["AXP","American Express","fin"],
+  ["AZO","AutoZone","consumer"],
+  ["BA","Boeing","indus"],
+  ["BAC","Bank of America","fin"],
+  ["BALL","Ball Corporation","materials"],
+  ["BAX","Baxter International","health"],
+  ["BBY","Best Buy","consumer"],
+  ["BDX","Becton Dickinson","health"],
+  ["BEN","Franklin Resources","fin"],
+  ["BF-B","Brown–Forman","consumer"],
+  ["BG","Bunge Global","consumer"],
+  ["BIIB","Biogen","health"],
+  ["BKNG","Booking Holdings","consumer"],
+  ["BKR","Baker Hughes","energy"],
+  ["BLDR","Builders FirstSource","indus"],
+  ["BLK","BlackRock","fin"],
+  ["BMY","Bristol Myers Squibb","health"],
+  ["BNY","BNY Mellon","fin"],
+  ["BR","Broadridge Financial Solutions","indus"],
+  ["BRK-B","Berkshire Hathaway","fin"],
+  ["BRO","Brown & Brown","fin"],
+  ["BSX","Boston Scientific","health"],
+  ["BX","Blackstone Inc.","fin"],
+  ["BXP","BXP, Inc.","realestate"],
+  ["C","Citigroup","fin"],
+  ["CAH","Cardinal Health","health"],
+  ["CARR","Carrier Global","indus"],
+  ["CASY","Casey's","consumer"],
+  ["CAT","Caterpillar Inc.","indus"],
+  ["CB","Chubb Limited","fin"],
+  ["CBOE","Cboe Global Markets","fin"],
+  ["CBRE","CBRE Group","realestate"],
+  ["CCI","Crown Castle","realestate"],
+  ["CCL","Carnival Corporation","consumer"],
+  ["CDNS","Cadence Design Systems","tech"],
+  ["CDW","CDW Corporation","tech"],
+  ["CEG","Constellation Energy","utilities"],
+  ["CF","CF Industries","materials"],
+  ["CFG","Citizens Financial Group","fin"],
+  ["CHD","Church & Dwight","consumer"],
+  ["CHRW","C.H. Robinson","indus"],
+  ["CHTR","Charter Communications","comms"],
+  ["CI","Cigna","health"],
+  ["CIEN","Ciena","tech"],
+  ["CINF","Cincinnati Financial","fin"],
+  ["CL","Colgate-Palmolive","consumer"],
+  ["CLX","Clorox","consumer"],
+  ["CMCSA","Comcast","comms"],
+  ["CME","CME Group","fin"],
+  ["CMG","Chipotle Mexican Grill","consumer"],
+  ["CMI","Cummins","indus"],
+  ["CMS","CMS Energy","utilities"],
+  ["CNC","Centene Corporation","health"],
+  ["CNP","CenterPoint Energy","utilities"],
+  ["COF","Capital One","fin"],
+  ["COHR","Coherent Corp.","tech"],
+  ["COIN","Coinbase","fin"],
+  ["COO","Cooper Companies (The)","health"],
+  ["COP","ConocoPhillips","energy"],
+  ["COR","Cencora","health"],
+  ["COST","Costco","consumer"],
+  ["CPAY","Corpay","fin"],
+  ["CPRT","Copart","indus"],
+  ["CPT","Camden Property Trust","realestate"],
+  ["CRH","CRH plc","materials"],
+  ["CRL","Charles River Laboratories","health"],
+  ["CRM","Salesforce","tech"],
+  ["CRWD","CrowdStrike","tech"],
+  ["CSCO","Cisco","tech"],
+  ["CSGP","CoStar Group","realestate"],
+  ["CSX","CSX Corporation","indus"],
+  ["CTAS","Cintas","indus"],
+  ["CTSH","Cognizant","tech"],
+  ["CTVA","Corteva","materials"],
+  ["CVNA","Carvana","consumer"],
+  ["CVS","CVS Health","health"],
+  ["CVX","Chevron Corporation","energy"],
+  ["D","Dominion Energy","utilities"],
+  ["DAL","Delta Air Lines","indus"],
+  ["DASH","DoorDash","consumer"],
+  ["DD","DuPont","indus"],
+  ["DDOG","Datadog","tech"],
+  ["DE","Deere & Company","indus"],
+  ["DECK","Deckers Brands","consumer"],
+  ["DELL","Dell Technologies","tech"],
+  ["DG","Dollar General","consumer"],
+  ["DGX","Quest Diagnostics","health"],
+  ["DHI","D. R. Horton","consumer"],
+  ["DHR","Danaher Corporation","health"],
+  ["DIS","Walt Disney Company (The)","comms"],
+  ["DLR","Digital Realty","realestate"],
+  ["DLTR","Dollar Tree","consumer"],
+  ["DOC","Healthpeak Properties","realestate"],
+  ["DOV","Dover Corporation","indus"],
+  ["DOW","Dow Inc.","materials"],
+  ["DPZ","Domino's","consumer"],
+  ["DRI","Darden Restaurants","consumer"],
+  ["DTE","DTE Energy","utilities"],
+  ["DUK","Duke Energy","utilities"],
+  ["DVA","DaVita","health"],
+  ["DVN","Devon Energy","energy"],
+  ["DXCM","Dexcom","health"],
+  ["EBAY","eBay Inc.","consumer"],
+  ["ECHO","EchoStar","comms"],
+  ["ECL","Ecolab","materials"],
+  ["ED","Consolidated Edison","utilities"],
+  ["EFX","Equifax","indus"],
+  ["EG","Everest Group","fin"],
+  ["EIX","Edison International","utilities"],
+  ["EL","Estée Lauder Companies (The)","consumer"],
+  ["ELV","Elevance Health","health"],
+  ["EME","Emcor","indus"],
+  ["EMR","Emerson Electric","indus"],
+  ["EOG","EOG Resources","energy"],
+  ["EQIX","Equinix","realestate"],
+  ["EQR","Equity Residential","realestate"],
+  ["EQT","EQT Corporation","energy"],
+  ["ERIE","Erie Indemnity","fin"],
+  ["ES","Eversource Energy","utilities"],
+  ["ESS","Essex Property Trust","realestate"],
+  ["ETN","Eaton Corporation","indus"],
+  ["ETR","Entergy","utilities"],
+  ["EVRG","Evergy","utilities"],
+  ["EW","Edwards Lifesciences","health"],
+  ["EXC","Exelon","utilities"],
+  ["EXE","Expand Energy","energy"],
+  ["EXPD","Expeditors International","indus"],
+  ["EXPE","Expedia Group","consumer"],
+  ["EXR","Extra Space Storage","realestate"],
+  ["F","Ford Motor Company","consumer"],
+  ["FANG","Diamondback Energy","energy"],
+  ["FAST","Fastenal","indus"],
+  ["FCX","Freeport-McMoRan","materials"],
+  ["FDS","FactSet","fin"],
+  ["FDX","FedEx","indus"],
+  ["FDXF","FedEx Freight","indus"],
+  ["FE","FirstEnergy","utilities"],
+  ["FERG","Ferguson Enterprises","indus"],
+  ["FFIV","F5, Inc.","tech"],
+  ["FICO","Fair Isaac","tech"],
+  ["FIS","Fidelity National Information Services","fin"],
+  ["FISV","Fiserv","fin"],
+  ["FITB","Fifth Third Bancorp","fin"],
+  ["FIX","Comfort Systems USA","indus"],
+  ["FLEX","Flex Ltd.","tech"],
+  ["FOX","Fox Corporation (Class B)","comms"],
+  ["FOXA","Fox Corporation (Class A)","comms"],
+  ["FRT","Federal Realty Investment Trust","realestate"],
+  ["FSLR","First Solar","semi"],
+  ["FTNT","Fortinet","tech"],
+  ["FTV","Fortive","indus"],
+  ["GD","General Dynamics","indus"],
+  ["GDDY","GoDaddy","tech"],
+  ["GE","GE Aerospace","indus"],
+  ["GEHC","GE HealthCare","health"],
+  ["GEN","Gen Digital","tech"],
+  ["GEV","GE Vernova","indus"],
+  ["GILD","Gilead Sciences","health"],
+  ["GIS","General Mills","consumer"],
+  ["GL","Globe Life","fin"],
+  ["GLW","Corning Inc.","tech"],
+  ["GM","General Motors","consumer"],
+  ["GNRC","Generac","indus"],
+  ["GOOG","Alphabet Inc. (Class C)","comms"],
+  ["GOOGL","Alphabet Inc. (Class A)","comms"],
+  ["GPC","Genuine Parts Company","consumer"],
+  ["GPN","Global Payments","fin"],
+  ["GRMN","Garmin","consumer"],
+  ["GS","Goldman Sachs","fin"],
+  ["GWW","W. W. Grainger","indus"],
+  ["HAL","Halliburton","energy"],
+  ["HAS","Hasbro","consumer"],
+  ["HBAN","Huntington Bancshares","fin"],
+  ["HCA","HCA Healthcare","health"],
+  ["HD","Home Depot (The)","consumer"],
+  ["HIG","Hartford (The)","fin"],
+  ["HII","Huntington Ingalls Industries","indus"],
+  ["HLT","Hilton Worldwide","consumer"],
+  ["HON","Honeywell Technologies","indus"],
+  ["HONA","Honeywell Aerospace","indus"],
+  ["HOOD","Robinhood Markets","fin"],
+  ["HPE","Hewlett Packard Enterprise","tech"],
+  ["HPQ","HP Inc.","tech"],
+  ["HRL","Hormel Foods","consumer"],
+  ["HSIC","Henry Schein","health"],
+  ["HST","Host Hotels & Resorts","realestate"],
+  ["HSY","Hershey Company (The)","consumer"],
+  ["HUBB","Hubbell Incorporated","indus"],
+  ["HUM","Humana","health"],
+  ["HWM","Howmet Aerospace","indus"],
+  ["IBKR","Interactive Brokers","fin"],
+  ["IBM","IBM","tech"],
+  ["ICE","Intercontinental Exchange","fin"],
+  ["IDXX","Idexx Laboratories","health"],
+  ["IEX","IDEX Corporation","indus"],
+  ["IFF","International Flavors & Fragrances","materials"],
+  ["INCY","Incyte","health"],
+  ["INTC","Intel","semi"],
+  ["INTU","Intuit","tech"],
+  ["INVH","Invitation Homes","realestate"],
+  ["IP","International Paper","materials"],
+  ["IQV","IQVIA","health"],
+  ["IR","Ingersoll Rand","indus"],
+  ["IRM","Iron Mountain","realestate"],
+  ["ISRG","Intuitive Surgical","health"],
+  ["IT","Gartner","tech"],
+  ["ITW","Illinois Tool Works","indus"],
+  ["IVZ","Invesco","fin"],
+  ["J","Jacobs Solutions","indus"],
+  ["JBHT","J.B. Hunt","indus"],
+  ["JBL","Jabil","tech"],
+  ["JCI","Johnson Controls","indus"],
+  ["JKHY","Jack Henry & Associates","fin"],
+  ["JNJ","Johnson & Johnson","health"],
+  ["JPM","JPMorgan Chase","fin"],
+  ["KDP","Keurig Dr Pepper","consumer"],
+  ["KEY","KeyCorp","fin"],
+  ["KEYS","Keysight Technologies","tech"],
+  ["KHC","Kraft Heinz","consumer"],
+  ["KIM","Kimco Realty","realestate"],
+  ["KKR","KKR & Co.","fin"],
+  ["KLAC","KLA Corporation","semi"],
+  ["KMB","Kimberly-Clark","consumer"],
+  ["KMI","Kinder Morgan","energy"],
+  ["KO","Coca-Cola Company (The)","consumer"],
+  ["KR","Kroger","consumer"],
+  ["KVUE","Kenvue","consumer"],
+  ["L","Loews Corporation","fin"],
+  ["LDOS","Leidos","indus"],
+  ["LEN","Lennar","consumer"],
+  ["LH","Labcorp","health"],
+  ["LHX","L3Harris","indus"],
+  ["LII","Lennox International","indus"],
+  ["LIN","Linde plc","materials"],
+  ["LITE","Lumentum","tech"],
+  ["LLY","Lilly (Eli)","health"],
+  ["LMT","Lockheed Martin","indus"],
+  ["LNT","Alliant Energy","utilities"],
+  ["LOW","Lowe's","consumer"],
+  ["LRCX","Lam Research","semi"],
+  ["LULU","Lululemon Athletica","consumer"],
+  ["LUV","Southwest Airlines","indus"],
+  ["LVS","Las Vegas Sands","consumer"],
+  ["LYB","LyondellBasell","materials"],
+  ["LYV","Live Nation Entertainment","comms"],
+  ["MA","Mastercard","fin"],
+  ["MAA","Mid-America Apartment Communities","realestate"],
+  ["MAR","Marriott International","consumer"],
+  ["MAS","Masco","indus"],
+  ["MCD","McDonald's","consumer"],
+  ["MCHP","Microchip Technology","semi"],
+  ["MCK","McKesson Corporation","health"],
+  ["MCO","Moody's Corporation","fin"],
+  ["MDLZ","Mondelez International","consumer"],
+  ["MDT","Medtronic","health"],
+  ["MET","MetLife","fin"],
+  ["META","Meta Platforms","comms"],
+  ["MGM","MGM Resorts","consumer"],
+  ["MKC","McCormick & Company","consumer"],
+  ["MLM","Martin Marietta Materials","materials"],
+  ["MMM","3M","indus"],
+  ["MNST","Monster Beverage","consumer"],
+  ["MO","Altria","consumer"],
+  ["MOS","Mosaic Company (The)","materials"],
+  ["MPC","Marathon Petroleum","energy"],
+  ["MPWR","Monolithic Power Systems","semi"],
+  ["MRK","Merck & Co.","health"],
+  ["MRNA","Moderna","health"],
+  ["MRSH","Marsh McLennan","fin"],
+  ["MRVL","Marvell Technology","semi"],
+  ["MS","Morgan Stanley","fin"],
+  ["MSCI","MSCI","fin"],
+  ["MSFT","Microsoft","tech"],
+  ["MSI","Motorola Solutions","tech"],
+  ["MTB","M&T Bank","fin"],
+  ["MTD","Mettler Toledo","health"],
+  ["MU","Micron Technology","semi"],
+  ["NCLH","Norwegian Cruise Line Holdings","consumer"],
+  ["NDAQ","Nasdaq, Inc.","fin"],
+  ["NDSN","Nordson Corporation","indus"],
+  ["NEE","NextEra Energy","utilities"],
+  ["NEM","Newmont","materials"],
+  ["NFLX","Netflix","comms"],
+  ["NI","NiSource","utilities"],
+  ["NKE","Nike, Inc.","consumer"],
+  ["NOC","Northrop Grumman","indus"],
+  ["NOW","ServiceNow","tech"],
+  ["NRG","NRG Energy","utilities"],
+  ["NSC","Norfolk Southern","indus"],
+  ["NTAP","NetApp","tech"],
+  ["NTRS","Northern Trust","fin"],
+  ["NUE","Nucor","materials"],
+  ["NVDA","Nvidia","semi"],
+  ["NVR","NVR, Inc.","consumer"],
+  ["NWS","News Corp (Class B)","comms"],
+  ["NWSA","News Corp (Class A)","comms"],
+  ["NXPI","NXP Semiconductors","semi"],
+  ["O","Realty Income","realestate"],
+  ["ODFL","Old Dominion","indus"],
+  ["OKE","Oneok","energy"],
+  ["OMC","Omnicom Group","comms"],
+  ["ON","ON Semiconductor","semi"],
+  ["ORCL","Oracle Corporation","tech"],
+  ["ORLY","O'Reilly Automotive","consumer"],
+  ["OTIS","Otis Worldwide","indus"],
+  ["OXY","Occidental Petroleum","energy"],
+  ["PANW","Palo Alto Networks","tech"],
+  ["PAYX","Paychex","indus"],
+  ["PCAR","Paccar","indus"],
+  ["PCG","PG&E Corporation","utilities"],
+  ["PEG","Public Service Enterprise Group","utilities"],
+  ["PEP","PepsiCo","consumer"],
+  ["PFE","Pfizer","health"],
+  ["PFG","Principal Financial Group","fin"],
+  ["PG","Procter & Gamble","consumer"],
+  ["PGR","Progressive Corporation","fin"],
+  ["PH","Parker Hannifin","indus"],
+  ["PHM","PulteGroup","consumer"],
+  ["PKG","Packaging Corporation of America","materials"],
+  ["PLD","Prologis","realestate"],
+  ["PLTR","Palantir Technologies","tech"],
+  ["PM","Philip Morris International","consumer"],
+  ["PNC","PNC Financial Services","fin"],
+  ["PNR","Pentair","indus"],
+  ["PNW","Pinnacle West Capital","utilities"],
+  ["PODD","Insulet Corporation","health"],
+  ["PPG","PPG Industries","materials"],
+  ["PPL","PPL Corporation","utilities"],
+  ["PRU","Prudential Financial","fin"],
+  ["PSA","Public Storage","realestate"],
+  ["PSKY","Paramount Skydance Corporation","comms"],
+  ["PSX","Phillips 66","energy"],
+  ["PTC","PTC Inc.","tech"],
+  ["PWR","Quanta Services","indus"],
+  ["PYPL","PayPal","fin"],
+  ["Q","Qnity Electronics","semi"],
+  ["QCOM","Qualcomm","semi"],
+  ["RCL","Royal Caribbean Group","consumer"],
+  ["REG","Regency Centers","realestate"],
+  ["REGN","Regeneron Pharmaceuticals","health"],
+  ["RF","Regions Financial Corporation","fin"],
+  ["RJF","Raymond James Financial","fin"],
+  ["RL","Ralph Lauren Corporation","consumer"],
+  ["RMD","ResMed|","health"],
+  ["ROK","Rockwell Automation","indus"],
+  ["ROL","Rollins, Inc.","indus"],
+  ["ROP","Roper Technologies","tech"],
+  ["ROST","Ross Stores","consumer"],
+  ["RSG","Republic Services","indus"],
+  ["RTX","RTX Corporation","indus"],
+  ["RVTY","Revvity","health"],
+  ["SBAC","SBA Communications","realestate"],
+  ["SBUX","Starbucks","consumer"],
+  ["SCHW","Charles Schwab Corporation","fin"],
+  ["SHW","Sherwin-Williams","materials"],
+  ["SJM","J.M. Smucker Company (The)","consumer"],
+  ["SLB","Schlumberger","energy"],
+  ["SMCI","Supermicro","tech"],
+  ["SNA","Snap-on","indus"],
+  ["SNDK","Sandisk","tech"],
+  ["SNPS","Synopsys","tech"],
+  ["SO","Southern Company","utilities"],
+  ["SOLV","Solventum","health"],
+  ["SPG","Simon Property Group","realestate"],
+  ["SPGI","S&P Global","fin"],
+  ["SRE","Sempra","utilities"],
+  ["STE","Steris","health"],
+  ["STLD","Steel Dynamics","materials"],
+  ["STT","State Street Corporation","fin"],
+  ["STX","Seagate Technology","tech"],
+  ["STZ","Constellation Brands","consumer"],
+  ["SW","Smurfit Westrock","materials"],
+  ["SWK","Stanley Black & Decker","indus"],
+  ["SWKS","Skyworks Solutions","semi"],
+  ["SYF","Synchrony Financial","fin"],
+  ["SYK","Stryker Corporation","health"],
+  ["SYY","Sysco","consumer"],
+  ["T","AT&T","comms"],
+  ["TAP","Molson Coors Beverage Company","consumer"],
+  ["TDG","TransDigm Group","indus"],
+  ["TDY","Teledyne Technologies","tech"],
+  ["TECH","Bio-Techne","health"],
+  ["TEL","TE Connectivity","tech"],
+  ["TER","Teradyne","semi"],
+  ["TFC","Truist Financial","fin"],
+  ["TGT","Target Corporation","consumer"],
+  ["TJX","TJX Companies","consumer"],
+  ["TKO","TKO Group Holdings","comms"],
+  ["TMO","Thermo Fisher Scientific","health"],
+  ["TMUS","T-Mobile US","comms"],
+  ["TPL","Texas Pacific Land Corporation","energy"],
+  ["TPR","Tapestry, Inc.","consumer"],
+  ["TRGP","Targa Resources","energy"],
+  ["TRMB","Trimble Inc.","tech"],
+  ["TROW","T. Rowe Price","fin"],
+  ["TRV","Travelers Companies (The)","fin"],
+  ["TSCO","Tractor Supply","consumer"],
+  ["TSLA","Tesla, Inc.","consumer"],
+  ["TSN","Tyson Foods","consumer"],
+  ["TT","Trane Technologies","indus"],
+  ["TTD","Trade Desk (The)","comms"],
+  ["TTWO","Take-Two Interactive","comms"],
+  ["TXN","Texas Instruments","semi"],
+  ["TXT","Textron","indus"],
+  ["TYL","Tyler Technologies","tech"],
+  ["UAL","United Airlines Holdings","indus"],
+  ["UBER","Uber","indus"],
+  ["UDR","UDR, Inc.","realestate"],
+  ["UHS","Universal Health Services","health"],
+  ["ULTA","Ulta Beauty","consumer"],
+  ["UNH","UnitedHealth Group","health"],
+  ["UNP","Union Pacific Corporation","indus"],
+  ["UPS","United Parcel Service","indus"],
+  ["URI","United Rentals","indus"],
+  ["USB","U.S. Bancorp","fin"],
+  ["V","Visa Inc.","fin"],
+  ["VEEV","Veeva Systems","health"],
+  ["VICI","Vici Properties","realestate"],
+  ["VLO","Valero Energy","energy"],
+  ["VLTO","Veralto","indus"],
+  ["VMC","Vulcan Materials Company","materials"],
+  ["VRSK","Verisk Analytics","indus"],
+  ["VRSN","Verisign","tech"],
+  ["VRT","Vertiv","indus"],
+  ["VRTX","Vertex Pharmaceuticals","health"],
+  ["VST","Vistra Corp.","utilities"],
+  ["VTR","Ventas","realestate"],
+  ["VTRS","Viatris","health"],
+  ["VZ","Verizon","comms"],
+  ["WAB","Wabtec","indus"],
+  ["WAT","Waters Corporation","health"],
+  ["WBD","Warner Bros. Discovery","comms"],
+  ["WDAY","Workday, Inc.","tech"],
+  ["WDC","Western Digital","tech"],
+  ["WEC","WEC Energy Group","utilities"],
+  ["WELL","Welltower","realestate"],
+  ["WFC","Wells Fargo","fin"],
+  ["WM","Waste Management","indus"],
+  ["WMB","Williams Companies","energy"],
+  ["WMT","Walmart","consumer"],
+  ["WRB","W. R. Berkley Corporation","fin"],
+  ["WSM","Williams-Sonoma, Inc.","consumer"],
+  ["WST","West Pharmaceutical Services","health"],
+  ["WTW","Willis Towers Watson","fin"],
+  ["WY","Weyerhaeuser","realestate"],
+  ["WYNN","Wynn Resorts","consumer"],
+  ["XEL","Xcel Energy","utilities"],
+  ["XOM","ExxonMobil","energy"],
+  ["XYL","Xylem Inc.","indus"],
+  ["XYZ","Block, Inc.","fin"],
+  ["YUM","Yum! Brands","consumer"],
+  ["ZBH","Zimmer Biomet","health"],
+  ["ZBRA","Zebra Technologies","tech"],
+  ["ZTS","Zoetis","health"],
+];
+
+const SP500_BY_TK = Object.fromEntries(SP500.map(e=>[e[0], e]));
+
 /* ---------- factor-model return generation (250 trading days) ---------- */
 const DAYS = 250;
 function series(fn){ const a=new Float64Array(DAYS); for(let t=0;t<DAYS;t++) a[t]=fn(t); return a; }
@@ -627,6 +1196,17 @@ const EXPOSURE = {
   health:   [0.60, 1.0, -0.02,  0.00],
   consumer: [1.05, 1.0, -0.08, -0.12],
   indus:    [0.95, 1.0,  0.02, -0.18],
+  // Added with the S&P 500 library. Betas are chosen to reflect how each
+  // sector actually behaves rather than copied from a neighbour, because
+  // these feed the synthetic correlation matrix that draws the edges:
+  //   utilities  - classic bond proxy: low market beta, strongly rate-negative
+  //   realestate - the most rate-sensitive sector of the eleven
+  //   materials  - commodity-linked, so the only new row with real oil beta
+  //   comms      - behaves close to tech, slightly lower beta
+  utilities:  [0.55, 1.0, -0.30,  0.05],
+  realestate: [0.85, 1.0, -0.38,  0.00],
+  materials:  [1.00, 1.0, -0.05,  0.30],
+  comms:      [1.10, 1.0, -0.10,  0.00],
 };
 
 const nodes = UNIVERSE.map(([tk,name,sector,size],i)=>({ i, tk, name, sector, size }));
@@ -770,6 +1350,33 @@ function buildGraph(corr){
       if(!edgeMap.has(k)){ edgeMap.set(k,{a:i,b:j,r:corr[i][j],mech:"Return co-movement",link:false}); added++; }
     }
   }
+  /* Nothing may be left orphaned. The |r| >= 0.5 bar above keeps the graph
+     from becoming a hairball, but a node with ZERO edges is strictly worse
+     than one weak edge: it can't participate in a cascade at all, which is
+     the whole point of the app, so it just sits there looking broken.
+
+     This bites low-beta sectors hardest. A single utility correlates ~0.44
+     with its nearest neighbour (another rate-sensitive name) and lands just
+     under the bar -- the model behaving correctly, not a data problem. The
+     rescue edge is drawn at its true |r|, so a weak link renders thin and
+     faint rather than pretending to be a strong one. */
+  const degree = new Array(N).fill(0);
+  for(const e of edgeMap.values()){ degree[e.a]++; degree[e.b]++; }
+  for(let i=0;i<N;i++){
+    if(degree[i]>0) continue;
+    let best=-1, bestJ=-1;
+    for(let j=0;j<N;j++){
+      if(j===i) continue;
+      const ar=Math.abs(corr[i][j]);
+      if(ar>best){ best=ar; bestJ=j; }
+    }
+    if(bestJ<0) continue;
+    const k=edgeKey(nodes[i].tk,nodes[bestJ].tk);
+    if(edgeMap.has(k)) continue;
+    edgeMap.set(k,{a:i,b:bestJ,r:corr[i][bestJ],mech:"Nearest co-movement",link:false});
+    degree[i]++; degree[bestJ]++;
+  }
+
   const edges=[...edgeMap.values()];
   const ADJ = Array.from({length:N},()=>[]);
   edges.forEach((e,ei)=>{ ADJ[e.a].push({to:e.b,r:e.r,ei}); ADJ[e.b].push({to:e.a,r:e.r,ei}); });
@@ -1475,9 +2082,78 @@ function addLiveNode(tk, name, sector){
 }
 
 let lookupInFlight = null;
+/* ---------- saved watchlist ----------------------------------------------
+   Anything added beyond the built-in UNIVERSE is persisted server-side (see
+   /api/watchlist) so it survives a reload. The server owns validation; this
+   side just sends the whole list, which makes add and remove the same call
+   and avoids two tabs racing on a partial update.
+
+   Everything the server hands back is replayed through addLiveNode(), the
+   same path a manual add takes -- so a restored ticker gets its factor
+   series and correlation row built identically to one added by hand. */
+function currentWatchlist(){
+  const builtin = new Set(UNIVERSE.map(u=>u[0]));
+  return nodes.filter(n=>!builtin.has(n.tk)).map(n=>n.tk);
+}
+
+async function saveWatchlist(){
+  try{
+    await fetch("/api/watchlist", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({tickers: currentWatchlist()}),
+    });
+  }catch(e){ /* no server -> model-only mode; nothing to persist to */ }
+}
+
+async function restoreWatchlist(){
+  let saved = [];
+  try{
+    const r = await fetch("/api/watchlist");
+    saved = (await r.json()).tickers || [];
+  }catch(e){ return; }   // model-only mode
+  let added = 0;
+  for(const tk of saved){
+    if(IDX[tk]!=null) continue;                       // already present
+    const known = SP500_BY_TK[tk];
+    // Restore only what can be resolved offline. A non-S&P ticker would need
+    // a /api/lookup round trip each, which at boot would serialise behind
+    // the rate limiter; it stays saved and can be re-added by searching.
+    if(!known) continue;
+    addLiveNode(known[0], known[1], known[2]);
+    added++;
+  }
+  if(added){
+    renderList();
+    document.getElementById("f-nodes").textContent = N;
+    if(liveMode) syncQuotes();
+  }
+}
+
 async function lookupAndAdd(raw){
   const tkQuery = raw.trim().toUpperCase();
   if(!tkQuery) return;
+
+  /* S&P 500 names resolve from the baked-in library: no round trip, and it
+     works with no server or no internet. The /api/lookup fallback below
+     still handles anything outside the index. */
+  const known = SP500_BY_TK[tkQuery];
+  if(known && IDX[tkQuery]==null){
+    const i = addLiveNode(known[0], known[1], known[2]);
+    saveWatchlist();
+    setSearchMsg("Added "+known[0]+" · "+SECTOR_BY_ID[known[2]].label,"ok");
+    searchInput.value=""; query=""; renderList(); applySearchVisual();
+    selectNode(i);
+    if(liveMode) syncQuotes();
+    return;
+  }
+  if(known && IDX[tkQuery]!=null){
+    setSearchMsg(tkQuery+" is already on the graph","ok");
+    searchInput.value=""; query=""; renderList(); applySearchVisual();
+    selectNode(IDX[tkQuery]);
+    return;
+  }
+
   setSearchMsg("Looking up "+tkQuery+"…");
   lookupInFlight = tkQuery;
   try{
@@ -1490,6 +2166,7 @@ async function lookupAndAdd(raw){
     if(!hit.sector){ setSearchMsg(hit.symbol+" isn't an individual stock (ETF/index/other) — not supported","err"); return; }
     const bucket = bucketFor(hit.sector, hit.industry);
     const i = addLiveNode(hit.symbol, hit.name||hit.symbol, bucket);
+    saveWatchlist();
     setSearchMsg("Added "+hit.symbol+" · "+SECTOR_BY_ID[bucket].label,"ok");
     searchInput.value=""; query=""; renderList(); applySearchVisual();
     selectNode(i);
@@ -2880,9 +3557,199 @@ setTimeout(()=>{
   selectNode(IDX[selTk] ?? IDX.NVDA);
   if(sel2Tk!=null && IDX[sel2Tk]!=null) selectNode(IDX[sel2Tk], {compare:true});
 }, 600);
+/* ============================================================================
+   INDEX VIEW — all 503 S&P names, rendered on the GPU by cosmos.gl
+
+   This is a SEPARATE layer, not a replacement for the SVG graph. cosmos.gl
+   cannot draw per-node text labels or dashed hop-order edges, and the pinned
+   radial cascade fights its GPU simulation — all three are core to the
+   curated view, so that view keeps SVG. cosmos.gl earns its 693 KB only
+   here, where 503 nodes and ~1k links would make SVG crawl.
+
+   The model is built LAZILY on first open: 503 return series plus a
+   503x503 correlation pass is ~30M multiply-adds, which is fine once but
+   has no business running at boot for a view most sessions never open.
+   ========================================================================== */
+let indexView = { on:false, graph:null, built:false, nodes:null, building:false };
+
+function buildIndexModel(){
+  // Same synthetic factor model as the curated graph, so the two views are
+  // consistent with each other rather than two different fictions.
+  const list = SP500.filter(e => EXPOSURE[e[2]]);   // macro has no exposure row
+  const n = list.length;
+  const series503 = new Array(n);
+  const mean503 = new Float64Array(n), sd503 = new Float64Array(n);
+
+  for(let i=0;i<n;i++){
+    const sec = list[i][2];
+    const [bm,bs,br,bo] = EXPOSURE[sec];
+    const beta = bm*(0.85+0.3*rand());
+    const a = new Float64Array(DAYS);
+    for(let t=0;t<DAYS;t++)
+      a[t] = beta*F_mkt[t] + bs*F_sect[sec][t] + br*F_rate[t] + bo*F_oil[t] + 0.0085*gauss();
+    let m=0; for(let t=0;t<DAYS;t++) m+=a[t]; m/=DAYS;
+    let v=0; for(let t=0;t<DAYS;t++) v+=(a[t]-m)**2;
+    series503[i]=a; mean503[i]=m; sd503[i]=Math.sqrt(v/DAYS);
+  }
+
+  // Standardize once so the correlation pass is a plain dot product rather
+  // than re-centring inside the O(n^2) loop.
+  const z = new Array(n);
+  for(let i=0;i<n;i++){
+    const a=series503[i], zi=new Float64Array(DAYS), s=sd503[i]||1;
+    for(let t=0;t<DAYS;t++) zi[t]=(a[t]-mean503[i])/s;
+    z[i]=zi;
+  }
+
+  // Top-2 correlates per node: enough to show structure, few enough that the
+  // link count stays ~1k rather than the 126,506 candidate pairs.
+  const K=2, links=[];
+  const seen=new Set();
+  for(let i=0;i<n;i++){
+    let b1=-1,b1j=-1,b2=-1,b2j=-1;
+    for(let j=0;j<n;j++){
+      if(j===i) continue;
+      let dot=0; const zi=z[i], zj=z[j];
+      for(let t=0;t<DAYS;t++) dot+=zi[t]*zj[t];
+      const ar=Math.abs(dot/DAYS);
+      if(ar>b1){ b2=b1;b2j=b1j; b1=ar;b1j=j; }
+      else if(ar>b2){ b2=ar;b2j=j; }
+    }
+    for(const j of [b1j,b2j]){
+      if(j<0) continue;
+      const k = i<j ? i+"-"+j : j+"-"+i;
+      if(seen.has(k)) continue;
+      seen.add(k); links.push(i,j);
+    }
+  }
+  return { list, n, links: new Float32Array(links) };
+}
+
+function hexToRgba(hex){
+  const h=hex.replace("#","");
+  return [parseInt(h.slice(0,2),16)/255, parseInt(h.slice(2,4),16)/255,
+          parseInt(h.slice(4,6),16)/255, 1];
+}
+
+function initIndexGraph(){
+  const model = buildIndexModel();
+  indexView.nodes = model.list;
+
+  const n = model.n;
+  const pos = new Float32Array(n*2), col = new Float32Array(n*4), size = new Float32Array(n);
+  for(let i=0;i<n;i++){
+    // Seed positions in sector clusters so the first frame already reads as
+    // structure rather than a random cloud the sim has to untangle.
+    const sec = model.list[i][2];
+    const si = SECTORS.findIndex(s=>s.id===sec);
+    const ang = (si/SECTORS.length)*Math.PI*2 + gauss()*0.25;
+    const rad = 260 + gauss()*70;
+    pos[i*2]=Math.cos(ang)*rad; pos[i*2+1]=Math.sin(ang)*rad;
+    const [r,g,b,a] = hexToRgba(SECTOR_BY_ID[sec].hex);
+    col[i*4]=r; col[i*4+1]=g; col[i*4+2]=b; col[i*4+3]=a;
+    // Sized for legibility at 503 points, not for density: at 3px they were
+    // technically rendering but visually absent on a 1250px canvas.
+    size[i] = 7;
+  }
+
+  const graph = new Cosmos.Graph(document.getElementById("index-stage"), {
+    backgroundColor: "#0e0e0d",
+    pointGreyoutOpacity: 0.15,
+    linkWidth: 0.35,
+    linkColor: "#3a3a37",
+    linkArrows: false,
+    // Tuned to keep the cloud compact enough to frame: with weaker gravity
+    // the sim pushed points out past 2000 units and fitView couldn't hold
+    // them and the point size in view at the same time.
+    simulationGravity: 0.5,
+    simulationRepulsion: 0.35,
+    simulationLinkSpring: 1.0,
+    simulationFriction: 0.88,
+    fitViewOnInit: true,
+    onClick: (i)=>{
+      if(i==null) return;
+      const e = indexView.nodes[i];
+      // Clicking an index node adds it to the curated graph -- the two views
+      // stay connected instead of the index being a dead-end display.
+      if(IDX[e[0]]==null){ addLiveNode(e[0], e[1], e[2]); saveWatchlist(); renderList(); }
+      showIndexLabel(i, true);
+    },
+    onPointMouseOver: (i)=> showIndexLabel(i, false),
+    onPointMouseOut: ()=> { document.getElementById("index-label").style.display="none"; },
+  });
+  graph.setPointPositions(pos);
+  graph.setPointColors(col);
+  graph.setPointSizes(size);
+  graph.setLinks(model.links);
+  graph.render();
+  indexView.graph = graph;
+  indexView.built = true;
+  // fitViewOnInit frames the SEED positions; the simulation then moves
+  // everything, so re-frame once it has mostly settled.
+  setTimeout(()=>{ try{ graph.fitView(); }catch(e){} }, 1200);
+  setTimeout(()=>{ try{ graph.fitView(); }catch(e){} }, 3000);
+}
+
+function showIndexLabel(i, sticky){
+  const e = indexView.nodes && indexView.nodes[i];
+  const box = document.getElementById("index-label");
+  if(!e){ box.style.display="none"; return; }
+  box.replaceChildren();
+  const tk=document.createElement("div"); tk.className="tk"; tk.textContent=e[0];
+  const nm=document.createElement("div"); nm.textContent=e[1];
+  const sc=document.createElement("div"); sc.className="sec";
+  sc.textContent = SECTOR_BY_ID[e[2]].label + (IDX[e[0]]!=null ? " · on graph" : " · click to add");
+  box.append(tk,nm,sc);
+  box.style.display="block";
+  // Anchored to the cursor rather than the point: cosmos.gl doesn't expose a
+  // world->screen transform, and at 503 points the cursor IS the point.
+  box.style.left = (lastPointer.x+14)+"px";
+  box.style.top  = (lastPointer.y+14)+"px";
+}
+
+let lastPointer = {x:0,y:0};
+window.addEventListener("mousemove", e=>{ lastPointer={x:e.clientX,y:e.clientY}; });
+
+function setIndexView(on){
+  indexView.on = on;
+  document.getElementById("index-stage").classList.toggle("on", on);
+  document.getElementById("btn-index-view").classList.toggle("on", on);
+  document.getElementById("stage").style.display = on ? "none" : "block";
+  document.querySelectorAll(".legend, .order-key").forEach(el=>{
+    el.style.display = on ? "none" : "";
+  });
+  const note = document.getElementById("index-note");
+  note.classList.toggle("on", on);
+  if(on && !note.textContent){
+    note.textContent = "All 503 S&P 500 names, GPU-rendered. Labels appear on hover "
+      + "only and hop-order dashes aren't drawn — this renderer can't do either, "
+      + "which is why the curated graph keeps its own. Click any point to add it "
+      + "to that graph. Correlations are the synthetic factor model, not live.";
+  }
+  if(on && !indexView.built && !indexView.building){
+    indexView.building = true;
+    note.textContent = "Building 503-name correlation model…";
+    // Yield a frame so the note paints before the ~30M-op build blocks.
+    requestAnimationFrame(()=> requestAnimationFrame(()=>{
+      const t0=performance.now();
+      try{ initIndexGraph(); }
+      catch(err){ note.textContent = "Index view failed: "+err.message; indexView.building=false; return; }
+      indexView.building=false;
+      note.textContent = "All 503 S&P 500 names, GPU-rendered in "
+        + Math.round(performance.now()-t0) + "ms. Labels on hover only and no "
+        + "hop-order dashes — this renderer can't do either, which is why the "
+        + "curated graph keeps its own. Click any point to add it there. "
+        + "Correlations are the synthetic factor model, not live.";
+    }));
+  }
+}
+
+document.getElementById("btn-index-view").addEventListener("click", ()=> setIndexView(!indexView.on));
+
 // connect to the live proxy (degrades to model if server.py isn't running)
 setLiveStatus("connecting");
 startLive();
+restoreWatchlist();
 if(qp.get("tab")==="flow") fetchFlow();
 if(qp.get("tab")==="snipe"){
   document.querySelector("main").classList.add("snipe-active");

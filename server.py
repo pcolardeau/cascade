@@ -195,6 +195,17 @@ _DEFAULT_DTE_WINDOW = 3
 # (not under a data/ subdir) to match this project's flat, no-build-step layout.
 SNIPE_LOG_PATH = os.path.join(BASE_DIR, "snipe_log.json")
 
+# Tickers the user has added to the graph beyond the built-in universe.
+# Server-side rather than localStorage so the list survives a browser change
+# or a cleared cache, and so it lives with the app's other persisted state.
+WATCHLIST_PATH = os.path.join(BASE_DIR, "watchlist.json")
+
+# A saved list is user data, so it gets the same bounds as everything else
+# that crosses the API: one crafted POST shouldn't be able to grow the file
+# without limit or wedge the client replaying it at boot.
+MAX_WATCHLIST = 200
+_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,9}$")
+
 # US Eastern time helpers, used to compute "30 minutes before the close"
 # (15:30 America/New_York) for the Snipe Log's daily snapshot scheduler, and
 # to map a closing-price timestamp back to the calendar trading day it
@@ -2383,6 +2394,57 @@ def resolve_snipe_log():
     return entries
 
 
+# ---------------------------------------------------------------------------
+# Watchlist -- tickers the user added to the graph, persisted so they survive
+# a reload. Deliberately mirrors the Snipe Log's storage contract: a corrupt
+# or missing file degrades to "nothing saved yet" rather than taking down the
+# endpoint, and writes go through a temp file + atomic rename so a crash
+# mid-write can't leave truncated JSON behind.
+# ---------------------------------------------------------------------------
+_watchlist_lock = threading.Lock()
+
+
+def load_watchlist():
+    """The saved tickers as a list of strings, or [] if nothing valid is
+    stored. Never raises -- a bad file means "no watchlist", not an error."""
+    with _watchlist_lock:
+        try:
+            with open(WATCHLIST_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return []
+        except (json.JSONDecodeError, OSError, ValueError):
+            return []
+    if not isinstance(data, list):
+        return []
+    return [t for t in data if isinstance(t, str) and _TICKER_RE.match(t)]
+
+
+def save_watchlist(tickers):
+    """Validate, de-duplicate and persist. Returns the stored list.
+
+    Validation happens here rather than at the handler so a direct caller
+    can't write a file the client would then choke on replaying at boot.
+    """
+    seen, clean = set(), []
+    for t in tickers if isinstance(tickers, list) else []:
+        if not isinstance(t, str):
+            continue
+        t = t.strip().upper()
+        if not _TICKER_RE.match(t) or t in seen:
+            continue
+        seen.add(t)
+        clean.append(t)
+        if len(clean) >= MAX_WATCHLIST:
+            break
+    with _watchlist_lock:
+        tmp = f"{WATCHLIST_PATH}.tmp-{os.getpid()}-{threading.get_ident()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(clean, f, indent=2)
+        os.replace(tmp, WATCHLIST_PATH)
+    return clean
+
+
 def get_snipe_log(board=DEFAULT_SNIPE_BOARD):
     """Return one board's Snipe Log, freshly resolved, most-recent-first,
     plus a summary computed only over that board's closed (settled) trades.
@@ -2653,6 +2715,9 @@ class Handler(BaseHTTPRequestHandler):
             vol_source=self._qparam(query, "vol_source", "implied"),
         )
 
+    def _api_watchlist(self, query):
+        return {"tickers": load_watchlist()}
+
     def _api_snipe_log(self, query):
         board = self._qparam(query, "board", DEFAULT_SNIPE_BOARD)
         if board not in SNIPE_LOG_BOARDS:
@@ -2675,6 +2740,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/options/gamma": _api_options_gamma,
         "/api/options/modeled-backtest": _api_options_modeled_backtest,
         "/api/snipe-log": _api_snipe_log,
+        "/api/watchlist": _api_watchlist,
     }
 
     def do_GET(self):
@@ -2699,17 +2765,32 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[server error] Unhandled exception: {e}", file=sys.stderr)
             self._send_json({"_error": "Internal server error"}, status=500)
 
+    # Bound the POST body: the only writer is a small JSON list, and an
+    # unbounded read() would let one request pull arbitrary memory.
+    MAX_POST_BODY = 64 * 1024
+
     def do_POST(self):
-        # Deliberately tiny: exactly one POST route exists (a manual "snapshot
-        # today's pick now" trigger for the Snipe Log), so this stays a small,
-        # dedicated method rather than growing do_GET's routing table/pattern
-        # for a single endpoint. Any other path 404s.
+        # Two POST routes: a manual Snipe Log snapshot, and the watchlist
+        # write. Still small enough to stay a dedicated method rather than
+        # growing do_GET's routing table. Any other path 404s.
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)  # drain any body so HTTP/1.1 keep-alive stays in sync
+        # Always read the body, even when unused -- an undrained body desyncs
+        # HTTP/1.1 keep-alive and the next request on the socket reads garbage.
+        body = self.rfile.read(min(length, self.MAX_POST_BODY)) if length else b""
+        if length > self.MAX_POST_BODY:
+            self._send_json({"_error": "request body too large"}, status=413)
+            return
         parsed_url = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed_url.query)
         try:
+            if parsed_url.path == "/api/watchlist":
+                # Whole-list PUT semantics on POST: the client owns the list
+                # and sends it entire, so add and remove are the same call
+                # and there's no partial-update race between two tabs.
+                raw = json.loads(body or "{}") if body else {}
+                stored = save_watchlist(raw.get("tickers"))
+                self._send_json({"tickers": stored})
+                return
             if parsed_url.path == "/api/snipe-log/snapshot":
                 board = self._qparam(query, "board", DEFAULT_SNIPE_BOARD)
                 if board not in SNIPE_LOG_BOARDS:
