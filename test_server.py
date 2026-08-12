@@ -1410,6 +1410,110 @@ class ScanRiskFlagIntegrationTests(NetworkFreeTestCase):
                          "the clean contract outranks the thin one")
 
 
+class IndexFundAllowlistTests(NetworkFreeTestCase):
+    """The Snipe boards screen US index funds only, because they're about
+    what can actually be filled: measured on live ~7-DTE ITM contracts,
+    index ETFs run ~2.2x tighter on spread (2.78% vs 6.20% median), which is
+    the cost paid on both entry and exit.
+
+    Not a hard wall -- allow_any=1 scans anything and flags the result.
+    Scanning SMCI is how the too-narrow default DTE window was found, so the
+    diagnostic path stays open on purpose.
+    """
+    def test_index_funds_pass(self):
+        for sym in ("SPY", "QQQ", "IWM"):
+            self.assertEqual(server.validate_scan_symbols([sym]), [sym])
+
+    def test_case_is_ignored(self):
+        self.assertEqual(server.validate_scan_symbols(["spy"]), ["spy"])
+
+    def test_non_index_symbol_is_rejected_with_an_actionable_message(self):
+        with self.assertRaises(ValueError) as cm:
+            server.validate_scan_symbols(["SMCI"])
+        msg = str(cm.exception)
+        self.assertIn("SMCI", msg)
+        self.assertIn("allow_any=1", msg, "the message must say how to proceed")
+
+    def test_mixed_list_reports_only_the_offending_symbols(self):
+        with self.assertRaises(ValueError) as cm:
+            server.validate_scan_symbols(["SPY", "SMCI", "WMT"])
+        msg = str(cm.exception)
+        self.assertIn("SMCI", msg)
+        self.assertIn("WMT", msg)
+        self.assertNotIn("SPY not", msg)
+
+    def test_allow_any_bypasses_the_check(self):
+        self.assertEqual(
+            server.validate_scan_symbols(["SMCI"], allow_any=True), ["SMCI"])
+
+    # -- through the handlers ---------------------------------------------
+
+    def test_handlers_reject_non_index_symbols(self):
+        """ValueError propagates to do_GET, which already maps it to a 400."""
+        for handler in (server.Handler._api_options_itm_scan,
+                        server.Handler._api_options_itm_scan_weekly,
+                        server.Handler._api_options_debit_spreads):
+            with self.assertRaises(ValueError):
+                handler(server.Handler, {"symbols": ["SMCI"]})
+
+    def test_gamma_handler_rejects_non_index_symbols(self):
+        with self.assertRaises(ValueError):
+            server.Handler._api_options_gamma(server.Handler, {"symbol": ["SMCI"]})
+
+    def test_handlers_accept_the_override(self):
+        calls = {}
+        self.patch_server("get_itm_scan",
+                          lambda *a, **k: calls.setdefault("syms", a[0]) or {"contracts": []})
+        server.Handler._api_options_itm_scan(
+            server.Handler, {"symbols": ["SMCI"], "allow_any": ["1"]})
+        self.assertEqual(calls["syms"], ["SMCI"])
+
+    def test_default_universe_needs_no_override(self):
+        calls = {}
+        self.patch_server("get_itm_scan",
+                          lambda *a, **k: calls.setdefault("syms", a[0]) or {"contracts": []})
+        server.Handler._api_options_itm_scan(server.Handler, {})
+        self.assertEqual(calls["syms"], server.SNIPE_SCAN)
+
+    def test_option_scan_board_is_not_restricted(self):
+        """The Flow board is 'most active options across the market' -- a
+        different feature with a different purpose. Restricting it would
+        break it, so it must keep its single-name universe."""
+        self.assertTrue(set(server.OPTION_SCAN) - server.INDEX_FUNDS,
+                        "OPTION_SCAN still spans names beyond the index funds")
+
+    # -- the flag ----------------------------------------------------------
+
+    def test_non_index_underlying_is_flagged(self):
+        flags, _r = server._build_risk_flags(
+            volume=5000, oi=20000, iv=None, rvol=None,
+            earnings_date_iso=None, expiry_iso=None, underlying="SMCI")
+        self.assertIn("NON_INDEX", {f["code"] for f in flags})
+
+    def test_index_underlying_is_not_flagged(self):
+        flags, _r = server._build_risk_flags(
+            volume=5000, oi=20000, iv=None, rvol=None,
+            earnings_date_iso=None, expiry_iso=None, underlying="SPY")
+        self.assertEqual(flags, [])
+
+    def test_flag_is_absent_when_no_underlying_is_supplied(self):
+        """Callers that don't pass an underlying must not get a spurious
+        flag -- absence of information isn't evidence of a non-index name."""
+        flags, _r = server._build_risk_flags(
+            volume=5000, oi=20000, iv=None, rvol=None,
+            earnings_date_iso=None, expiry_iso=None)
+        self.assertEqual(flags, [])
+
+    def test_flag_reaches_the_board_output(self):
+        self.patch_server("get_quotes", lambda syms: {"SMCI": {"price": 500.0}})
+        self.patch_server("_fetch_chain", lambda s, require_volume=True: {
+            "contracts": [_snipe_contract(dte=0, volume=5000, oi=20000)],
+            "call_vol": 0.0, "put_vol": 0.0, "ts": 1700000000})
+        c = server.get_itm_scan(["SMCI"])["contracts"][0]
+        self.assertIn("NON_INDEX", {f["code"] for f in c["flags"]})
+        self.assertLess(c["score"], c["raw_score"])
+
+
 class ItmScanEndpointHorizonRoutingTests(NetworkFreeTestCase):
     """The /api/options/itm-scan handler picks the board by horizon:
     target_dte=0 (the default) keeps the 0DTE score, target_dte>0 routes to
@@ -1919,6 +2023,53 @@ class ModeledBacktestTests(NetworkFreeTestCase):
         out = server.get_modeled_backtest("IWM", vol_source="implied")
         self.assertIn("realized", out["vol_source"])
         self.assertIn("no implied-vol proxy", out["vol_source"])
+
+    def test_truncated_proxy_series_falls_back_and_says_so(self):
+        """Regression. Yahoo intermittently answers 200 with a TRUNCATED
+        series -- measured on ^VIX9D, three consecutive fetches returned
+        501, 501 and 1 bars. get_history zips timestamps against closes, so
+        that arrives as a short-but-valid series, not an error.
+
+        Before the coverage floor, a 1-bar response was truthy and the run
+        reported `implied (^VIX)` while pricing essentially every trade off
+        realized vol -- putting the optimistic realized-vol number under the
+        honest implied-vol label."""
+        base = 1700000000
+        closes = self._drifting(200)
+        def truncated(sym, rng="6mo"):
+            if sym.startswith("^"):          # proxy: a single bar
+                return {"t": [base], "c": [18.0]}
+            return {"t": [base + i * 86400 for i in range(len(closes))], "c": closes}
+        self.patch_server("get_history", truncated)
+        out = server.get_modeled_backtest("SPY", vol_source="implied")
+        self.assertIn("realized", out["vol_source"])
+        self.assertIn("incomplete", out["vol_source"])
+        self.assertNotIn("implied (", out["vol_source"])
+
+    def test_partial_proxy_coverage_is_rejected_wholesale(self):
+        """Half a series is not 'mostly implied' -- mixing the two silently
+        across trades would make the run uninterpretable, so a series below
+        the floor is dropped entirely rather than used where it happens to
+        have data."""
+        base = 1700000000
+        closes = self._drifting(200)
+        def half(sym, rng="6mo"):
+            n = len(closes)
+            if sym.startswith("^"):
+                half_n = n // 2
+                return {"t": [base + i * 86400 for i in range(half_n)],
+                        "c": [18.0] * half_n}
+            return {"t": [base + i * 86400 for i in range(n)], "c": closes}
+        self.patch_server("get_history", half)
+        out = server.get_modeled_backtest("SPY", vol_source="implied")
+        self.assertIn("incomplete", out["vol_source"])
+
+    def test_full_coverage_is_accepted(self):
+        """Control for the two above: a complete series must still be used."""
+        self._patch_history(self._drifting(200), vix=18.0)
+        out = server.get_modeled_backtest("SPY", vol_source="implied")
+        self.assertIn("implied (", out["vol_source"])
+        self.assertNotIn("incomplete", out["vol_source"])
 
     def test_implied_and_realized_runs_are_both_reported(self):
         """The point of keeping both: the difference the vol input makes is

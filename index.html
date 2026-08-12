@@ -425,6 +425,9 @@ table.opt tr.body:hover { background: var(--surface-3); cursor: pointer; }
 .snipe-flag.THIN_OI, .snipe-flag.THIN_VOL {
   color: var(--ink-2); border-color: var(--border); background: var(--surface-3);
 }
+/* only reachable via allow_any=1 — the caller stepped outside the index-fund
+   universe the boards are scoped to, so the row stays but carries the reason */
+.snipe-flag.NON_INDEX { color: var(--down); border-color: var(--down); background: rgba(230,103,103,0.15); }
 /* raw score struck through next to the penalized one, so the deduction is
    visible rather than the board just quietly ranking something lower */
 .snipe-score-raw { color: var(--ink-muted); font-size: 9px; text-decoration: line-through; margin-left: 4px; }
