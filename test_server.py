@@ -1998,16 +1998,17 @@ class ModeledBacktestTests(NetworkFreeTestCase):
     def test_implied_vol_series_scales_percent_to_a_fraction(self):
         """VIX quotes annualized vol in percent; the pricer wants a fraction."""
         self._patch_history(self._drifting(50), vix=20.0)
-        series = server.implied_vol_series("SPY", "2y")
+        proxy, series = server.implied_vol_series("SPY", "2y")
         self.assertTrue(series)
+        self.assertIn("VIX", proxy)
         self.assertAlmostEqual(next(iter(series.values())), 0.20)
 
     def test_symbols_without_a_proxy_return_none_not_empty(self):
         """None means 'no proxy exists' (permanent); an empty dict would mean
         'the fetch came back empty' (retryable). Callers treat them
         differently, so the distinction has to survive."""
-        self.assertIsNone(server.implied_vol_series("IWM", "2y"))
-        self.assertIsNone(server.implied_vol_series("NOT-A-TICKER", "2y"))
+        self.assertEqual(server.implied_vol_series("IWM", "2y"), (None, None))
+        self.assertEqual(server.implied_vol_series("NOT-A-TICKER", "2y"), (None, None))
 
     def test_implied_vol_is_used_when_a_proxy_exists(self):
         self._patch_history(self._drifting(200), vix=20.0)
@@ -2070,6 +2071,53 @@ class ModeledBacktestTests(NetworkFreeTestCase):
         out = server.get_modeled_backtest("SPY", vol_source="implied")
         self.assertIn("implied (", out["vol_source"])
         self.assertNotIn("incomplete", out["vol_source"])
+
+    def test_prefers_the_short_dated_proxy(self):
+        """These price ~7-DTE contracts, so 9-day vol is the right point on
+        the curve; 30-day understates entry cost because short-dated vol is
+        usually the pricier end."""
+        base = 1700000000
+        closes = self._drifting(200)
+        def hist(sym, rng="6mo"):
+            if sym.startswith("^"):
+                return {"t": [base + i * 86400 for i in range(len(closes))],
+                        "c": [20.0] * len(closes)}
+            return {"t": [base + i * 86400 for i in range(len(closes))], "c": closes}
+        self.patch_server("get_history", hist)
+        out = server.get_modeled_backtest("SPY", vol_source="implied")
+        self.assertIn("^VIX9D", out["vol_source"])
+
+    def test_truncated_short_dated_proxy_falls_back_to_the_30day_index(self):
+        """^VIX9D is the series actually observed truncating. When it does,
+        the run should drop to ^VIX -- still real implied vol -- rather than
+        all the way to realized, which would be a much bigger loss of
+        fidelity than the term-structure error it was avoiding."""
+        base = 1700000000
+        closes = self._drifting(200)
+        def hist(sym, rng="6mo"):
+            if sym == "^VIX9D":
+                return {"t": [base], "c": [17.0]}          # truncated
+            if sym.startswith("^"):
+                return {"t": [base + i * 86400 for i in range(len(closes))],
+                        "c": [20.0] * len(closes)}          # full 30-day
+            return {"t": [base + i * 86400 for i in range(len(closes))], "c": closes}
+        self.patch_server("get_history", hist)
+        out = server.get_modeled_backtest("SPY", vol_source="implied")
+        self.assertIn("implied (^VIX)", out["vol_source"])
+        self.assertNotIn("^VIX9D", out["vol_source"])
+        self.assertNotIn("incomplete", out["vol_source"])
+
+    def test_all_proxies_truncated_falls_back_to_realized(self):
+        base = 1700000000
+        closes = self._drifting(200)
+        def hist(sym, rng="6mo"):
+            if sym.startswith("^"):
+                return {"t": [base], "c": [17.0]}
+            return {"t": [base + i * 86400 for i in range(len(closes))], "c": closes}
+        self.patch_server("get_history", hist)
+        out = server.get_modeled_backtest("SPY", vol_source="implied")
+        self.assertIn("realized", out["vol_source"])
+        self.assertIn("incomplete", out["vol_source"])
 
     def test_implied_and_realized_runs_are_both_reported(self):
         """The point of keeping both: the difference the vol input makes is

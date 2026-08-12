@@ -1821,7 +1821,16 @@ _VOL_PREMIUM_SENSITIVITY = (1.0, 1.1, 1.25)
 # these track the INDEX (SPX/NDX), not the ETF, and they quote 30-day
 # implied vol while the simulated contracts are ~7-day, so term structure
 # is ignored.
-_IV_PROXY = {"SPY": "^VIX", "QQQ": "^VXN"}
+# Ordered preference per symbol: the first proxy with usable coverage wins.
+# Short-dated first, because these simulate ~7-DTE contracts and 30-day vol is
+# the wrong point on the curve for them -- short-dated vol is usually the
+# pricier end, so using 30-day understates entry cost.
+#
+# ^VIX9D (9-day SPX) is the closest published match for SPY. No short-dated
+# NDX index is published, so QQQ keeps 30-day ^VXN. Both fall back to the
+# 30-day index if the short-dated fetch comes back truncated -- see
+# _IV_MIN_COVERAGE, which is exactly the failure ^VIX9D was observed to have.
+_IV_PROXY = {"SPY": ("^VIX9D", "^VIX"), "QQQ": ("^VXN",)}
 
 
 def _norm_cdf(x):
@@ -1873,25 +1882,43 @@ def _realized_vol_from(closes):
 _IV_MIN_COVERAGE = 0.80
 
 
-def implied_vol_series(symbol, rng):
-    """{date: sigma} from `symbol`'s implied-vol proxy index, or None when no
+def implied_vol_series(symbol, rng, needed_dates=None):
+    """(proxy_name, {date: sigma}) for `symbol`, or (None, None) when no
     proxy exists for it.
 
-    The index quotes annualized implied vol in percent (VIX 15.4 -> 0.154).
-    Returning None rather than an empty dict lets callers distinguish "this
-    symbol has no proxy" from "the proxy fetch came back empty", which
-    matter differently: the first is permanent, the second is retryable.
+    Walks _IV_PROXY's preference order and returns the first proxy whose
+    coverage of `needed_dates` clears _IV_MIN_COVERAGE, so a truncated
+    short-dated fetch falls through to the 30-day index instead of quietly
+    degrading the whole run to realized vol. With no `needed_dates` the
+    first proxy that returns anything wins -- callers that care about
+    coverage must say what they're pricing.
 
-    Callers must check coverage against the dates they actually intend to
-    price -- see _IV_MIN_COVERAGE. A short series here is not an error and
-    cannot be detected from the series alone.
+    The index quotes annualized implied vol in percent (VIX 15.4 -> 0.154).
+    (None, None) rather than an empty dict lets callers distinguish "this
+    symbol has no proxy" (permanent) from "the fetch came back short"
+    (retryable) -- they're reported differently.
     """
-    proxy = _IV_PROXY.get(symbol.upper())
-    if not proxy:
-        return None
-    hist = get_history(proxy, rng)
-    ts, closes = hist.get("t") or [], hist.get("c") or []
-    return {_et_date_from_ts(t): c / 100.0 for t, c in zip(ts, closes) if c}
+    proxies = _IV_PROXY.get(symbol.upper())
+    if not proxies:
+        return None, None
+    best = (None, None, -1.0)
+    for proxy in proxies:
+        hist = get_history(proxy, rng)
+        ts, closes = hist.get("t") or [], hist.get("c") or []
+        series = {_et_date_from_ts(t): c / 100.0 for t, c in zip(ts, closes) if c}
+        if not needed_dates:
+            if series:
+                return proxy, series
+            continue
+        covered = sum(1 for d in needed_dates if d in series)
+        coverage = covered / len(needed_dates)
+        if coverage >= _IV_MIN_COVERAGE:
+            return proxy, series
+        if coverage > best[2]:
+            best = (proxy, series, coverage)
+    # Nothing cleared the floor. Hand back the best attempt so the caller can
+    # report how short it actually fell rather than just "unavailable".
+    return best[0], best[1]
 
 
 def _simulate_weekly_itm(bars, hold_days, moneyness, vol_lookback,
@@ -1984,20 +2011,20 @@ def get_modeled_backtest(symbol, rng="2y", hold_days=7, moneyness=0.01,
     ts, closes = hist.get("t") or [], hist.get("c") or []
     bars = [(_et_date_from_ts(t), c) for t, c in zip(ts, closes)]
 
-    iv_by_date = implied_vol_series(symbol, rng) if vol_source == "implied" else None
-    proxy = _IV_PROXY.get(symbol.upper())
+    needed = [d for d, _c in bars]
+    proxy, iv_by_date = ((None, None) if vol_source != "implied"
+                         else implied_vol_series(symbol, rng, needed))
     if vol_source != "implied":
         vol_source_used = f"realized ({vol_lookback}d trailing)"
-    elif iv_by_date is None:
+    elif proxy is None:
         # No proxy exists for this symbol at all (permanent).
         vol_source_used = f"realized (no implied-vol proxy for {symbol})"
     else:
-        # A proxy exists, but the fetch may have come back truncated -- check
-        # it against the dates actually being priced, not against itself.
+        # A proxy answered, but the fetch may have come back truncated --
+        # check against the dates actually being priced, not against itself.
         # Anything short is rejected rather than silently mixed with realized
-        # vol under an "implied" label. See _IV_MIN_COVERAGE.
-        needed = [d for d, _c in bars]
-        covered = sum(1 for d in needed if d in iv_by_date)
+        # vol across trades, which would make the run uninterpretable.
+        covered = sum(1 for d in needed if d in (iv_by_date or {}))
         coverage = covered / len(needed) if needed else 0.0
         if coverage >= _IV_MIN_COVERAGE:
             vol_source_used = f"implied ({proxy})"

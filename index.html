@@ -2395,7 +2395,14 @@ function renderSnipe(){
     box.append(e); return;
   }
 
-  if(snipeMode==="spreads"){ renderSpreadsTable(box, snipeData, cfg); return; }
+  // Spreads render their own table, then fall through to the shared trailer
+  // below (gamma). An early return here previously skipped it, so the gamma
+  // section silently vanished on this one board.
+  if(snipeMode==="spreads"){
+    renderSpreadsTable(box, snipeData, cfg);
+    renderSnipeTrailer(box, snipeData);
+    return;
+  }
 
   const contracts = sortSnipeRows(snipeData.contracts||[]);
   if(!contracts.length){
@@ -2498,10 +2505,15 @@ function renderSnipe(){
   // next close; it is not a record of the weekly or spreads boards, so it
   // only belongs under the mode it actually describes.
   if(LOGGED_BOARDS.includes(snipeMode)) renderSnipeLogSection(box, snipeMode);
+  renderSnipeTrailer(box, snipeData);
+}
 
-  // Gamma is a property of the underlying, not of any one board's scoring,
-  // so it hangs off the tab rather than a mode. Keyed to the first scanned
-  // symbol so it always has a concrete subject.
+/* Everything that hangs off the tab rather than a specific board. Shared by
+   every mode, so it lives in one function instead of being appended at each
+   render path's tail — which is how the spreads board silently lost it. */
+function renderSnipeTrailer(box, snipeData){
+  // Gamma is a property of the underlying, not of any board's scoring.
+  // Keyed to the first scanned symbol so it always has a concrete subject.
   const gxSym = (snipeData.contracts && snipeData.contracts[0] && snipeData.contracts[0].underlying)
              || (snipeData.spreads && snipeData.spreads[0] && snipeData.spreads[0].underlying)
              || "SPY";
