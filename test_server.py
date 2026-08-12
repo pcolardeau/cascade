@@ -259,6 +259,7 @@ class ApiRoutesTests(unittest.TestCase):
             "/api/options/itm-scan": server.Handler._api_options_itm_scan,
             "/api/options/itm-scan-weekly": server.Handler._api_options_itm_scan_weekly,
             "/api/options/debit-spreads": server.Handler._api_options_debit_spreads,
+            "/api/options/gamma": server.Handler._api_options_gamma,
             "/api/snipe-log": server.Handler._api_snipe_log,
         }
         self.assertEqual(server.Handler._API_ROUTES, expected)
@@ -1622,6 +1623,134 @@ class BuildRiskFlagsTests(unittest.TestCase):
         b, rb = server._build_risk_flags(**args)
         self.assertEqual([f["code"] for f in a], [f["code"] for f in b])
         self.assertEqual(ra, rb)
+
+
+class ParseChainVolumeFilterTests(unittest.TestCase):
+    """`require_volume` gates whether untraded strikes survive parsing.
+
+    Every trading board wants them gone -- an untraded contract has no
+    market to screen. Open-interest analysis needs them kept: on SPY's live
+    chain, zero-volume rows hold ~17% of all open interest, so filtering
+    them would silently discard a sixth of the positioning being measured.
+    """
+    @staticmethod
+    def _rows():
+        return _wrap_chain_json([
+            {"option": "SPY260821C00500000", "volume": 10, "open_interest": 100,
+             "bid": 1.0, "ask": 1.1, "gamma": 0.02},
+            {"option": "SPY260821C00505000", "volume": 0, "open_interest": 9000,
+             "bid": 1.0, "ask": 1.1, "gamma": 0.03},
+        ])
+
+    def test_traded_only_by_default(self):
+        contracts, _cv, _pv = server._parse_chain("SPY", self._rows())
+        self.assertEqual([c["strike"] for c in contracts], [500.0])
+
+    def test_untraded_strikes_kept_when_volume_not_required(self):
+        contracts, _cv, _pv = server._parse_chain("SPY", self._rows(),
+                                                  require_volume=False)
+        self.assertEqual(sorted(c["strike"] for c in contracts), [500.0, 505.0])
+
+    def test_gamma_is_surfaced_on_parsed_contracts(self):
+        contracts, _cv, _pv = server._parse_chain("SPY", self._rows())
+        self.assertEqual(contracts[0]["gamma"], 0.02)
+
+    def test_volume_totals_ignore_untraded_rows_either_way(self):
+        """A zero-volume row contributes nothing to call/put volume even when
+        it's kept -- otherwise the Flow board's put/call ratio would shift."""
+        _c, call_vol, _pv = server._parse_chain("SPY", self._rows(),
+                                                 require_volume=False)
+        self.assertEqual(call_vol, 10)
+
+
+class GammaExposureTests(NetworkFreeTestCase):
+    """get_gamma_exposure() reports where gamma is concentrated, deliberately
+    WITHOUT inferring dealer positioning -- open interest says how many
+    contracts exist at a strike, never who holds which side."""
+
+    def _patch(self, contracts, spot=500.0):
+        self.patch_server("get_quotes", lambda syms: {"SPY": {"price": spot}})
+        self.patch_server("_fetch_chain", lambda s, require_volume=True: {
+            "contracts": contracts, "call_vol": 0.0, "put_vol": 0.0, "ts": 1700000000,
+        })
+
+    @staticmethod
+    def _c(strike, typ="C", gamma=0.01, oi=100, dte=10):
+        return {"underlying": "SPY", "type": typ, "strike": strike, "dte": dte,
+                "gamma": gamma, "oi": oi, "expiry": "2026-08-21"}
+
+    def test_exposure_math_matches_the_documented_formula(self):
+        """gamma * OI * 100 * spot^2 * 0.01 = dollars of delta per 1% move."""
+        self._patch([self._c(500.0, gamma=0.01, oi=100)], spot=500.0)
+        out = server.get_gamma_exposure("SPY")
+        expected = 0.01 * 100 * 100 * (500.0 ** 2) * 0.01
+        self.assertAlmostEqual(out["strikes"][0]["call"], round(expected, 2))
+
+    def test_calls_and_puts_are_reported_separately_not_netted(self):
+        """Netting would encode an assumption about who is long which side."""
+        self._patch([self._c(500.0, "C", oi=100), self._c(500.0, "P", oi=100)])
+        row = server.get_gamma_exposure("SPY")["strikes"][0]
+        self.assertGreater(row["call"], 0)
+        self.assertGreater(row["put"], 0)
+        self.assertAlmostEqual(row["total"], row["call"] + row["put"])
+
+    def test_peak_strike_is_the_highest_total_concentration(self):
+        self._patch([self._c(500.0, oi=100), self._c(510.0, oi=5000),
+                     self._c(520.0, oi=50)])
+        self.assertEqual(server.get_gamma_exposure("SPY")["peak_strike"], 510.0)
+
+    def test_strikes_are_returned_in_strike_order(self):
+        self._patch([self._c(520.0, oi=90), self._c(500.0, oi=100),
+                     self._c(510.0, oi=95)])
+        strikes = [r["strike"] for r in server.get_gamma_exposure("SPY")["strikes"]]
+        self.assertEqual(strikes, sorted(strikes))
+
+    def test_top_limits_strikes_by_concentration_not_by_strike(self):
+        self._patch([self._c(500.0, oi=1), self._c(510.0, oi=9999),
+                     self._c(520.0, oi=5000)])
+        out = server.get_gamma_exposure("SPY", top=2)
+        self.assertEqual(sorted(r["strike"] for r in out["strikes"]), [510.0, 520.0])
+
+    def test_expiries_beyond_the_horizon_are_excluded(self):
+        self._patch([self._c(500.0, dte=10), self._c(510.0, dte=400)])
+        out = server.get_gamma_exposure("SPY", target_dte=30)
+        self.assertEqual([r["strike"] for r in out["strikes"]], [500.0])
+
+    def test_rows_without_gamma_or_open_interest_are_skipped(self):
+        self._patch([self._c(500.0, gamma=None), self._c(505.0, oi=0),
+                     self._c(510.0, gamma=0.02, oi=10)])
+        out = server.get_gamma_exposure("SPY")
+        self.assertEqual([r["strike"] for r in out["strikes"]], [510.0])
+
+    def test_missing_spot_does_not_crash(self):
+        self.patch_server("get_quotes", lambda syms: {})
+        self.patch_server("_fetch_chain", lambda s, require_volume=True: {
+            "contracts": [self._c(500.0)], "call_vol": 0.0, "put_vol": 0.0, "ts": None})
+        out = server.get_gamma_exposure("SPY")
+        self.assertIsNone(out["spot"])
+
+    def test_uses_the_unfiltered_chain(self):
+        """Untraded strikes are the point -- the analysis must request the
+        full chain, not the traded-only view every board uses."""
+        seen = {}
+        self.patch_server("get_quotes", lambda syms: {"SPY": {"price": 500.0}})
+        def fake(sym, require_volume=True):
+            seen["require_volume"] = require_volume
+            return {"contracts": [], "call_vol": 0.0, "put_vol": 0.0, "ts": None}
+        self.patch_server("_fetch_chain", fake)
+        server.get_gamma_exposure("SPY")
+        self.assertIs(seen["require_volume"], False)
+
+    def test_note_refuses_to_claim_dealer_positioning(self):
+        self._patch([self._c(500.0)])
+        note = server.get_gamma_exposure("SPY")["note"]
+        self.assertIn("never who holds which side", note)
+        self.assertIn("not a prediction", note)
+
+    def test_target_dte_is_clamped_like_the_other_scans(self):
+        self._patch([self._c(500.0, dte=10)])
+        out = server.get_gamma_exposure("SPY", target_dte=10 ** 6)
+        self.assertLessEqual(out["target_dte"], server.MAX_TARGET_DTE)
 
 
 class WeeklySnipeLogTests(NetworkFreeTestCase):

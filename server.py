@@ -559,8 +559,18 @@ def _parse_occ_symbol(occ_str):
         return None
 
 
-def _parse_chain(symbol, raw):
-    """Return (contracts, call_vol, put_vol) for one underlying's CBOE chain."""
+def _parse_chain(symbol, raw, require_volume=True):
+    """Return (contracts, call_vol, put_vol) for one underlying's CBOE chain.
+
+    Args:
+        require_volume (bool): drop contracts that haven't traded today.
+            True for every trading board -- an untraded contract has no
+            meaningful market to screen. False for open-interest analysis
+            (see get_gamma_exposure), where untraded strikes are precisely
+            the point: measured on SPY's live chain, zero-volume rows hold
+            17% of all open interest, so filtering them would silently
+            discard a sixth of the positioning being measured.
+    """
     contracts = []
     call_vol = put_vol = 0.0
     data = json.loads(raw)
@@ -570,7 +580,7 @@ def _parse_chain(symbol, raw):
     today = _today_et()
     for opt in body.get("options", []):
         vol = opt.get("volume") or 0
-        if not vol:
+        if require_volume and not vol:
             continue
         parsed = _parse_occ_symbol(opt.get("option", ""))
         if not parsed:
@@ -595,6 +605,7 @@ def _parse_chain(symbol, raw):
             "ask": opt.get("ask"),
             "delta": opt.get("delta"),  # signed: negative for puts, kept as-is (not abs'd)
             "theta": opt.get("theta"),
+            "gamma": opt.get("gamma"),
         })
     return contracts, call_vol, put_vol
 
@@ -609,8 +620,16 @@ def _cboe_chain_url(symbol):
             f"{urllib.parse.quote(symbol, safe='')}.json")
 
 
-def _fetch_chain(symbol):
-    key = f"o:{symbol}"
+def _fetch_chain(symbol, require_volume=True):
+    """Fetch and parse one underlying's chain, cached per (symbol, filter).
+
+    The two variants are cached under different keys deliberately: the
+    traded-only view is what every board wants and is far smaller, while the
+    full view (untraded strikes included) is only needed for open-interest
+    analysis. Sharing one cache entry would either bloat every board's
+    working set or silently give the OI analysis a filtered chain.
+    """
+    key = f"o:{symbol}" if require_volume else f"oall:{symbol}"
     cached = cache_get(key)
     if cached is not None:
         return cached
@@ -620,7 +639,7 @@ def _fetch_chain(symbol):
         raw = fetch(url, timeout=20)
         # capture the feed's own timestamp for the "as of" line
         ts = json.loads(raw).get("timestamp")
-        contracts, call_vol, put_vol = _parse_chain(symbol, raw)
+        contracts, call_vol, put_vol = _parse_chain(symbol, raw, require_volume)
         result = {"contracts": contracts, "call_vol": call_vol, "put_vol": put_vol, "ts": ts}
     except (urllib.error.URLError, IOError, json.JSONDecodeError, KeyError, ValueError):
         # Dead symbol or parsing error shouldn't kill the board; return empty result
@@ -1585,6 +1604,124 @@ def get_debit_spreads(symbols=None, target_dte=7, window=_DEFAULT_DTE_WINDOW, to
 
 
 # ---------------------------------------------------------------------------
+# Gamma concentration by strike.
+#
+# WHAT THIS IS NOT: a dealer-positioning model. The common "GEX" treatment
+# signs call gamma positive and put gamma negative on the assumption that
+# dealers are long calls and short puts, then concludes where they'll be
+# forced to hedge. That assumption is not in this data -- open interest says
+# how many contracts exist at a strike, never who holds which side. Publishing
+# an inferred dealer position as fact would be the most overconfident thing in
+# this app.
+#
+# So this reports the measurable thing only: how much gamma sits at each
+# strike, calls and puts kept separate rather than netted. A strike with a
+# large concentration is where the most option-price convexity is anchored,
+# which is a real and useful observation; whether anyone is hedging it, and in
+# which direction, is left to the reader rather than asserted.
+# ---------------------------------------------------------------------------
+GAMMA_TOP_STRIKES = 12
+
+
+def get_gamma_exposure(symbol, target_dte=30, window=None, top=GAMMA_TOP_STRIKES):
+    """Gamma concentration per strike for one underlying.
+
+    Uses the FULL chain including untraded strikes -- open interest is the
+    quantity being measured, and untraded rows hold a sixth of it (see
+    _parse_chain's require_volume note).
+
+    Per strike, per side, the reported figure is:
+
+        gamma * open_interest * 100 * spot^2 * 0.01
+
+    i.e. the dollar change in aggregate delta for a 1% move in the
+    underlying. gamma is per-share, a contract covers 100 shares, and
+    spot^2 * 0.01 converts "delta per $1" into "dollars per 1%" -- so the
+    number is directly comparable across underlyings at different prices.
+
+    Args:
+        symbol (str): underlying to analyze.
+        target_dte (int): include expiries out to this many days. Gamma is
+            concentrated in near-dated contracts, and far-dated OI mostly
+            adds noise, so this defaults to a month rather than the whole
+            chain.
+        window (int): unused placeholder kept out of the signature's way --
+            the DTE filter here is one-sided (0..target_dte), unlike the
+            boards' centered window.
+        top (int): how many strikes to return, ranked by total concentration.
+
+    Returns:
+        dict: {symbol, spot, as_of, delayed, note, strikes: [...],
+               peak_strike, total_call, total_put}.
+    """
+    target_dte = _clamp_int(target_dte, 0, MAX_TARGET_DTE)
+    top = max(top, 0)
+    key = f"gamma:{symbol}:{target_dte}:{top}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    quotes = get_quotes([symbol])
+    spot = (quotes.get(symbol) or {}).get("price")
+    res = _fetch_chain(symbol, require_volume=False)
+    contracts = res.get("contracts") or []
+
+    by_strike = {}
+    for c in contracts:
+        dte = c.get("dte")
+        if dte is None or dte < 0 or dte > target_dte:
+            continue
+        gamma, oi = c.get("gamma"), c.get("oi")
+        if not gamma or not oi:
+            continue
+        # dollars of delta per 1% move -- see the docstring
+        exposure = abs(gamma) * oi * 100 * (spot ** 2) * 0.01 if spot else 0.0
+        row = by_strike.setdefault(c["strike"], {
+            "strike": c["strike"], "call": 0.0, "put": 0.0,
+            "call_oi": 0, "put_oi": 0,
+        })
+        if c.get("type") == "C":
+            row["call"] += exposure
+            row["call_oi"] += oi
+        else:
+            row["put"] += exposure
+            row["put_oi"] += oi
+
+    rows = []
+    for row in by_strike.values():
+        row["total"] = row["call"] + row["put"]
+        # Kept separate rather than netted: netting encodes an assumption
+        # about who is long which side, which this data cannot support.
+        rows.append({k: (round(v, 2) if isinstance(v, float) else v)
+                     for k, v in row.items()})
+    rows.sort(key=lambda r: r["total"], reverse=True)
+    peak = rows[0]["strike"] if rows else None
+
+    out = {
+        "symbol": symbol,
+        "spot": spot,
+        "as_of": res.get("ts"),
+        "delayed": True,
+        "target_dte": target_dte,
+        "peak_strike": peak,
+        "total_call": round(sum(r["call"] for r in rows), 2),
+        "total_put": round(sum(r["put"] for r in rows), 2),
+        "strikes": sorted(rows[:top], key=lambda r: r["strike"]),
+        "note": ("CBOE delayed ~15min. Gamma concentration = gamma x open interest, "
+                 "expressed as dollars of delta per 1% move, for expiries within "
+                 f"{target_dte} days. Calls and puts are reported SEPARATELY, not "
+                 "netted: open interest says how many contracts exist at a strike, "
+                 "never who holds which side, so any dealer-positioning reading is "
+                 "an assumption this data cannot support. A high-concentration "
+                 "strike is where option convexity is anchored -- not a prediction "
+                 "that price will pin there. Screening tool, not a trade "
+                 "recommendation."),
+    }
+    cache_put(key, out, ttl=300)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Snipe Log -- forward paper-trading track record for the Snipe board's
 # top-scored pick each day.
 #
@@ -2026,6 +2163,14 @@ class Handler(BaseHTTPRequestHandler):
         window = int(self._qparam(query, "window", str(_DEFAULT_DTE_WINDOW)))
         return get_debit_spreads(syms, target_dte, window, top)
 
+    def _api_options_gamma(self, query):
+        sym = self._qparam(query, "symbol")
+        if not sym:
+            return {"_error": "no symbol"}
+        target_dte = int(self._qparam(query, "target_dte", "30"))
+        top = int(self._qparam(query, "top", str(GAMMA_TOP_STRIKES)))
+        return get_gamma_exposure(sym, target_dte=target_dte, top=top)
+
     def _api_snipe_log(self, query):
         board = self._qparam(query, "board", DEFAULT_SNIPE_BOARD)
         if board not in SNIPE_LOG_BOARDS:
@@ -2045,6 +2190,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/options/itm-scan": _api_options_itm_scan,
         "/api/options/itm-scan-weekly": _api_options_itm_scan_weekly,
         "/api/options/debit-spreads": _api_options_debit_spreads,
+        "/api/options/gamma": _api_options_gamma,
         "/api/snipe-log": _api_snipe_log,
     }
 
