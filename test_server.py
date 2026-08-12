@@ -257,6 +257,7 @@ class ApiRoutesTests(unittest.TestCase):
             "/api/options/active": server.Handler._api_options_active,
             "/api/options/itm-scan": server.Handler._api_options_itm_scan,
             "/api/options/itm-scan-weekly": server.Handler._api_options_itm_scan_weekly,
+            "/api/options/debit-spreads": server.Handler._api_options_debit_spreads,
             "/api/snipe-log": server.Handler._api_snipe_log,
         }
         self.assertEqual(server.Handler._API_ROUTES, expected)
@@ -1436,6 +1437,173 @@ class ItmScanEndpointHorizonRoutingTests(NetworkFreeTestCase):
         calls = self._record_calls()
         server.Handler._api_options_itm_scan_weekly(server.Handler, {})
         self.assertIn("weekly", calls)
+
+
+class SpreadScoreTests(unittest.TestCase):
+    """Tests _spread_score(): 40% probability of MAX profit (short-leg
+    delta, 0.40->0.85) + 40% reward per dollar risked (0->2.0x) + 20%
+    combined execution cost (0%->25%, inverted)."""
+
+    def test_perfect_inputs_score_100(self):
+        self.assertEqual(server._spread_score(short_delta=0.85, reward_risk=2.0,
+                                              cost_pct=0.0), 100.0)
+
+    def test_worst_inputs_score_0(self):
+        self.assertEqual(server._spread_score(short_delta=0.40, reward_risk=0.0,
+                                              cost_pct=0.25), 0.0)
+
+    def test_inputs_beyond_range_clamp(self):
+        self.assertEqual(server._spread_score(short_delta=1.5, reward_risk=9.0,
+                                              cost_pct=-0.5), 100.0)
+        self.assertEqual(server._spread_score(short_delta=0.1, reward_risk=-3.0,
+                                              cost_pct=0.9), 0.0)
+
+    def test_uses_short_leg_delta_for_probability(self):
+        """Max profit needs the underlying beyond the SHORT strike, so it's
+        the short leg's delta that estimates hitting the best case."""
+        lo = server._spread_score(short_delta=0.45, reward_risk=1.0, cost_pct=0.05)
+        hi = server._spread_score(short_delta=0.80, reward_risk=1.0, cost_pct=0.05)
+        self.assertGreater(hi, lo)
+
+    def test_better_reward_risk_scores_higher(self):
+        lo = server._spread_score(short_delta=0.6, reward_risk=0.4, cost_pct=0.05)
+        hi = server._spread_score(short_delta=0.6, reward_risk=1.8, cost_pct=0.05)
+        self.assertGreater(hi, lo)
+
+    def test_cheaper_execution_scores_higher(self):
+        wide = server._spread_score(short_delta=0.6, reward_risk=1.0, cost_pct=0.20)
+        tight = server._spread_score(short_delta=0.6, reward_risk=1.0, cost_pct=0.01)
+        self.assertGreater(tight, wide)
+
+    def test_missing_inputs_degrade_to_worst_case_not_a_crash(self):
+        self.assertIsInstance(
+            server._spread_score(short_delta=None, reward_risk=None, cost_pct=None),
+            float)
+
+
+class GetDebitSpreadsTests(NetworkFreeTestCase):
+    """Tests get_debit_spreads(): leg pairing, payoff math, the
+    conservative worst-fill pricing, and the invalid-spread guards."""
+
+    def _patch(self, spot, contracts, rvol=None, earnings=None):
+        self.patch_server("get_quotes", lambda syms: {"SPY": {"price": spot}})
+        self.patch_server("_fetch_chain", lambda symbol: {
+            "contracts": contracts, "call_vol": 0.0, "put_vol": 0.0, "ts": 1700000000,
+        })
+        self.patch_server("realized_vol", lambda symbol, lookback_days=30: rvol)
+        self.patch_server("earnings_map", lambda days_ahead: earnings or {})
+
+    @staticmethod
+    def _leg(strike, bid, ask, **kw):
+        """One tradeable leg. Liquidity defaults to healthy so the risk
+        flags stay quiet unless a test deliberately overrides them."""
+        kw.setdefault("volume", 5000)
+        kw.setdefault("oi", 20000)
+        return _snipe_contract(dte=7, expiry="2026-08-18", strike=strike,
+                               bid=bid, ask=ask, **kw)
+
+    def test_call_spread_payoff_math(self):
+        """Long 495C at ask 6.00, short 500C at bid 3.00, width 5.
+        Net debit 3.00 -> max loss $300; max gain (5-3)=2.00 -> $200;
+        breakeven 495+3 = 498."""
+        self._patch(500.0, [self._leg(495.0, 5.8, 6.0, delta=0.75),
+                            self._leg(500.0, 3.0, 3.2, delta=0.50)])
+        spreads = server.get_debit_spreads(["SPY"])["spreads"]
+        self.assertEqual(len(spreads), 1)
+        s = spreads[0]
+        self.assertEqual(s["long_strike"], 495.0)
+        self.assertEqual(s["short_strike"], 500.0)
+        self.assertEqual(s["net_debit"], 300.0)
+        self.assertEqual(s["max_loss"], 300.0)
+        self.assertEqual(s["max_gain"], 200.0)
+        self.assertAlmostEqual(s["reward_risk"], 200.0 / 300.0, places=3)
+        self.assertAlmostEqual(s["breakeven"], 498.0)
+
+    def test_put_spread_pairs_toward_lower_strikes(self):
+        """For puts the short leg sits BELOW the long leg -- that's the
+        further-out-of-the-money direction on the put side."""
+        self._patch(500.0, [self._leg(505.0, 5.8, 6.0, type="P", delta=-0.75),
+                            self._leg(500.0, 3.0, 3.2, type="P", delta=-0.50)])
+        spreads = server.get_debit_spreads(["SPY"])["spreads"]
+        self.assertEqual(len(spreads), 1)
+        s = spreads[0]
+        self.assertEqual(s["long_strike"], 505.0)
+        self.assertEqual(s["short_strike"], 500.0)
+        self.assertAlmostEqual(s["breakeven"], 502.0)  # 505 - 3.00
+
+    def test_prices_at_worst_realistic_fill(self):
+        """Long fills at ITS ASK and short at ITS BID -- both sides against
+        you -- so a wider quote makes the spread look worse, never better."""
+        self._patch(500.0, [self._leg(495.0, 5.0, 6.0, delta=0.75),
+                            self._leg(500.0, 3.0, 4.0, delta=0.50)])
+        s = server.get_debit_spreads(["SPY"])["spreads"][0]
+        self.assertEqual(s["net_debit"], 300.0, "6.00 ask - 3.00 bid, not mid-to-mid")
+
+    def test_otm_long_leg_is_not_used_as_an_anchor(self):
+        self._patch(500.0, [self._leg(505.0, 5.8, 6.0, delta=0.40),
+                            self._leg(510.0, 3.0, 3.2, delta=0.25)])
+        self.assertEqual(server.get_debit_spreads(["SPY"])["spreads"], [])
+
+    def test_credit_pairing_is_rejected(self):
+        """If the short leg's bid exceeds the long leg's ask it's a credit,
+        not a debit spread -- outside this board's scope."""
+        self._patch(500.0, [self._leg(495.0, 2.0, 2.1, delta=0.75),
+                            self._leg(500.0, 9.0, 9.2, delta=0.50)])
+        self.assertEqual(server.get_debit_spreads(["SPY"])["spreads"], [])
+
+    def test_debit_at_or_above_width_is_rejected(self):
+        """Paying >= the width can never return a profit at expiry."""
+        self._patch(500.0, [self._leg(495.0, 6.0, 6.2, delta=0.75),
+                            self._leg(500.0, 1.0, 1.1, delta=0.50)])
+        # width 5, net debit 6.2-1.0 = 5.2 -> rejected
+        self.assertEqual(server.get_debit_spreads(["SPY"])["spreads"], [])
+
+    def test_legs_are_not_paired_across_expiries(self):
+        """A long and short in different expiries is a calendar spread, not
+        a vertical -- the payoff math here would be wrong for it."""
+        self._patch(500.0, [
+            self._leg(495.0, 5.8, 6.0, delta=0.75),
+            _snipe_contract(dte=8, expiry="2026-08-19", strike=500.0,
+                            bid=3.0, ask=3.2, delta=0.50, volume=5000, oi=20000),
+        ])
+        self.assertEqual(server.get_debit_spreads(["SPY"])["spreads"], [])
+
+    def test_legs_are_not_paired_across_types(self):
+        self._patch(500.0, [self._leg(495.0, 5.8, 6.0, delta=0.75),
+                            self._leg(500.0, 3.0, 3.2, type="P", delta=-0.50)])
+        self.assertEqual(server.get_debit_spreads(["SPY"])["spreads"], [])
+
+    def test_risk_flags_penalize_the_spread_score(self):
+        self._patch(500.0, [self._leg(495.0, 5.8, 6.0, delta=0.75, volume=1, oi=1),
+                            self._leg(500.0, 3.0, 3.2, delta=0.50, volume=1, oi=1)],
+                    earnings={"SPY": "2026-08-17"})
+        s = server.get_debit_spreads(["SPY"])["spreads"][0]
+        codes = {f["code"] for f in s["flags"]}
+        self.assertIn("EARNINGS", codes)
+        self.assertIn("THIN_OI", codes)
+        self.assertLess(s["spread_score"], s["raw_spread_score"])
+
+    def test_ranked_by_spread_score_descending(self):
+        self._patch(500.0, [self._leg(490.0, 11.8, 12.0, delta=0.85),
+                            self._leg(495.0, 5.8, 6.0, delta=0.75),
+                            self._leg(500.0, 3.0, 3.2, delta=0.50)])
+        spreads = server.get_debit_spreads(["SPY"])["spreads"]
+        scores = [s["spread_score"] for s in spreads]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_top_limits_returned_spreads(self):
+        self._patch(500.0, [self._leg(490.0, 11.8, 12.0, delta=0.85),
+                            self._leg(495.0, 5.8, 6.0, delta=0.75),
+                            self._leg(500.0, 3.0, 3.2, delta=0.50)])
+        self.assertEqual(len(server.get_debit_spreads(["SPY"], top=1)["spreads"]), 1)
+
+    def test_note_carries_the_screening_disclaimer(self):
+        self._patch(500.0, [self._leg(495.0, 5.8, 6.0, delta=0.75),
+                            self._leg(500.0, 3.0, 3.2, delta=0.50)])
+        out = server.get_debit_spreads(["SPY"])
+        self.assertTrue(out["delayed"])
+        self.assertIn("Screening tool", out["note"])
+        self.assertIn("No trades are placed automatically", out["note"])
 
 
 class SnipeLogTests(NetworkFreeTestCase):

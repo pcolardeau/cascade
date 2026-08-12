@@ -868,9 +868,23 @@ def _apply_risk_flags(raw_score, flags):
     return round(max(0.0, raw_score - sum(f["penalty"] for f in flags)), 1)
 
 
+def _fetch_chains_and_quotes(symbols):
+    """The single network fan-out every options board starts from: spot
+    quotes for all symbols, plus each symbol's full CBOE chain in parallel.
+
+    Shared by the ITM scan core and the debit-spread board -- the latter
+    can't reuse _scan_itm_candidates directly because it needs the OTM side
+    of the chain too (that's where its short legs come from).
+    """
+    quotes = get_quotes(symbols)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        chains = dict(zip(symbols, executor.map(_fetch_chain, symbols)))
+    return quotes, chains
+
+
 def _scan_itm_candidates(symbols, dte_lo, dte_hi):
-    """Shared scan core behind every ITM board (0DTE Snipe, Snipe Weekly,
-    debit spreads).
+    """Shared scan core behind the single-leg ITM boards (0DTE Snipe, Snipe
+    Weekly).
 
     Does the one network fan-out (quotes + full chains, in parallel), filters
     to in-the-money contracts whose DTE falls in [dte_lo, dte_hi] and which
@@ -899,9 +913,7 @@ def _scan_itm_candidates(symbols, dte_lo, dte_hi):
         (as_of, candidates): `candidates` is a list of (raw_contract, spot,
         base) triples, where `base` holds the shared metrics above.
     """
-    quotes = get_quotes(symbols)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        chains = dict(zip(symbols, executor.map(_fetch_chain, symbols)))
+    quotes, chains = _fetch_chains_and_quotes(symbols)
     # Once per scan, not once per symbol -- see earnings_map's docstring.
     earnings = earnings_map(dte_hi)
 
@@ -1251,6 +1263,206 @@ def get_itm_scan_weekly(symbols=None, target_dte=7, window=2, top=20):
         "contracts": all_contracts[:top],
     }
     cache_put(key, out, ttl=300)  # a week-out decision doesn't need 0DTE-grade freshness
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Debit spreads -- a separate board, not a column on the single-leg ones.
+#
+# A vertical debit spread has a fundamentally different payoff shape from a
+# naked long: defined max loss AND capped max gain, versus unlimited-ish
+# upside for the full premium at risk. Ranking the two in one list would
+# compare numbers that don't mean the same thing (a 400% single-leg move
+# scenario is not comparable to a spread's fixed max gain), so this gets its
+# own scan, its own score, and its own endpoint.
+# ---------------------------------------------------------------------------
+_SPREAD_PROB_WEIGHT = 0.40    # |short-leg delta| -- odds of capturing MAX profit
+_SPREAD_REWARD_WEIGHT = 0.40  # max gain per dollar risked
+_SPREAD_COST_WEIGHT = 0.20    # combined execution cost of both legs
+_SPREAD_DELTA_FLOOR = 0.40    # |short delta| at/below this scores 0 on probability
+_SPREAD_DELTA_CEIL = 0.85     # |short delta| at/above this scores 1 on probability
+_SPREAD_REWARD_CEIL = 2.0     # max_gain/max_loss at/above this scores 1 on reward
+_SPREAD_COST_CEIL = 0.25      # combined spread% at/above this scores 0 on cost
+_SPREAD_MAX_WIDTH_STEPS = 6   # how many strikes above/below the long leg to pair
+
+
+def _spread_score(short_delta, reward_risk, cost_pct):
+    """0-100 score for one vertical debit spread.
+
+    Ranks on the question a spread actually poses -- "how likely am I to
+    collect the FULL width, and how much do I collect per dollar risked" --
+    rather than the single-leg boards' question of how far one option might
+    run.
+
+      - probability of max profit (40%): |delta| of the SHORT leg, not the
+        long one. Max gain requires the underlying to finish beyond the
+        short strike, so the short leg's delta is the market's own estimate
+        of hitting the best case. Scaled 0.40 -> 0.85.
+      - reward per dollar risked (40%): max_gain / max_loss, scaled 0 -> 2.0.
+        A spread risking $300 to make $600 scores full marks here.
+      - execution cost (20%): the COMBINED bid/ask cost of both legs, since
+        a spread is two fills on the way in and (usually) two on the way
+        out. Scaled so 0% -> 1 and 25% -> 0.
+    """
+    prob = _clamp01((abs(short_delta or 0) - _SPREAD_DELTA_FLOOR) /
+                     (_SPREAD_DELTA_CEIL - _SPREAD_DELTA_FLOOR))
+    reward = _clamp01((reward_risk or 0) / _SPREAD_REWARD_CEIL)
+    cost = _clamp01(1 - (cost_pct if cost_pct is not None else 1.0) / _SPREAD_COST_CEIL)
+    return round(100 * (_SPREAD_PROB_WEIGHT * prob +
+                         _SPREAD_REWARD_WEIGHT * reward +
+                         _SPREAD_COST_WEIGHT * cost), 1)
+
+
+def get_debit_spreads(symbols=None, target_dte=7, window=2, top=20):
+    """Build and rank vertical debit spreads (long ITM leg + short leg
+    further out) across the scanned underlyings.
+
+    For calls the short leg sits at a HIGHER strike, for puts a LOWER one --
+    in both cases further from the money than the long leg, which is what
+    makes the position a debit (you pay more for the long than you collect
+    for the short) with a defined max loss and a capped max gain.
+
+    Priced conservatively: the long leg fills at its ask and the short leg
+    at its bid, i.e. both sides against you. That is the worst realistic
+    fill, so the reported net debit is an upper bound on cost and the
+    reported max gain a lower bound on payoff -- the honest direction to err
+    for a screening tool.
+
+    Screening only: it never places or simulates placing an order.
+
+    Args:
+        symbols (list): Underlyings to scan. Defaults to SNIPE_SCAN.
+        target_dte (int), window (int): DTE window, as on the weekly board.
+        top (int): Max spreads returned across all symbols.
+
+    Returns:
+        dict: {as_of, delayed, note, spreads}.
+    """
+    if symbols is None:
+        symbols = SNIPE_SCAN
+    symbols = symbols[:MAX_API_SYMBOLS]
+    top = max(top, 0)
+    dte_lo, dte_hi = target_dte - window, target_dte + window
+    key = f"spreads:{','.join(sorted(symbols))}:{dte_lo}:{dte_hi}:{top}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    quotes, chains = _fetch_chains_and_quotes(symbols)
+    earnings = earnings_map(dte_hi)
+
+    all_spreads = []
+    as_of = None
+    for sym in symbols:
+        res = chains.get(sym) or {}
+        as_of = as_of or res.get("ts")
+        spot = (quotes.get(sym) or {}).get("price")
+        if not spot:
+            continue
+        rvol = realized_vol(sym)
+        earnings_date_iso = earnings.get(sym.upper())
+
+        # Group the tradeable rows by (expiry, type) so legs are only ever
+        # paired within one expiry and one option type -- pairing across
+        # either would not be a vertical spread.
+        by_leg = {}
+        for c in res.get("contracts", []):
+            dte = c.get("dte")
+            if dte is None or not (dte_lo <= dte <= dte_hi):
+                continue
+            bid, ask = c.get("bid"), c.get("ask")
+            if bid is None or ask is None or bid <= 0 or ask <= 0:
+                continue
+            by_leg.setdefault((c.get("expiry"), c.get("type")), []).append(c)
+
+        for (expiry, typ), legs in by_leg.items():
+            # Ascending strike for calls, descending for puts, so "further
+            # out of the money" is always forward in this list and the same
+            # pairing loop works for both.
+            legs.sort(key=lambda c: c["strike"], reverse=(typ == "P"))
+            for i, long_leg in enumerate(legs):
+                long_strike = long_leg["strike"]
+                is_itm = ((typ == "C" and long_strike < spot) or
+                          (typ == "P" and long_strike > spot))
+                if not is_itm:
+                    continue  # long leg anchors the position; keep it ITM
+                for short_leg in legs[i + 1:i + 1 + _SPREAD_MAX_WIDTH_STEPS]:
+                    short_strike = short_leg["strike"]
+                    width = abs(short_strike - long_strike)
+                    if width <= 0:
+                        continue
+                    # Worst realistic fill: pay the ask, receive the bid.
+                    net_debit = long_leg["ask"] - short_leg["bid"]
+                    if net_debit <= 0 or net_debit >= width:
+                        # <=0 would be a credit (not a debit spread); >=width
+                        # means paying more than the position can ever return.
+                        continue
+
+                    max_loss = net_debit * 100
+                    max_gain = (width - net_debit) * 100
+                    reward_risk = max_gain / max_loss if max_loss else None
+                    breakeven = (long_strike + net_debit if typ == "C"
+                                 else long_strike - net_debit)
+                    breakeven_cushion_pct = ((spot - breakeven) / spot if typ == "C"
+                                             else (breakeven - spot) / spot)
+                    combined_cost = ((long_leg["ask"] - long_leg["bid"]) +
+                                     (short_leg["ask"] - short_leg["bid"]))
+                    cost_pct = combined_cost / net_debit if net_debit else None
+
+                    flags = _liquidity_flags(
+                        min(long_leg.get("volume") or 0, short_leg.get("volume") or 0),
+                        min(long_leg.get("oi") or 0, short_leg.get("oi") or 0))
+                    iv_flag, iv_rv_ratio = _iv_flag(long_leg.get("iv"), rvol)
+                    if iv_flag:
+                        flags.append(iv_flag)
+                    earnings_flag = _earnings_flag(earnings_date_iso, expiry)
+                    if earnings_flag:
+                        flags.append(earnings_flag)
+
+                    raw_score = _spread_score(short_leg.get("delta"),
+                                              reward_risk, cost_pct)
+                    all_spreads.append({
+                        "underlying": sym,
+                        "type": typ,
+                        "expiry": expiry,
+                        "dte": long_leg.get("dte"),
+                        "spot": spot,
+                        "long_strike": long_strike,
+                        "short_strike": short_strike,
+                        "width": round(width, 4),
+                        "long_ask": long_leg["ask"],
+                        "short_bid": short_leg["bid"],
+                        "long_delta": long_leg.get("delta"),
+                        "short_delta": short_leg.get("delta"),
+                        "net_debit": round(net_debit * 100, 2),
+                        "max_loss": round(max_loss, 2),
+                        "max_gain": round(max_gain, 2),
+                        "reward_risk": round(reward_risk, 3) if reward_risk else None,
+                        "breakeven": round(breakeven, 4),
+                        "breakeven_cushion_pct": round(breakeven_cushion_pct, 4),
+                        "cost_pct": round(cost_pct, 4) if cost_pct is not None else None,
+                        "spread_score": _apply_risk_flags(raw_score, flags),
+                        "raw_spread_score": raw_score,
+                        "flags": flags,
+                        "realized_vol": round(rvol, 2) if rvol else None,
+                        "iv_rv_ratio": iv_rv_ratio,
+                        "earnings_date": earnings_date_iso,
+                    })
+
+    all_spreads.sort(key=lambda s: s["spread_score"], reverse=True)
+    out = {
+        "as_of": as_of,
+        "delayed": True,
+        "note": (f"CBOE delayed ~15min. Vertical debit spreads, ~{target_dte}-DTE "
+                 f"(window +/-{window} days), long leg ITM. Priced at the worst "
+                 "realistic fill (buy the ask, sell the bid), so net debit is an "
+                 "upper bound and max gain a lower bound. Ranked by Spread Score "
+                 "(probability of max profit + reward per dollar risked + "
+                 "execution cost). Screening tool, not a trade recommendation. "
+                 "No trades are placed automatically."),
+        "spreads": all_spreads[:top],
+    }
+    cache_put(key, out, ttl=300)
     return out
 
 
@@ -1624,6 +1836,13 @@ class Handler(BaseHTTPRequestHandler):
         window = int(self._qparam(query, "window", "2"))
         return get_itm_scan_weekly(syms, target_dte, window, top)
 
+    def _api_options_debit_spreads(self, query):
+        syms = self._qsymbols(query, default=SNIPE_SCAN)
+        top = int(self._qparam(query, "top", "20"))
+        target_dte = int(self._qparam(query, "target_dte", "7"))
+        window = int(self._qparam(query, "window", "2"))
+        return get_debit_spreads(syms, target_dte, window, top)
+
     def _api_snipe_log(self, query):
         return get_snipe_log()
 
@@ -1639,6 +1858,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/options/active": _api_options_active,
         "/api/options/itm-scan": _api_options_itm_scan,
         "/api/options/itm-scan-weekly": _api_options_itm_scan_weekly,
+        "/api/options/debit-spreads": _api_options_debit_spreads,
         "/api/snipe-log": _api_snipe_log,
     }
 
