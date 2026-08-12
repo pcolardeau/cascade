@@ -189,6 +189,29 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
 .order-key .li { display: flex; align-items: center; gap: 8px; font-size: 10px; color: var(--ink-2); }
 .order-key svg { flex: 0 0 auto; }
 
+/* index view (cosmos.gl, all 503) — a sibling layer to the SVG, not a
+   replacement, so the curated graph keeps everything cosmos.gl can't do:
+   per-node text labels, dashed hop-order edges, and the pinned radial
+   cascade. Labels here are on-demand only, which is the right call at 503
+   nodes regardless of renderer. */
+#index-stage { position: absolute; inset: 0; display: none; }
+#index-stage.on { display: block; }
+#index-label {
+  position: absolute; z-index: 20; pointer-events: none; display: none;
+  background: rgba(26,26,25,0.97); border: 1px solid var(--border); border-radius: 5px;
+  padding: 5px 8px; font-size: 11px; box-shadow: 0 6px 24px rgba(0,0,0,0.5);
+}
+#index-label .tk { font-weight: 800; }
+#index-label .sec { color: var(--ink-muted); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.6px; }
+#index-note {
+  position: absolute; left: 12px; bottom: 12px; z-index: 15; display: none;
+  background: rgba(20,20,19,0.88); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; font-size: 10px; color: var(--ink-2); max-width: 430px;
+  line-height: 1.5; backdrop-filter: blur(6px);
+}
+#index-note.on { display: block; }
+.tbtn.on { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+
 /* node/edge svg styling */
 .edge { stroke: var(--baseline); fill: none; transition: stroke 0.3s, opacity 0.3s, stroke-width 0.3s; }
 .edge.dim { opacity: 0.12; }
@@ -505,6 +528,13 @@ footer b { color: var(--ink-2); font-weight: 600; }
   <!-- center: network -->
   <section id="stage-wrap">
     <svg id="stage"></svg>
+    <!-- Index view: all 503 S&P names on the GPU. Hidden until asked for, and
+         it renders into its own canvas rather than replacing the SVG, so the
+         curated graph keeps its labels, dashed hop-order edges and radial
+         cascade layout untouched. -->
+    <div id="index-stage"></div>
+    <div id="index-label"></div>
+    <div id="index-note"></div>
     <div class="toolbar">
       <div class="tool-group">
         <span class="tool-label">Shock</span>
@@ -520,6 +550,7 @@ footer b { color: var(--ink-2); font-weight: 600; }
       <button class="tbtn" id="btn-clear">CLEAR</button>
       <button class="tbtn" id="btn-reheat">RE-LAYOUT</button>
       <button class="tbtn" id="btn-sync-corr" title="Rebuild the correlation network from 6mo live daily history">SYNC HISTORY</button>
+      <button class="tbtn" id="btn-index-view" title="Render all 503 S&amp;P 500 names on the GPU. The curated graph keeps labels and hop-order edges; this view trades those for scale.">INDEX VIEW</button>
       <span class="badge" id="corr-status">CORRELATION MODEL SYNTHETIC</span>
     </div>
     <div class="legend" id="legend"></div>
@@ -566,6 +597,7 @@ footer b { color: var(--ink-2); font-weight: 600; }
 
 <div id="tip"></div>
 
+<script src="/vendor/cosmos.umd.js"></script>
 <script>
 "use strict";
 /* ============================================================================
@@ -3525,6 +3557,195 @@ setTimeout(()=>{
   selectNode(IDX[selTk] ?? IDX.NVDA);
   if(sel2Tk!=null && IDX[sel2Tk]!=null) selectNode(IDX[sel2Tk], {compare:true});
 }, 600);
+/* ============================================================================
+   INDEX VIEW — all 503 S&P names, rendered on the GPU by cosmos.gl
+
+   This is a SEPARATE layer, not a replacement for the SVG graph. cosmos.gl
+   cannot draw per-node text labels or dashed hop-order edges, and the pinned
+   radial cascade fights its GPU simulation — all three are core to the
+   curated view, so that view keeps SVG. cosmos.gl earns its 693 KB only
+   here, where 503 nodes and ~1k links would make SVG crawl.
+
+   The model is built LAZILY on first open: 503 return series plus a
+   503x503 correlation pass is ~30M multiply-adds, which is fine once but
+   has no business running at boot for a view most sessions never open.
+   ========================================================================== */
+let indexView = { on:false, graph:null, built:false, nodes:null, building:false };
+
+function buildIndexModel(){
+  // Same synthetic factor model as the curated graph, so the two views are
+  // consistent with each other rather than two different fictions.
+  const list = SP500.filter(e => EXPOSURE[e[2]]);   // macro has no exposure row
+  const n = list.length;
+  const series503 = new Array(n);
+  const mean503 = new Float64Array(n), sd503 = new Float64Array(n);
+
+  for(let i=0;i<n;i++){
+    const sec = list[i][2];
+    const [bm,bs,br,bo] = EXPOSURE[sec];
+    const beta = bm*(0.85+0.3*rand());
+    const a = new Float64Array(DAYS);
+    for(let t=0;t<DAYS;t++)
+      a[t] = beta*F_mkt[t] + bs*F_sect[sec][t] + br*F_rate[t] + bo*F_oil[t] + 0.0085*gauss();
+    let m=0; for(let t=0;t<DAYS;t++) m+=a[t]; m/=DAYS;
+    let v=0; for(let t=0;t<DAYS;t++) v+=(a[t]-m)**2;
+    series503[i]=a; mean503[i]=m; sd503[i]=Math.sqrt(v/DAYS);
+  }
+
+  // Standardize once so the correlation pass is a plain dot product rather
+  // than re-centring inside the O(n^2) loop.
+  const z = new Array(n);
+  for(let i=0;i<n;i++){
+    const a=series503[i], zi=new Float64Array(DAYS), s=sd503[i]||1;
+    for(let t=0;t<DAYS;t++) zi[t]=(a[t]-mean503[i])/s;
+    z[i]=zi;
+  }
+
+  // Top-2 correlates per node: enough to show structure, few enough that the
+  // link count stays ~1k rather than the 126,506 candidate pairs.
+  const K=2, links=[];
+  const seen=new Set();
+  for(let i=0;i<n;i++){
+    let b1=-1,b1j=-1,b2=-1,b2j=-1;
+    for(let j=0;j<n;j++){
+      if(j===i) continue;
+      let dot=0; const zi=z[i], zj=z[j];
+      for(let t=0;t<DAYS;t++) dot+=zi[t]*zj[t];
+      const ar=Math.abs(dot/DAYS);
+      if(ar>b1){ b2=b1;b2j=b1j; b1=ar;b1j=j; }
+      else if(ar>b2){ b2=ar;b2j=j; }
+    }
+    for(const j of [b1j,b2j]){
+      if(j<0) continue;
+      const k = i<j ? i+"-"+j : j+"-"+i;
+      if(seen.has(k)) continue;
+      seen.add(k); links.push(i,j);
+    }
+  }
+  return { list, n, links: new Float32Array(links) };
+}
+
+function hexToRgba(hex){
+  const h=hex.replace("#","");
+  return [parseInt(h.slice(0,2),16)/255, parseInt(h.slice(2,4),16)/255,
+          parseInt(h.slice(4,6),16)/255, 1];
+}
+
+function initIndexGraph(){
+  const model = buildIndexModel();
+  indexView.nodes = model.list;
+
+  const n = model.n;
+  const pos = new Float32Array(n*2), col = new Float32Array(n*4), size = new Float32Array(n);
+  for(let i=0;i<n;i++){
+    // Seed positions in sector clusters so the first frame already reads as
+    // structure rather than a random cloud the sim has to untangle.
+    const sec = model.list[i][2];
+    const si = SECTORS.findIndex(s=>s.id===sec);
+    const ang = (si/SECTORS.length)*Math.PI*2 + gauss()*0.25;
+    const rad = 260 + gauss()*70;
+    pos[i*2]=Math.cos(ang)*rad; pos[i*2+1]=Math.sin(ang)*rad;
+    const [r,g,b,a] = hexToRgba(SECTOR_BY_ID[sec].hex);
+    col[i*4]=r; col[i*4+1]=g; col[i*4+2]=b; col[i*4+3]=a;
+    // Sized for legibility at 503 points, not for density: at 3px they were
+    // technically rendering but visually absent on a 1250px canvas.
+    size[i] = 7;
+  }
+
+  const graph = new Cosmos.Graph(document.getElementById("index-stage"), {
+    backgroundColor: "#0e0e0d",
+    pointGreyoutOpacity: 0.15,
+    linkWidth: 0.35,
+    linkColor: "#3a3a37",
+    linkArrows: false,
+    // Tuned to keep the cloud compact enough to frame: with weaker gravity
+    // the sim pushed points out past 2000 units and fitView couldn't hold
+    // them and the point size in view at the same time.
+    simulationGravity: 0.5,
+    simulationRepulsion: 0.35,
+    simulationLinkSpring: 1.0,
+    simulationFriction: 0.88,
+    fitViewOnInit: true,
+    onClick: (i)=>{
+      if(i==null) return;
+      const e = indexView.nodes[i];
+      // Clicking an index node adds it to the curated graph -- the two views
+      // stay connected instead of the index being a dead-end display.
+      if(IDX[e[0]]==null){ addLiveNode(e[0], e[1], e[2]); saveWatchlist(); renderList(); }
+      showIndexLabel(i, true);
+    },
+    onPointMouseOver: (i)=> showIndexLabel(i, false),
+    onPointMouseOut: ()=> { document.getElementById("index-label").style.display="none"; },
+  });
+  graph.setPointPositions(pos);
+  graph.setPointColors(col);
+  graph.setPointSizes(size);
+  graph.setLinks(model.links);
+  graph.render();
+  indexView.graph = graph;
+  indexView.built = true;
+  // fitViewOnInit frames the SEED positions; the simulation then moves
+  // everything, so re-frame once it has mostly settled.
+  setTimeout(()=>{ try{ graph.fitView(); }catch(e){} }, 1200);
+  setTimeout(()=>{ try{ graph.fitView(); }catch(e){} }, 3000);
+}
+
+function showIndexLabel(i, sticky){
+  const e = indexView.nodes && indexView.nodes[i];
+  const box = document.getElementById("index-label");
+  if(!e){ box.style.display="none"; return; }
+  box.replaceChildren();
+  const tk=document.createElement("div"); tk.className="tk"; tk.textContent=e[0];
+  const nm=document.createElement("div"); nm.textContent=e[1];
+  const sc=document.createElement("div"); sc.className="sec";
+  sc.textContent = SECTOR_BY_ID[e[2]].label + (IDX[e[0]]!=null ? " · on graph" : " · click to add");
+  box.append(tk,nm,sc);
+  box.style.display="block";
+  // Anchored to the cursor rather than the point: cosmos.gl doesn't expose a
+  // world->screen transform, and at 503 points the cursor IS the point.
+  box.style.left = (lastPointer.x+14)+"px";
+  box.style.top  = (lastPointer.y+14)+"px";
+}
+
+let lastPointer = {x:0,y:0};
+window.addEventListener("mousemove", e=>{ lastPointer={x:e.clientX,y:e.clientY}; });
+
+function setIndexView(on){
+  indexView.on = on;
+  document.getElementById("index-stage").classList.toggle("on", on);
+  document.getElementById("btn-index-view").classList.toggle("on", on);
+  document.getElementById("stage").style.display = on ? "none" : "block";
+  document.querySelectorAll(".legend, .order-key").forEach(el=>{
+    el.style.display = on ? "none" : "";
+  });
+  const note = document.getElementById("index-note");
+  note.classList.toggle("on", on);
+  if(on && !note.textContent){
+    note.textContent = "All 503 S&P 500 names, GPU-rendered. Labels appear on hover "
+      + "only and hop-order dashes aren't drawn — this renderer can't do either, "
+      + "which is why the curated graph keeps its own. Click any point to add it "
+      + "to that graph. Correlations are the synthetic factor model, not live.";
+  }
+  if(on && !indexView.built && !indexView.building){
+    indexView.building = true;
+    note.textContent = "Building 503-name correlation model…";
+    // Yield a frame so the note paints before the ~30M-op build blocks.
+    requestAnimationFrame(()=> requestAnimationFrame(()=>{
+      const t0=performance.now();
+      try{ initIndexGraph(); }
+      catch(err){ note.textContent = "Index view failed: "+err.message; indexView.building=false; return; }
+      indexView.building=false;
+      note.textContent = "All 503 S&P 500 names, GPU-rendered in "
+        + Math.round(performance.now()-t0) + "ms. Labels on hover only and no "
+        + "hop-order dashes — this renderer can't do either, which is why the "
+        + "curated graph keeps its own. Click any point to add it there. "
+        + "Correlations are the synthetic factor model, not live.";
+    }));
+  }
+}
+
+document.getElementById("btn-index-view").addEventListener("click", ()=> setIndexView(!indexView.on));
+
 // connect to the live proxy (degrades to model if server.py isn't running)
 setLiveStatus("connecting");
 startLive();
