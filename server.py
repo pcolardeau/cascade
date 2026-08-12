@@ -133,6 +133,49 @@ OPTION_SCAN = [
 # end-to-end. Add it later if CBOE's index-option support turns out sturdier.
 SNIPE_SCAN = ["SPY", "QQQ", "IWM"]
 
+# The Snipe boards screen US index funds only, because the boards are about
+# what can actually be FILLED and that is where the difference shows up.
+# Measured on live ~7-DTE ITM contracts:
+#
+#              median spread   p90 spread   median OI
+#   index ETFs     2.78%          8.4%         164
+#   single names   6.20%         14.6%         168
+#
+# So index ETFs are ~2.2x tighter on spread, which is the cost that actually
+# matters here (it is paid on entry AND exit, and is 15-25% of every score on
+# these boards). Note the advantage is specifically in spread, NOT depth --
+# per-contract open interest is effectively identical, because index chains
+# spread their much larger total OI across far more strikes and expiries.
+#
+# Accepted trade-off, recorded so it isn't mistaken for an oversight: these
+# three correlate 0.77-0.92 with each other (SPY-QQQ 0.92, SPY-IWM 0.84,
+# QQQ-IWM 0.77), so restricting to them is close to making one bet three
+# ways. Fill quality is worth more than diversification for a screener whose
+# entire edge is measured in basis points of spread.
+#
+# Not a hard wall: `allow_any=1` scans anything and flags the result NON_INDEX.
+# Scanning SMCI is how the too-narrow default DTE window was found (its
+# expiries land at 3/10/17 DTE, missing a +/-2 window entirely), so the
+# diagnostic path is deliberately kept open.
+INDEX_FUNDS = frozenset({"SPY", "QQQ", "IWM"})
+
+
+def validate_scan_symbols(symbols, allow_any=False):
+    """Return `symbols` if they're all US index funds, else raise ValueError.
+
+    do_GET already maps ValueError to a 400 with the message attached, so
+    this rides the existing error path rather than inventing another.
+    """
+    if allow_any:
+        return symbols
+    outside = [s for s in symbols if s.upper() not in INDEX_FUNDS]
+    if outside:
+        raise ValueError(
+            f"{', '.join(outside)} not a US index fund "
+            f"({'/'.join(sorted(INDEX_FUNDS))}); options there fill worse "
+            f"(~2.2x wider spreads). Pass allow_any=1 to scan anyway.")
+    return symbols
+
 # Default +/- tolerance, in calendar days, around a target DTE (see
 # get_itm_scan_weekly / get_debit_spreads). 3, not 2, because [target-3,
 # target+3] spans exactly 7 calendar days and weekly option expiries are 7
@@ -787,6 +830,7 @@ _RISK_PENALTIES = {
     "EARNINGS": 25,    # an earnings report lands before expiry (IV-crush risk)
     "THIN_OI": 10,     # too few open contracts to trust the quoted market
     "THIN_VOL": 8,     # barely traded today -- the quote may be stale
+    "NON_INDEX": 15,   # scanned via allow_any; fills worse than an index fund
 }
 
 # IV/realized-vol ratio at/above which a contract is flagged IV_RICH. 1.0
@@ -945,7 +989,8 @@ def _iv_flag(iv, rvol):
              "label": f"IV {ratio:.1f}x realized vol"}, round(ratio, 2))
 
 
-def _build_risk_flags(volume, oi, iv, rvol, earnings_date_iso, expiry_iso):
+def _build_risk_flags(volume, oi, iv, rvol, earnings_date_iso, expiry_iso,
+                      underlying=None):
     """Every risk flag for one contract, in one place.
 
     The single-leg scan core and the spreads board both need the same three
@@ -965,6 +1010,12 @@ def _build_risk_flags(volume, oi, iv, rvol, earnings_date_iso, expiry_iso):
     earnings_flag = _earnings_flag(earnings_date_iso, expiry_iso)
     if earnings_flag:
         flags.append(earnings_flag)
+    # Reached only via allow_any=1: the caller deliberately stepped outside
+    # the index-fund universe, so the row stays but carries the reason.
+    if underlying and underlying.upper() not in INDEX_FUNDS:
+        flags.append({"code": "NON_INDEX", "penalty": _RISK_PENALTIES["NON_INDEX"],
+                      "label": f"{underlying} is not a US index fund "
+                               f"(~2.2x wider spreads)"})
     return flags, iv_rv_ratio
 
 
@@ -1063,7 +1114,7 @@ def _scan_itm_candidates(symbols, dte_lo, dte_hi):
 
             flags, iv_rv_ratio = _build_risk_flags(
                 c.get("volume"), c.get("oi"), c.get("iv"), rvol,
-                earnings_date_iso, c.get("expiry"))
+                earnings_date_iso, c.get("expiry"), sym)
 
             candidates.append((c, spot, {
                 "mid": mid,
@@ -1552,7 +1603,7 @@ def get_debit_spreads(symbols=None, target_dte=7, window=_DEFAULT_DTE_WINDOW, to
                     flags, iv_rv_ratio = _build_risk_flags(
                         min(long_leg.get("volume") or 0, short_leg.get("volume") or 0),
                         min(long_leg.get("oi") or 0, short_leg.get("oi") or 0),
-                        long_leg.get("iv"), rvol, earnings_date_iso, expiry)
+                        long_leg.get("iv"), rvol, earnings_date_iso, expiry, sym)
 
                     raw_score = _spread_score(short_leg.get("delta"),
                                               reward_risk, cost_pct)
@@ -1770,7 +1821,16 @@ _VOL_PREMIUM_SENSITIVITY = (1.0, 1.1, 1.25)
 # these track the INDEX (SPX/NDX), not the ETF, and they quote 30-day
 # implied vol while the simulated contracts are ~7-day, so term structure
 # is ignored.
-_IV_PROXY = {"SPY": "^VIX", "QQQ": "^VXN"}
+# Ordered preference per symbol: the first proxy with usable coverage wins.
+# Short-dated first, because these simulate ~7-DTE contracts and 30-day vol is
+# the wrong point on the curve for them -- short-dated vol is usually the
+# pricier end, so using 30-day understates entry cost.
+#
+# ^VIX9D (9-day SPX) is the closest published match for SPY. No short-dated
+# NDX index is published, so QQQ keeps 30-day ^VXN. Both fall back to the
+# 30-day index if the short-dated fetch comes back truncated -- see
+# _IV_MIN_COVERAGE, which is exactly the failure ^VIX9D was observed to have.
+_IV_PROXY = {"SPY": ("^VIX9D", "^VIX"), "QQQ": ("^VXN",)}
 
 
 def _norm_cdf(x):
@@ -1808,21 +1868,57 @@ def _realized_vol_from(closes):
     return math.sqrt(var) * math.sqrt(252)
 
 
-def implied_vol_series(symbol, rng):
-    """{date: sigma} from `symbol`'s implied-vol proxy index, or None when no
+# Minimum share of the simulated sessions an implied-vol series must cover
+# before it may be used. Yahoo intermittently answers HTTP 200 with a
+# TRUNCATED series -- measured on ^VIX9D, three consecutive fetches returned
+# 501, 501 and 1 bars -- and get_history zips timestamps against closes, so a
+# truncated response looks like a short but valid series rather than an error.
+#
+# Without this floor a 1-bar response silently degrades the run to realized
+# vol for every other date while still reporting `implied`, which would put
+# the optimistic realized-vol number under the honest implied-vol label. That
+# is the same class of failure the "no implied-vol proxy for IWM" wording
+# exists to prevent, arriving via throttling instead of a missing ticker.
+_IV_MIN_COVERAGE = 0.80
+
+
+def implied_vol_series(symbol, rng, needed_dates=None):
+    """(proxy_name, {date: sigma}) for `symbol`, or (None, None) when no
     proxy exists for it.
 
+    Walks _IV_PROXY's preference order and returns the first proxy whose
+    coverage of `needed_dates` clears _IV_MIN_COVERAGE, so a truncated
+    short-dated fetch falls through to the 30-day index instead of quietly
+    degrading the whole run to realized vol. With no `needed_dates` the
+    first proxy that returns anything wins -- callers that care about
+    coverage must say what they're pricing.
+
     The index quotes annualized implied vol in percent (VIX 15.4 -> 0.154).
-    Returning None rather than an empty dict lets callers distinguish "this
-    symbol has no proxy" from "the proxy fetch came back empty", which
-    matter differently: the first is permanent, the second is retryable.
+    (None, None) rather than an empty dict lets callers distinguish "this
+    symbol has no proxy" (permanent) from "the fetch came back short"
+    (retryable) -- they're reported differently.
     """
-    proxy = _IV_PROXY.get(symbol.upper())
-    if not proxy:
-        return None
-    hist = get_history(proxy, rng)
-    ts, closes = hist.get("t") or [], hist.get("c") or []
-    return {_et_date_from_ts(t): c / 100.0 for t, c in zip(ts, closes) if c}
+    proxies = _IV_PROXY.get(symbol.upper())
+    if not proxies:
+        return None, None
+    best = (None, None, -1.0)
+    for proxy in proxies:
+        hist = get_history(proxy, rng)
+        ts, closes = hist.get("t") or [], hist.get("c") or []
+        series = {_et_date_from_ts(t): c / 100.0 for t, c in zip(ts, closes) if c}
+        if not needed_dates:
+            if series:
+                return proxy, series
+            continue
+        covered = sum(1 for d in needed_dates if d in series)
+        coverage = covered / len(needed_dates)
+        if coverage >= _IV_MIN_COVERAGE:
+            return proxy, series
+        if coverage > best[2]:
+            best = (proxy, series, coverage)
+    # Nothing cleared the floor. Hand back the best attempt so the caller can
+    # report how short it actually fell rather than just "unavailable".
+    return best[0], best[1]
 
 
 def _simulate_weekly_itm(bars, hold_days, moneyness, vol_lookback,
@@ -1915,16 +2011,27 @@ def get_modeled_backtest(symbol, rng="2y", hold_days=7, moneyness=0.01,
     ts, closes = hist.get("t") or [], hist.get("c") or []
     bars = [(_et_date_from_ts(t), c) for t, c in zip(ts, closes)]
 
-    iv_by_date = implied_vol_series(symbol, rng) if vol_source == "implied" else None
-    proxy = _IV_PROXY.get(symbol.upper())
-    if vol_source == "implied" and iv_by_date:
-        vol_source_used = f"implied ({proxy})"
-    elif vol_source == "implied":
-        # Asked for implied, none exists for this symbol. Say so rather than
-        # silently reporting realized-vol results under an "implied" label.
+    needed = [d for d, _c in bars]
+    proxy, iv_by_date = ((None, None) if vol_source != "implied"
+                         else implied_vol_series(symbol, rng, needed))
+    if vol_source != "implied":
+        vol_source_used = f"realized ({vol_lookback}d trailing)"
+    elif proxy is None:
+        # No proxy exists for this symbol at all (permanent).
         vol_source_used = f"realized (no implied-vol proxy for {symbol})"
     else:
-        vol_source_used = f"realized ({vol_lookback}d trailing)"
+        # A proxy answered, but the fetch may have come back truncated --
+        # check against the dates actually being priced, not against itself.
+        # Anything short is rejected rather than silently mixed with realized
+        # vol across trades, which would make the run uninterpretable.
+        covered = sum(1 for d in needed if d in (iv_by_date or {}))
+        coverage = covered / len(needed) if needed else 0.0
+        if coverage >= _IV_MIN_COVERAGE:
+            vol_source_used = f"implied ({proxy})"
+        else:
+            iv_by_date = None  # don't price ANY trade off a partial series
+            vol_source_used = (f"realized (implied-vol data incomplete for "
+                               f"{proxy}: {covered}/{len(needed)} sessions)")
 
     def _run(premium, spread):
         return _simulate_weekly_itm(bars, hold_days, moneyness, vol_lookback,
@@ -2401,6 +2508,18 @@ class Handler(BaseHTTPRequestHandler):
         sym = self._qparam(query, "symbol")
         return get_lookup(sym) if sym else {"_error": "no symbol"}
 
+    @staticmethod
+    def _snipe_symbols(query, default=SNIPE_SCAN):
+        """Symbols for a Snipe-family board, restricted to US index funds
+        unless allow_any=1. See validate_scan_symbols / INDEX_FUNDS.
+
+        A staticmethod like the other query helpers above, so the handlers
+        stay callable with the class itself standing in for `self` (which is
+        how the routing tests exercise them without a live socket)."""
+        syms = Handler._qsymbols(query, default=default)
+        allow_any = Handler._qparam(query, "allow_any", "") in ("1", "true", "yes")
+        return validate_scan_symbols(syms, allow_any), allow_any
+
     def _api_options_active(self, query):
         syms = self._qsymbols(query, default=OPTION_SCAN)
         top = int(self._qparam(query, "top", "25"))
@@ -2413,7 +2532,7 @@ class Handler(BaseHTTPRequestHandler):
         (see _itm_scan_score vs _weekly_itm_scan_score), so the horizon picks
         the formula rather than one formula being stretched across both.
         /api/options/itm-scan-weekly stays live as its own path."""
-        syms = self._qsymbols(query, default=SNIPE_SCAN)
+        syms, allow_any = self._snipe_symbols(query)
         top = int(self._qparam(query, "top", "20"))
         target_dte = int(self._qparam(query, "target_dte", "0"))
         if target_dte > 0:
@@ -2425,14 +2544,14 @@ class Handler(BaseHTTPRequestHandler):
         return get_itm_scan(syms, down, flat, up, top)
 
     def _api_options_itm_scan_weekly(self, query):
-        syms = self._qsymbols(query, default=SNIPE_SCAN)
+        syms, _allow_any = self._snipe_symbols(query)
         top = int(self._qparam(query, "top", "20"))
         target_dte = int(self._qparam(query, "target_dte", "7"))
         window = int(self._qparam(query, "window", str(_DEFAULT_DTE_WINDOW)))
         return get_itm_scan_weekly(syms, target_dte, window, top)
 
     def _api_options_debit_spreads(self, query):
-        syms = self._qsymbols(query, default=SNIPE_SCAN)
+        syms, _allow_any = self._snipe_symbols(query)
         top = int(self._qparam(query, "top", "20"))
         target_dte = int(self._qparam(query, "target_dte", "7"))
         window = int(self._qparam(query, "window", str(_DEFAULT_DTE_WINDOW)))
@@ -2442,6 +2561,8 @@ class Handler(BaseHTTPRequestHandler):
         sym = self._qparam(query, "symbol")
         if not sym:
             return {"_error": "no symbol"}
+        allow_any = self._qparam(query, "allow_any", "") in ("1", "true", "yes")
+        validate_scan_symbols([sym], allow_any)
         target_dte = int(self._qparam(query, "target_dte", "30"))
         top = int(self._qparam(query, "top", str(GAMMA_TOP_STRIKES)))
         return get_gamma_exposure(sym, target_dte=target_dte, top=top)
