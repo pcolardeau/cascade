@@ -2119,6 +2119,86 @@ class ModeledBacktestTests(NetworkFreeTestCase):
         self.assertIn("realized", out["vol_source"])
         self.assertIn("incomplete", out["vol_source"])
 
+    # -- modelled term-structure adjustment (QQQ) --------------------------
+
+    def _patch_term_history(self, closes, vxn=25.0, vix=20.0, vix9d=18.0):
+        """Symbol-aware stub giving each index its own level, so the ratio
+        being applied is a known quantity rather than an accident."""
+        base = 1700000000
+        levels = {"^VXN": vxn, "^VIX": vix, "^VIX9D": vix9d}
+        def fake(sym, rng="6mo"):
+            n = len(closes)
+            ts = [base + i * 86400 for i in range(n)]
+            if sym in levels:
+                return {"t": ts, "c": [levels[sym]] * n}
+            if sym.startswith("^"):
+                return {"t": [], "c": []}
+            return {"t": ts, "c": closes}
+        self.patch_server("get_history", fake)
+
+    def test_term_structure_ratio_is_short_over_long(self):
+        self._patch_term_history(self._drifting(50), vix=20.0, vix9d=18.0)
+        ratios = server.term_structure_ratio("2y")
+        self.assertTrue(ratios)
+        self.assertAlmostEqual(next(iter(ratios.values())), 0.9)
+
+    def test_qqq_is_term_adjusted_and_labelled_modelled(self):
+        """No short-dated NDX index is published, so QQQ borrows the SPX
+        curve's shape. That's an assumption, and it must say so."""
+        self._patch_term_history(self._drifting(200))
+        out = server.get_modeled_backtest("QQQ", vol_source="implied")
+        self.assertTrue(out["term_adjusted"])
+        self.assertIn("MODELLED", out["vol_source"])
+        self.assertIn("^VXN", out["vol_source"])
+
+    def test_spy_is_never_term_adjusted(self):
+        """SPY has real 9-day data, so it must use that rather than a model."""
+        self._patch_term_history(self._drifting(200))
+        out = server.get_modeled_backtest("SPY", vol_source="implied")
+        self.assertFalse(out["term_adjusted"])
+        self.assertNotIn("MODELLED", out["vol_source"])
+
+    def test_adjusted_run_ships_the_unadjusted_one_alongside(self):
+        """Same idiom as realized_vol_summary / no_spread_summary: when an
+        input is a judgement call, show both numbers instead of picking."""
+        self._patch_term_history(self._drifting(200))
+        out = server.get_modeled_backtest("QQQ", vol_source="implied")
+        self.assertIsNotNone(out["unadjusted_summary"])
+        self.assertIn("unadjusted_summary", out)
+
+    def test_unadjusted_summary_is_absent_when_nothing_was_adjusted(self):
+        self._patch_term_history(self._drifting(200))
+        out = server.get_modeled_backtest("SPY", vol_source="implied")
+        self.assertIsNone(out["unadjusted_summary"])
+
+    def test_a_ratio_below_one_lowers_entry_cost_and_raises_returns(self):
+        """Sanity on direction: the SPX curve is normally in contango, so
+        the adjustment usually scales 30-day vol DOWN, making entries
+        cheaper. If this ever inverted it would mean the ratio was applied
+        upside down."""
+        self._patch_term_history(self._drifting(200), vix=20.0, vix9d=18.0)
+        out = server.get_modeled_backtest("QQQ", vol_source="implied")
+        self.assertGreater(out["summary"]["avg_pnl_pct"],
+                           out["unadjusted_summary"]["avg_pnl_pct"])
+
+    def test_missing_reference_pair_skips_the_adjustment(self):
+        """No ratio data means no adjustment -- and crucially, not a silent
+        claim of one. Assuming 1.0 would mislabel an unadjusted run."""
+        base = 1700000000
+        closes = self._drifting(200)
+        def fake(sym, rng="6mo"):
+            n = len(closes)
+            ts = [base + i * 86400 for i in range(n)]
+            if sym == "^VXN":
+                return {"t": ts, "c": [25.0] * n}
+            if sym.startswith("^"):
+                return {"t": [], "c": []}      # no VIX/VIX9D -> no ratio
+            return {"t": ts, "c": closes}
+        self.patch_server("get_history", fake)
+        out = server.get_modeled_backtest("QQQ", vol_source="implied")
+        self.assertFalse(out["term_adjusted"])
+        self.assertNotIn("MODELLED", out["vol_source"])
+
     def test_implied_and_realized_runs_are_both_reported(self):
         """The point of keeping both: the difference the vol input makes is
         a visible number rather than an assertion."""
