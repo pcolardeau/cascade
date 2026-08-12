@@ -92,7 +92,11 @@ button.badge:hover { border-color: rgba(255,255,255,0.28); }
 .tape .u { color: var(--up); } .tape .d { color: var(--down); }
 
 /* ================= layout ================= */
-main { flex: 1; display: grid; grid-template-columns: 236px 1fr 380px; min-height: 0; }
+main { flex: 1; display: grid; grid-template-columns: 236px 1fr 560px; min-height: 0; }
+/* Snipe is a dense 13-column table, not a narrow info panel — when it's the
+   active tab, shrink the network graph down to a strip and let the table
+   claim the rest of the window so wide contract rows never need to scroll. */
+main.snipe-active { grid-template-columns: 236px minmax(200px, 300px) minmax(760px, 1fr); }
 .panel { background: var(--surface-1); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
 .panel-title {
   font-size: 10px; letter-spacing: 1.6px; color: var(--ink-muted);
@@ -353,6 +357,61 @@ table.opt tr.body:hover { background: var(--surface-3); cursor: pointer; }
 .zdte { color: var(--accent); font-weight: 700; }
 .flow-note { color: var(--ink-muted); font-size: 10px; line-height: 1.5; margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--grid); }
 
+/* snipe (0DTE deep-ITM scan) */
+.snipe-tier {
+  display: inline-block; font-size: 9px; font-weight: 800; padding: 1px 6px; border-radius: 3px;
+  letter-spacing: 0.4px; border: 1px solid; text-align: center;
+}
+.snipe-tier.A { color: var(--up); border-color: var(--up); background: rgba(12,163,12,0.14); }
+.snipe-tier.B { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+.snipe-tier.C { color: var(--down); border-color: var(--down); background: rgba(230,103,103,0.15); }
+.snipe-score { font-weight: 800; }
+.snipe-score.hi { color: var(--up); }
+.snipe-score.mid { color: var(--accent); }
+.snipe-score.lo { color: var(--down); }
+
+/* snipe mode switcher (0DTE / Weekly / Spreads — one tab, three boards) */
+.snipe-modes { display: flex; gap: 4px; margin: 10px 0 4px; }
+.snipe-modes button {
+  font: inherit; font-size: 9.5px; font-weight: 700; letter-spacing: 0.6px;
+  text-transform: uppercase; padding: 4px 10px; cursor: pointer;
+  color: var(--ink-2); background: var(--surface-3);
+  border: 1px solid var(--border); border-radius: 3px;
+}
+.snipe-modes button:hover { color: var(--ink); border-color: var(--ink-muted); }
+.snipe-modes button.on {
+  color: var(--accent); border-color: var(--accent); background: var(--accent-dim);
+}
+
+/* risk flags — penalties are shown, never silently applied. Each badge is a
+   visible reason the score was reduced, so a low score is always legible. */
+.snipe-flags { display: inline-flex; flex-wrap: wrap; gap: 3px; }
+.snipe-flag {
+  display: inline-block; font-size: 8.5px; font-weight: 800; padding: 1px 4px;
+  border-radius: 3px; letter-spacing: 0.3px; border: 1px solid; white-space: nowrap;
+}
+.snipe-flag.EARNINGS { color: var(--down); border-color: var(--down); background: rgba(230,103,103,0.15); }
+.snipe-flag.IV_RICH  { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+.snipe-flag.THIN_OI, .snipe-flag.THIN_VOL {
+  color: var(--ink-2); border-color: var(--border); background: var(--surface-3);
+}
+/* raw score struck through next to the penalized one, so the deduction is
+   visible rather than the board just quietly ranking something lower */
+.snipe-score-raw { color: var(--ink-muted); font-size: 9px; text-decoration: line-through; margin-left: 4px; }
+
+/* snipe log (forward paper-trading track record, bottom of the Snipe tab) */
+.snipe-log-section { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--grid); }
+.snipe-log-section h3 { font-size: 10px; letter-spacing: 1.4px; color: var(--ink-muted); text-transform: uppercase; margin-bottom: 10px; }
+.snipe-log-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
+.snipe-log-summary .v.pos { color: var(--up); }
+.snipe-log-summary .v.neg { color: var(--down); }
+.snipe-log-status {
+  display: inline-block; font-size: 9px; font-weight: 800; padding: 1px 6px; border-radius: 3px;
+  letter-spacing: 0.4px; border: 1px solid; text-align: center;
+}
+.snipe-log-status.open { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+.snipe-log-status.closed { color: var(--ink-2); border-color: var(--border); background: var(--surface-3); }
+
 /* matrix */
 #matrix-wrap { position: relative; }
 #matrix { display: block; width: 100%; image-rendering: pixelated; border: 1px solid var(--border); border-radius: 4px; cursor: crosshair; }
@@ -434,11 +493,13 @@ footer b { color: var(--ink-2); font-weight: 600; }
       <button data-tab="cascade">Cascade</button>
       <button data-tab="flow">Flow</button>
       <button data-tab="matrix">Matrix</button>
+      <button data-tab="snipe">Snipe</button>
     </div>
     <div class="tab-body">
       <div class="tab-page on" id="tab-overview"></div>
       <div class="tab-page" id="tab-cascade"></div>
       <div class="tab-page" id="tab-flow"></div>
+      <div class="tab-page" id="tab-snipe"></div>
       <div class="tab-page" id="tab-matrix">
         <div class="panel-title" style="padding:0 0 8px" id="matrix-title">Cross-correlation · 250d daily returns</div>
         <div id="matrix-wrap"><canvas id="matrix"></canvas></div>
@@ -1389,8 +1450,14 @@ tabs.forEach(b=>b.addEventListener("click",()=>{
   tabs.forEach(x=>x.classList.toggle("on",x===b));
   document.querySelectorAll(".tab-page").forEach(p=>p.classList.remove("on"));
   document.getElementById("tab-"+b.dataset.tab).classList.add("on");
+  document.querySelector("main").classList.toggle("snipe-active", b.dataset.tab==="snipe");
   if(b.dataset.tab==="matrix") drawMatrix();
   if(b.dataset.tab==="flow" && !flowLoaded && !flowLoading) fetchFlow();
+  if(b.dataset.tab==="snipe"){
+    const st = snipeState(snipeMode);
+    if(!st.loaded && !st.loading) fetchSnipe(snipeMode); else renderSnipe();
+    if(!snipeLogLoaded && !snipeLogLoading) fetchSnipeLog();
+  }
 }));
 
 /* ----- overview ----- */
@@ -2067,7 +2134,438 @@ function renderFlow(){
   box.append(note);
 }
 
-/* boot — deep-linkable via ?sel=TICKER&sel2=TICKER&tab=overview|cascade|flow|matrix&shock=-4&depth=2
+/* ============================================================================
+   SNIPE — 0DTE deep-ITM scanner + execution model (CBOE delayed chains)
+   Mirrors the Flow tab's fetch/render/refresh pattern exactly (same cadence,
+   same empty/loading states, same table conventions) against the new
+   /api/options/itm-scan endpoint. Read-only screening tool: it only ever
+   displays numbers computed server-side, never places or simulates an order.
+   ========================================================================== */
+/* Three boards live under this one tab rather than three top-level tabs:
+   the wide-table grid override (main.snipe-active) is keyed to "snipe", and
+   all three are the same feature viewed at different horizons/structures.
+   Each mode caches independently so switching back and forth doesn't refetch. */
+const SNIPE_MODES = {
+  "0dte": {
+    label: "0DTE",
+    url: "/api/options/itm-scan?top=20",
+    title: "0DTE deep-ITM snipe scan",
+    subtitle: "CBOE delayed feed · SPY / QQQ / IWM · same-day expiry",
+    empty: "No 0DTE in-the-money contracts with a live two-sided market right now — try again closer to the open, or refresh later in the session.",
+    ranked: "Candidates · ranked by Snipe Score (probability + banked flat-P&L + tight spread)",
+  },
+  "weekly": {
+    label: "Weekly ~7d",
+    url: "/api/options/itm-scan-weekly?top=20",
+    title: "~7-DTE ITM scan",
+    subtitle: "CBOE delayed feed · SPY / QQQ / IWM · ~7 days to expiry (±3)",
+    empty: "No ITM contracts in the ~7-day window with a live two-sided market right now.",
+    ranked: "Candidates · ranked by Weekly Score (probability + IV-implied profit magnitude + spread + theta)",
+  },
+  "spreads": {
+    label: "Spreads",
+    url: "/api/options/debit-spreads?top=20",
+    title: "Vertical debit spreads",
+    subtitle: "CBOE delayed feed · long ITM leg + short leg further out · priced at the worst realistic fill",
+    empty: "No valid debit spreads in the ~7-day window right now.",
+    ranked: "Spreads · ranked by Spread Score (probability of max profit + reward per dollar risked + execution cost)",
+  },
+};
+let snipeMode = "0dte";
+const snipeCache = {};  // mode -> {data, loading, loaded}
+const snipeState = m => (snipeCache[m] ||= {data:null, loading:false, loaded:false});
+
+let snipeLogData=null, snipeLogLoading=false, snipeLogLoaded=false, snipeSnapshotInFlight=false;
+const fmtUsd = v => (v==null ? "—" : (v<0?"-":"")+"$"+Math.abs(v).toFixed(2));
+const fmtPct1 = v => v==null ? "—" : (v*100).toFixed(1)+"%";
+
+async function fetchSnipe(mode){
+  mode = mode || snipeMode;
+  const st = snipeState(mode);
+  if(st.loading) return;
+  st.loading=true; renderSnipe();
+  try{ const r=await fetch(SNIPE_MODES[mode].url); st.data=await r.json(); st.loaded=true; }
+  catch(e){ st.data={_error:String(e)}; }
+  st.loading=false; renderSnipe();
+}
+
+/* Risk-flag badges. The board penalizes rather than filters, so every
+   penalized row has to carry a legible reason — a deduction you can't see
+   is indistinguishable from a scoring bug. */
+function renderFlags(flags){
+  const wrap=document.createElement("span"); wrap.className="snipe-flags";
+  for(const f of (flags||[])){
+    const b=document.createElement("span");
+    b.className="snipe-flag "+(f.code||"");
+    b.textContent=(f.code||"").replace("_"," ");
+    b.title=(f.label||"")+" (−"+(f.penalty!=null?f.penalty:"?")+" pts)";
+    wrap.append(b);
+  }
+  return wrap;
+}
+
+/* Score cell: penalized score, with the pre-penalty score struck through
+   beside it whenever a flag actually took something off. */
+function scoreCell(score, rawScore){
+  const td=document.createElement("td"); td.className="num";
+  const band = score>=70?"hi":score>=40?"mid":"lo";
+  const span=document.createElement("span"); span.className="snipe-score "+band;
+  span.textContent = score!=null ? score.toFixed(0) : "—";
+  td.append(span);
+  if(rawScore!=null && score!=null && rawScore>score){
+    const raw=document.createElement("span"); raw.className="snipe-score-raw";
+    raw.textContent = rawScore.toFixed(0);
+    raw.title = "score before risk-flag penalties";
+    td.append(raw);
+  }
+  return td;
+}
+
+/* Snipe Log — forward paper-trading track record for the Snipe board's own
+   top pick, settled at the NEXT day's real close (never a backtest, never a
+   real trade). Its own fetch/render pair, but rendered as a sub-section
+   inside renderSnipe() (see renderSnipeLogSection below) rather than a
+   separate tab -- it's the same feature, just a second view onto it. */
+async function fetchSnipeLog(){
+  if(snipeLogLoading) return;
+  snipeLogLoading=true; renderSnipe();
+  try{ const r=await fetch("/api/snipe-log"); snipeLogData=await r.json(); snipeLogLoaded=true; }
+  catch(e){ snipeLogData={_error:String(e)}; }
+  snipeLogLoading=false; renderSnipe();
+}
+
+async function doSnipeSnapshot(){
+  if(snipeSnapshotInFlight) return;
+  snipeSnapshotInFlight=true; renderSnipe();
+  try{ await fetch("/api/snipe-log/snapshot", {method:"POST"}); }
+  catch(e){ /* surfaced through the refetch below via snipeLogData._error if it truly failed */ }
+  snipeSnapshotInFlight=false;
+  await fetchSnipeLog();
+}
+
+function renderSnipe(){
+  const box=document.getElementById("tab-snipe"); box.replaceChildren();
+  const cfg = SNIPE_MODES[snipeMode];
+  const st = snipeState(snipeMode);
+  const snipeData = st.data, snipeLoading = st.loading;
+
+  const top=document.createElement("div"); top.className="flow-top";
+  const left=document.createElement("div");
+  const k=document.createElement("div"); k.className="k"; k.textContent=cfg.title;
+  const ao=document.createElement("div"); ao.className="as-of";
+  ao.textContent = snipeData && snipeData.as_of ? ("CBOE delayed · as of "+snipeData.as_of) : cfg.subtitle;
+  left.append(k,ao);
+  const rb=document.createElement("button"); rb.className="flow-refresh";
+  rb.textContent = snipeLoading ? "LOADING…" : "↻ REFRESH";
+  rb.disabled = snipeLoading;
+  rb.addEventListener("click",()=>{ st.loaded=false; fetchSnipe(snipeMode); });
+  top.append(left,rb); box.append(top);
+
+  const modes=document.createElement("div"); modes.className="snipe-modes";
+  for(const [id,m] of Object.entries(SNIPE_MODES)){
+    const b=document.createElement("button");
+    b.textContent=m.label;
+    if(id===snipeMode) b.className="on";
+    b.addEventListener("click",()=>{
+      if(snipeMode===id) return;
+      snipeMode=id;
+      const s=snipeState(id);
+      if(!s.loaded && !s.loading) fetchSnipe(id); else renderSnipe();
+    });
+    modes.append(b);
+  }
+  box.append(modes);
+
+  if(snipeLoading && !snipeData){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="Scanning "+cfg.title.toLowerCase()+"…";
+    box.append(e); return;
+  }
+  if(!snipeData || snipeData._error){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent = "Snipe feed unavailable"+(snipeData&&snipeData._error?" ("+snipeData._error+")":"")+". Is server.py running? Retry with ↻ Refresh.";
+    box.append(e); return;
+  }
+
+  if(snipeMode==="spreads"){ renderSpreadsTable(box, snipeData, cfg); return; }
+
+  const contracts = snipeData.contracts||[];
+  if(!contracts.length){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent=cfg.empty;
+    box.append(e);
+  } else {
+    const cc=document.createElement("div"); cc.className="contracts";
+    const ch=document.createElement("h3"); ch.textContent=cfg.ranked; cc.append(ch);
+    /* The two single-leg boards differ in their last few columns: 0DTE
+       prices three fixed spot moves and carries a tier, weekly prices one
+       IV-implied move and carries theta exposure. Everything left of that
+       is identical, so one renderer handles both off this flag. */
+    const isWeekly = snipeMode==="weekly";
+    const tbl=document.createElement("table"); tbl.className="opt";
+    const hr=document.createElement("tr");
+    const cols = isWeekly
+      ? ["Ticker","Type","Score","Strike","DTE","Δ","IV/RV","Spread%","Bid/Ask","Cost $","Breakeven","Exp.Move","P&L Flat","P&L Move","Extrinsic","Flags"]
+      : ["Ticker","Type","Score","Strike","Δ","Spread%","Bid/Ask","Cost $","Breakeven","Cushion%","P&L Down","P&L Flat","P&L Up","Tier","Flags"];
+    for(const t of cols){
+      const th=document.createElement("th"); th.textContent=t; hr.append(th);
+    }
+    tbl.append(hr);
+    for(const o of contracts){
+      const tr=document.createElement("tr"); tr.className="body";
+
+      const td1=document.createElement("td");
+      const tk=document.createElement("span"); tk.className="opt-und"; tk.textContent=o.underlying;
+      if(fromY[o.underlying]!=null) tk.style.color=SECTOR_BY_ID[nodes[fromY[o.underlying]].sector].hex;
+      tk.style.fontWeight="700"; td1.append(tk);
+
+      const td2=document.createElement("td");
+      const cp=document.createElement("span"); cp.className="cp "+o.type; cp.textContent=o.type; td2.append(cp);
+
+      const score = isWeekly ? o.weekly_score : o.score;
+      const rawScore = isWeekly ? o.raw_weekly_score : o.raw_score;
+      const tdScore = scoreCell(score, rawScore);
+
+      const td3=document.createElement("td"); td3.className="num"; td3.textContent=o.strike.toFixed(o.strike>=100?0:2);
+      const tdDelta=document.createElement("td"); tdDelta.className="num"; tdDelta.textContent=o.delta!=null?o.delta.toFixed(2):"—";
+      const tdSpread=document.createElement("td"); tdSpread.className="num"; tdSpread.textContent=fmtPct1(o.spread_pct);
+      const tdBidAsk=document.createElement("td"); tdBidAsk.className="num"; tdBidAsk.textContent=o.bid.toFixed(2)+" / "+o.ask.toFixed(2);
+      const tdCost=document.createElement("td"); tdCost.className="num"; tdCost.textContent=fmtUsd(o.contract_cost);
+      const tdBe=document.createElement("td"); tdBe.className="num"; tdBe.textContent=o.breakeven.toFixed(2);
+
+      const tdFlags=document.createElement("td"); tdFlags.append(renderFlags(o.flags));
+
+      const sc = o.scenarios||{};
+      const pnlCell = v => {
+        const td=document.createElement("td"); td.className="num";
+        td.textContent = v!=null ? fmtUsd(v) : "—";
+        if(v!=null) td.style.color = v<0 ? "var(--down)" : "var(--up)";
+        return td;
+      };
+
+      if(isWeekly){
+        const tdDte=document.createElement("td"); tdDte.className="num"; tdDte.textContent=o.dte!=null?o.dte:"—";
+        const tdIvRv=document.createElement("td"); tdIvRv.className="num";
+        tdIvRv.textContent = o.iv_rv_ratio!=null ? o.iv_rv_ratio.toFixed(2)+"×" : "—";
+        if(o.iv_rv_ratio!=null) tdIvRv.title = "IV "+(o.iv!=null?o.iv.toFixed(1):"?")+"% vs realized "+(o.realized_vol!=null?o.realized_vol.toFixed(1):"?")+"%";
+        const tdMove=document.createElement("td"); tdMove.className="num"; tdMove.textContent=fmtPct1(o.expected_move_pct);
+        const tdExtr=document.createElement("td"); tdExtr.className="num"; tdExtr.textContent=fmtPct1(o.extrinsic_ratio);
+        tr.append(td1,td2,tdScore,td3,tdDte,tdDelta,tdIvRv,tdSpread,tdBidAsk,tdCost,tdBe,tdMove,
+                  pnlCell(sc.flat?sc.flat.pnl_dollars:null),
+                  pnlCell(sc.favorable?sc.favorable.pnl_dollars:null),
+                  tdExtr,tdFlags);
+      } else {
+        const tdCushion=document.createElement("td"); tdCushion.className="num"; tdCushion.textContent=fmtPct1(o.breakeven_cushion_pct);
+        const tdTier=document.createElement("td"); tdTier.className="num";
+        const tier=document.createElement("span"); tier.className="snipe-tier "+o.tier; tier.textContent=o.tier;
+        tdTier.append(tier);
+        tr.append(td1,td2,tdScore,td3,tdDelta,tdSpread,tdBidAsk,tdCost,tdBe,tdCushion,
+                  pnlCell(sc.down?sc.down.pnl_dollars:null),
+                  pnlCell(sc.flat?sc.flat.pnl_dollars:null),
+                  pnlCell(sc.up?sc.up.pnl_dollars:null),
+                  tdTier,tdFlags);
+      }
+      if(fromY[o.underlying]!=null) tr.addEventListener("click",()=>selectNode(fromY[o.underlying]));
+      tbl.append(tr);
+    }
+    cc.append(tbl); box.append(cc);
+  }
+
+  box.append(snipeDisclaimer(snipeData));
+
+  // The Snipe Log tracks the 0DTE board's own daily pick and settles at the
+  // next close; it is not a record of the weekly or spreads boards, so it
+  // only belongs under the mode it actually describes.
+  if(snipeMode==="0dte") renderSnipeLogSection(box);
+}
+
+/* Shared footer note. Prefers the server's own note (which spells out the
+   scoring and the worst-fill pricing for whichever board answered) and
+   always ends on the same screening-tool disclaimer. */
+function snipeDisclaimer(data){
+  const note=document.createElement("div"); note.className="flow-note";
+  note.textContent = (data && data.note)
+    ? data.note
+    : "Screening tool, not a trade recommendation. CBOE delayed ~15min. No trades are placed automatically.";
+  return note;
+}
+
+/* Spreads board. Its own table because a vertical debit spread's payoff
+   shape (defined max loss AND capped max gain) has no meaningful overlap
+   with the single-leg columns -- there is no "P&L at +0.5%" for a position
+   whose entire economics are the two strikes and the net debit. */
+function renderSpreadsTable(box, data, cfg){
+  const spreads = data.spreads||[];
+  if(!spreads.length){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent=cfg.empty;
+    box.append(e); box.append(snipeDisclaimer(data)); return;
+  }
+  const cc=document.createElement("div"); cc.className="contracts";
+  const ch=document.createElement("h3"); ch.textContent=cfg.ranked; cc.append(ch);
+  const tbl=document.createElement("table"); tbl.className="opt";
+  const hr=document.createElement("tr");
+  for(const t of ["Ticker","Type","Score","Long/Short","Width","DTE","Short Δ","Net Debit","Max Gain","Max Loss","Reward:Risk","Breakeven","Cost%","Flags"]){
+    const th=document.createElement("th"); th.textContent=t; hr.append(th);
+  }
+  tbl.append(hr);
+  for(const s of spreads){
+    const tr=document.createElement("tr"); tr.className="body";
+
+    const td1=document.createElement("td");
+    const tk=document.createElement("span"); tk.className="opt-und"; tk.textContent=s.underlying;
+    if(fromY[s.underlying]!=null) tk.style.color=SECTOR_BY_ID[nodes[fromY[s.underlying]].sector].hex;
+    tk.style.fontWeight="700"; td1.append(tk);
+
+    const td2=document.createElement("td");
+    const cp=document.createElement("span"); cp.className="cp "+s.type; cp.textContent=s.type; td2.append(cp);
+
+    const tdScore = scoreCell(s.spread_score, s.raw_spread_score);
+
+    const dp = v => v==null ? "—" : v.toFixed(v>=100?0:2);
+    const tdLegs=document.createElement("td"); tdLegs.className="num";
+    tdLegs.textContent = dp(s.long_strike)+" / "+dp(s.short_strike);
+    const tdWidth=document.createElement("td"); tdWidth.className="num"; tdWidth.textContent=dp(s.width);
+    const tdDte=document.createElement("td"); tdDte.className="num"; tdDte.textContent=s.dte!=null?s.dte:"—";
+    const tdSd=document.createElement("td"); tdSd.className="num";
+    tdSd.textContent = s.short_delta!=null ? s.short_delta.toFixed(2) : "—";
+
+    const tdDebit=document.createElement("td"); tdDebit.className="num"; tdDebit.textContent=fmtUsd(s.net_debit);
+    const tdGain=document.createElement("td"); tdGain.className="num"; tdGain.textContent=fmtUsd(s.max_gain);
+    tdGain.style.color="var(--up)";
+    const tdLoss=document.createElement("td"); tdLoss.className="num"; tdLoss.textContent=fmtUsd(s.max_loss);
+    tdLoss.style.color="var(--down)";
+    const tdRr=document.createElement("td"); tdRr.className="num";
+    tdRr.textContent = s.reward_risk!=null ? s.reward_risk.toFixed(2)+"×" : "—";
+    const tdBe=document.createElement("td"); tdBe.className="num";
+    tdBe.textContent = s.breakeven!=null ? s.breakeven.toFixed(2) : "—";
+    const tdCost=document.createElement("td"); tdCost.className="num"; tdCost.textContent=fmtPct1(s.cost_pct);
+    const tdFlags=document.createElement("td"); tdFlags.append(renderFlags(s.flags));
+
+    tr.append(td1,td2,tdScore,tdLegs,tdWidth,tdDte,tdSd,tdDebit,tdGain,tdLoss,tdRr,tdBe,tdCost,tdFlags);
+    if(fromY[s.underlying]!=null) tr.addEventListener("click",()=>selectNode(fromY[s.underlying]));
+    tbl.append(tr);
+  }
+  cc.append(tbl); box.append(cc);
+  box.append(snipeDisclaimer(data));
+}
+
+/* Snipe Log sub-section, appended to the bottom of the Snipe tab (not its
+   own top-level tab -- same feature, same fetch cadence). Renders the
+   summary strip + entries table from snipeLogData, or an appropriate
+   loading/error/empty state, plus the manual "snapshot now" button. */
+function renderSnipeLogSection(box){
+  const sec=document.createElement("div"); sec.className="snipe-log-section";
+  const sh=document.createElement("h3"); sh.textContent="Snipe Log — forward paper-trading track record"; sec.append(sh);
+
+  const top=document.createElement("div"); top.className="flow-top";
+  const left=document.createElement("div");
+  const k=document.createElement("div"); k.className="k"; k.textContent="Top pick logged daily · settled at next close";
+  left.append(k);
+  const snapBtn=document.createElement("button"); snapBtn.className="flow-refresh";
+  snapBtn.textContent = snipeSnapshotInFlight ? "SNAPSHOTTING…" : "SNAPSHOT TODAY'S PICK NOW";
+  snapBtn.disabled = snipeSnapshotInFlight;
+  snapBtn.addEventListener("click", doSnipeSnapshot);
+  top.append(left, snapBtn);
+  sec.append(top);
+
+  if(snipeLogLoading && !snipeLogData){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="Loading the Snipe Log…";
+    sec.append(e); box.append(sec); return;
+  }
+  if(!snipeLogData || snipeLogData._error){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent = "Snipe Log unavailable"+(snipeLogData&&snipeLogData._error?" ("+snipeLogData._error+")":"")+". Is server.py running?";
+    sec.append(e); box.append(sec); return;
+  }
+
+  const s = snipeLogData.summary || {};
+  const strip=document.createElement("div"); strip.className="snipe-log-summary";
+  const mkStat=(label,val,cls)=>{
+    const d=document.createElement("div"); d.className="stat";
+    const kk=document.createElement("div"); kk.className="k"; kk.textContent=label;
+    const vv=document.createElement("div"); vv.className="v"+(cls?" "+cls:""); vv.textContent=val;
+    d.append(kk,vv); return d;
+  };
+  strip.append(
+    mkStat("Trades logged", s.trades!=null ? s.trades : "—"),
+    mkStat("Win rate", s.win_rate!=null ? (s.win_rate*100).toFixed(0)+"%" : "—"),
+    mkStat("Total P&L", fmtUsd(s.total_pnl_dollars), s.total_pnl_dollars<0?"neg":"pos"),
+    mkStat("Avg P&L / trade", fmtUsd(s.avg_pnl_dollars), s.avg_pnl_dollars<0?"neg":"pos"),
+  );
+  sec.append(strip);
+
+  const entries = snipeLogData.entries || [];
+  if(!entries.length){
+    const e=document.createElement("div"); e.className="empty-note";
+    e.textContent="No picks logged yet — the scheduler snapshots the top Snipe candidate ~30min before the close on weekdays, or use Snapshot now.";
+    sec.append(e);
+  } else {
+    const tbl=document.createElement("table"); tbl.className="opt";
+    const hr=document.createElement("tr");
+    for(const t of ["Date","Ticker","Type/Strike","Entry Ask","Score","Status","Close","Exit Val","P&L $","P&L %","Correct"]){
+      const th=document.createElement("th"); th.textContent=t; hr.append(th);
+    }
+    tbl.append(hr);
+    for(const e of entries){
+      const tr=document.createElement("tr"); tr.className="body";
+
+      const td1=document.createElement("td"); td1.textContent=e.date;
+
+      const td2=document.createElement("td");
+      const tk=document.createElement("span"); tk.className="opt-und"; tk.style.fontWeight="700"; tk.textContent=e.underlying;
+      td2.append(tk);
+
+      const td3=document.createElement("td");
+      const cp=document.createElement("span"); cp.className="cp "+e.type; cp.textContent=e.type; td3.append(cp);
+      const stk=document.createElement("span"); stk.className="opt-strike";
+      stk.textContent = " "+(e.strike!=null ? e.strike.toFixed(e.strike>=100?0:2) : "—");
+      td3.append(stk);
+
+      const td4=document.createElement("td"); td4.className="num";
+      td4.textContent = e.entry_ask!=null ? e.entry_ask.toFixed(2) : "—";
+
+      const td5=document.createElement("td"); td5.className="num";
+      td5.textContent = e.entry_score!=null ? e.entry_score.toFixed(0) : "—";
+
+      const td6=document.createElement("td");
+      const pill=document.createElement("span"); pill.className="snipe-log-status "+e.status;
+      pill.textContent = e.status==="open" ? "OPEN" : "CLOSED";
+      td6.append(pill);
+
+      const td7=document.createElement("td"); td7.className="num";
+      td7.textContent = e.close_price!=null ? e.close_price.toFixed(2) : "—";
+
+      const td8=document.createElement("td"); td8.className="num";
+      td8.textContent = e.exit_value!=null ? e.exit_value.toFixed(2) : "—";
+
+      const td9=document.createElement("td"); td9.className="num";
+      td9.textContent = e.pnl_dollars!=null ? fmtUsd(e.pnl_dollars) : "—";
+      if(e.pnl_dollars!=null) td9.style.color = e.pnl_dollars<0 ? "var(--down)" : "var(--up)";
+
+      const td10=document.createElement("td"); td10.className="num";
+      td10.textContent = e.pnl_pct!=null ? fmtPct1(e.pnl_pct) : "—";
+      if(e.pnl_pct!=null) td10.style.color = e.pnl_pct<0 ? "var(--down)" : "var(--up)";
+
+      const td11=document.createElement("td"); td11.className="num";
+      td11.textContent = e.correct==null ? "—" : (e.correct ? "✓" : "✗");
+      td11.style.color = e.correct==null ? "var(--ink-muted)" : (e.correct ? "var(--up)" : "var(--down)");
+
+      tr.append(td1,td2,td3,td4,td5,td6,td7,td8,td9,td10,td11);
+      tbl.append(tr);
+    }
+    sec.append(tbl);
+  }
+
+  const note=document.createElement("div"); note.className="flow-note";
+  note.textContent = "Hypothetical paper log for studying this screening strategy — no real trades are placed. Past days do not predict future ones.";
+  sec.append(note);
+
+  box.append(sec);
+}
+
+/* boot — deep-linkable via ?sel=TICKER&sel2=TICKER&tab=overview|cascade|flow|matrix|snipe&shock=-4&depth=2
    sel2 is optional: a second shock source that puts the app straight into scenario-compare mode. */
 const qp = new URLSearchParams(location.search);
 if(qp.has("shock")){ const v=Math.max(-10,Math.min(10,parseFloat(qp.get("shock"))||-5));
@@ -2089,6 +2587,11 @@ setTimeout(()=>{
 setLiveStatus("connecting");
 startLive();
 if(qp.get("tab")==="flow") fetchFlow();
+if(qp.get("tab")==="snipe"){
+  document.querySelector("main").classList.add("snipe-active");
+  fetchSnipe();
+  fetchSnipeLog();
+}
 </script>
 </body>
 </html>
