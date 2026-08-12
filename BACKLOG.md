@@ -9,6 +9,9 @@ the point, since several of these look cheaper than they are.
   Safer / Biggest swing, client-side, on all three boards.
 - The minimum reward:risk floor on spreads (was item 0) — framed as a
   validity guard, not a risk preference, and disclosed in the board's note.
+- Gamma concentration by strike, backend only (was half of item 4).
+- The modeled historical simulation (was item 5). Its headline number is
+  not the finding; the vol-premium sensitivity is. See below.
 - The weekly forward paper-trading log (was item 1). One resolver now serves
   both boards by settling on the contract's expiry rather than the log date;
   for 0DTE those are the same day, so existing records were unaffected.
@@ -70,31 +73,34 @@ than being a bolted-on screener.
 
 ---
 
-## 5. Modeled historical backtest for the Weekly board
+## 5. What the modeled simulation actually said
 
-**What:** Simulate "buy the top-scored setup every Monday for the past N
-years" using Yahoo daily history (already fetched for the correlation feature)
-plus a stdlib Black-Scholes approximation to price the option at entry and
-exit.
+Not a to-do — a result worth not losing, since the number is easy to
+misread and someone (including a future me) will be tempted to quote the
+headline.
 
-**Why:** Years of statistical signal immediately, versus one paper trade per
-day from the forward log. It's the only path to a sample size large enough to
-actually calibrate the scoring weights rather than guess them.
+Over 2 years of daily bars, buying a ~1% ITM weekly call and holding to
+expiry, priced off trailing realized vol with a 3% execution haircut:
 
-**Blockers / notes:**
-- **This is a model, not a backtest, and must be labeled that way.** The
-  README is already explicit that no historical intraday options data exists
-  on this free feed — that's why the 0DTE board has a forward log instead.
-  Modeled prices inherit every assumption of the pricing model (constant vol,
-  no skew, no early exercise) and will systematically disagree with what
-  could actually have been filled.
-- Needs a historical volatility input per date to price with. Realized vol
-  from trailing daily bars is the honest choice, but it is *not* the implied
-  vol the contract would really have traded at, and the gap between them is
-  exactly the variance risk premium the strategy is exposed to. Overstating
-  results here is the default failure mode.
-- No bid/ask spread exists in a modeled price. Since spread is 15–25% of
-  every live score in this app, a modeled backtest that ignores it will look
-  materially better than reality. Apply a modeled spread haircut.
-- The realized-vol input this needs now exists (`realized_vol()` in server.py),
-  so that dependency is cleared.
+| underlying | trades | win rate | avg / trade | at 1.25x vol premium |
+|---|---|---|---|---|
+| SPY | 464 | 50.9% | +21.6% | **+9.1%** |
+| QQQ | 464 | 50.2% | +26.8% | **+11.1%** |
+| IWM | 464 | 46.8% | +21.5% | **+5.6%** |
+
+**The headline is not the finding.** Three things undercut it:
+
+- Most of the apparent edge is an artifact of pricing entries at REALIZED
+  vol. Real options trade at implied, which normally sits above it. At a
+  1.25x premium — ordinary, not a stress case — the edge roughly halves
+  on SPY/QQQ and nearly vanishes on IWM.
+- Win rate is a coin flip (47–51%) everywhere. A +21% average with a 50%
+  win rate means a few large winners carry it, so the average is not an
+  expectation you can plan around.
+- Two years is one regime. This period had no sustained bear market.
+
+**If anyone picks this up next:** the useful work isn't running it over
+more symbols, it's narrowing the vol assumption. Everything else is noise
+next to that one input. A source of historical implied vol — even a
+coarse one like VIX as a proxy for SPY — would do more for this than any
+other change.
