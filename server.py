@@ -1722,6 +1722,204 @@ def get_gamma_exposure(symbol, target_dte=30, window=None, top=GAMMA_TOP_STRIKES
 
 
 # ---------------------------------------------------------------------------
+# Modeled historical simulation of the weekly ITM strategy.
+#
+# READ THIS BEFORE TRUSTING ANY NUMBER IT RETURNS. This is NOT a backtest.
+# There is no historical intraday options data on this free feed -- that is
+# precisely why the Snipe Log records forward, one trade at a time, instead.
+# What follows prices hypothetical contracts with Black-Scholes from daily
+# underlying bars, so every result inherits the model's assumptions rather
+# than reporting what could actually have been filled.
+#
+# Three specific ways it flatters the strategy, all of them structural:
+#
+#   1. Volatility. Entry is priced off REALIZED vol from trailing bars,
+#      because implied vol history doesn't exist here. Implied normally
+#      trades above realized (that gap IS the variance risk premium), so
+#      modeled entries are systematically CHEAPER than real ones, which
+#      inflates returns. get_modeled_backtest reports a vol-premium
+#      sensitivity row precisely so this isn't buried in prose.
+#   2. Spread. A modeled price has no bid/ask. Live weekly ITM spreads on
+#      these names measured 2.7% median / 3.6% mean of premium, so entry
+#      gets a haircut -- without one the results are materially better than
+#      anything fillable.
+#   3. Model shape. Black-Scholes assumes constant vol, no skew, and
+#      European exercise. Real ITM equity options are American and skewed.
+#
+# It is included because a forward log accumulates one trade per day and
+# calibrating a scoring formula needs a sample far larger than that. Treat
+# the output as "does this strategy shape have any edge at all", never as a
+# performance claim.
+# ---------------------------------------------------------------------------
+_BS_RATE = 0.04             # flat risk-free rate; the app has no yield-curve feed
+_MODELED_SPREAD_PCT = 0.03  # measured live median 2.7% / mean 3.6% of premium
+_VOL_PREMIUM_SENSITIVITY = (1.0, 1.1, 1.25)
+
+
+def _norm_cdf(x):
+    """Standard normal CDF via math.erf -- keeps this stdlib-only."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def black_scholes_price(spot, strike, years, sigma, rate=_BS_RATE, is_call=True):
+    """Black-Scholes price for a European option. Returns intrinsic value at
+    (or past) expiry, or when volatility is degenerate, rather than dividing
+    by zero."""
+    intrinsic = max(0.0, spot - strike) if is_call else max(0.0, strike - spot)
+    if years <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
+        return intrinsic
+    sqrt_t = math.sqrt(years)
+    d1 = (math.log(spot / strike) + (rate + 0.5 * sigma ** 2) * years) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+    discount = math.exp(-rate * years)
+    if is_call:
+        return spot * _norm_cdf(d1) - strike * discount * _norm_cdf(d2)
+    return strike * discount * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+
+
+def _realized_vol_from(closes):
+    """Annualized realized vol from a list of closes, or None if too short.
+    Separate from realized_vol() (which fetches) so the simulation can
+    compute it over a trailing slice with no lookahead."""
+    rets = [math.log(closes[i] / closes[i - 1])
+            for i in range(1, len(closes))
+            if closes[i - 1] > 0 and closes[i] > 0]
+    if len(rets) < 2:
+        return None
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    return math.sqrt(var) * math.sqrt(252)
+
+
+def _simulate_weekly_itm(bars, hold_days, moneyness, vol_lookback,
+                         vol_premium, spread_pct, is_call=True):
+    """One pass of the simulation. `bars` is [(date, close), ...] ascending.
+
+    Buys a hypothetical ITM option `moneyness` in the money, holds to
+    expiry, settles at intrinsic. Volatility comes only from bars STRICTLY
+    BEFORE the entry, so there's no lookahead.
+    """
+    trades = []
+    for i in range(vol_lookback, len(bars) - hold_days):
+        entry_date, spot = bars[i]
+        exit_date, exit_spot = bars[i + hold_days]
+        sigma = _realized_vol_from([c for _d, c in bars[i - vol_lookback:i + 1]])
+        if not sigma:
+            continue
+        sigma *= vol_premium
+        # Strike placed `moneyness` in the money, rounded to a plausible
+        # $1 grid so strikes look like ones that would really list.
+        strike = round(spot * (1 - moneyness)) if is_call else round(spot * (1 + moneyness))
+        years = hold_days / 365.0
+        theo = black_scholes_price(spot, strike, years, sigma, is_call=is_call)
+        if theo <= 0:
+            continue
+        entry = theo * (1 + spread_pct / 2)  # pay the modeled ask, not the mid
+        payoff = (max(0.0, exit_spot - strike) if is_call
+                  else max(0.0, strike - exit_spot))
+        pnl = (payoff - entry) * 100
+        trades.append({
+            "entry_date": entry_date, "exit_date": exit_date,
+            "spot": round(spot, 2), "strike": strike, "exit_spot": round(exit_spot, 2),
+            "sigma": round(sigma, 4), "entry": round(entry, 4),
+            "payoff": round(payoff, 4),
+            "pnl_dollars": round(pnl, 2),
+            "pnl_pct": round(pnl / (entry * 100), 4),
+        })
+    return trades
+
+
+def _summarize_trades(trades):
+    n = len(trades)
+    if not n:
+        return {"trades": 0, "wins": 0, "win_rate": None,
+                "total_pnl_dollars": 0.0, "avg_pnl_pct": 0.0,
+                "best_pnl_pct": None, "worst_pnl_pct": None}
+    wins = sum(1 for t in trades if t["pnl_dollars"] > 0)
+    return {
+        "trades": n,
+        "wins": wins,
+        "win_rate": round(wins / n, 4),
+        "total_pnl_dollars": round(sum(t["pnl_dollars"] for t in trades), 2),
+        "avg_pnl_pct": round(sum(t["pnl_pct"] for t in trades) / n, 4),
+        "best_pnl_pct": max(t["pnl_pct"] for t in trades),
+        "worst_pnl_pct": min(t["pnl_pct"] for t in trades),
+    }
+
+
+def get_modeled_backtest(symbol, rng="2y", hold_days=7, moneyness=0.01,
+                         vol_lookback=30, spread_pct=_MODELED_SPREAD_PCT,
+                         option_type="C"):
+    """Model the weekly ITM strategy over historical daily bars.
+
+    See the module comment above this function for why the result is a
+    model rather than a backtest, and the three structural ways it flatters
+    the strategy.
+
+    Returns a headline result plus a `sensitivity` block pricing the same
+    trades at higher volatility assumptions. That block is the point: the
+    single biggest unknown is how far implied would have sat above the
+    realized vol used for entry, and showing the result collapse (or not)
+    as that gap widens is more honest than one number with a disclaimer.
+    """
+    is_call = option_type.upper() == "C"
+    hold_days = _clamp_int(hold_days, 1, MAX_TARGET_DTE)
+    vol_lookback = _clamp_int(vol_lookback, 5, 250)
+    key = (f"mbt:{symbol}:{rng}:{hold_days}:{moneyness}:{vol_lookback}:"
+           f"{spread_pct}:{option_type}")
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    hist = get_history(symbol, rng)
+    ts, closes = hist.get("t") or [], hist.get("c") or []
+    bars = [(_et_date_from_ts(t), c) for t, c in zip(ts, closes)]
+
+    headline = _simulate_weekly_itm(bars, hold_days, moneyness, vol_lookback,
+                                    1.0, spread_pct, is_call)
+    sensitivity = []
+    for premium in _VOL_PREMIUM_SENSITIVITY:
+        s = _summarize_trades(_simulate_weekly_itm(
+            bars, hold_days, moneyness, vol_lookback, premium, spread_pct, is_call))
+        s["vol_premium"] = premium
+        sensitivity.append(s)
+    # Same trades with no spread haircut, to size how much execution costs
+    # actually matter rather than asserting that they do.
+    no_spread = _summarize_trades(_simulate_weekly_itm(
+        bars, hold_days, moneyness, vol_lookback, 1.0, 0.0, is_call))
+
+    out = {
+        "symbol": symbol,
+        "range": rng,
+        "hold_days": hold_days,
+        "moneyness": moneyness,
+        "option_type": "C" if is_call else "P",
+        "spread_pct": spread_pct,
+        "bars": len(bars),
+        "summary": _summarize_trades(headline),
+        "sensitivity": sensitivity,
+        "no_spread_summary": no_spread,
+        "trades": headline[-20:],  # a tail sample, not the whole series
+        "modeled": True,
+        "note": ("MODELED, NOT A BACKTEST. No historical options prices exist on "
+                 "this feed, so entries are priced with Black-Scholes from daily "
+                 "underlying bars. Entry volatility is REALIZED vol from trailing "
+                 f"{vol_lookback} sessions -- implied normally trades above "
+                 "realized, so modeled entries are systematically cheaper than "
+                 "real ones and these returns are optimistic. See `sensitivity` "
+                 "for the same trades priced at higher volatility, and "
+                 "`no_spread_summary` for the same trades without the "
+                 f"{spread_pct:.0%} execution haircut. Black-Scholes also assumes "
+                 "constant vol, no skew and European exercise; real ITM equity "
+                 "options are American and skewed. Held to expiry, settled at "
+                 "intrinsic. Use this to ask whether the strategy shape has any "
+                 "edge at all, never as a performance claim."),
+    }
+    cache_put(key, out, ttl=900)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Snipe Log -- forward paper-trading track record for the Snipe board's
 # top-scored pick each day.
 #
@@ -2171,6 +2369,18 @@ class Handler(BaseHTTPRequestHandler):
         top = int(self._qparam(query, "top", str(GAMMA_TOP_STRIKES)))
         return get_gamma_exposure(sym, target_dte=target_dte, top=top)
 
+    def _api_options_modeled_backtest(self, query):
+        sym = self._qparam(query, "symbol")
+        if not sym:
+            return {"_error": "no symbol"}
+        return get_modeled_backtest(
+            sym,
+            rng=self._qparam(query, "range", "2y"),
+            hold_days=int(self._qparam(query, "hold_days", "7")),
+            moneyness=float(self._qparam(query, "moneyness", "0.01")),
+            option_type=self._qparam(query, "type", "C"),
+        )
+
     def _api_snipe_log(self, query):
         board = self._qparam(query, "board", DEFAULT_SNIPE_BOARD)
         if board not in SNIPE_LOG_BOARDS:
@@ -2191,6 +2401,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/options/itm-scan-weekly": _api_options_itm_scan_weekly,
         "/api/options/debit-spreads": _api_options_debit_spreads,
         "/api/options/gamma": _api_options_gamma,
+        "/api/options/modeled-backtest": _api_options_modeled_backtest,
         "/api/snipe-log": _api_snipe_log,
     }
 

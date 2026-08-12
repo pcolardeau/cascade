@@ -260,6 +260,7 @@ class ApiRoutesTests(unittest.TestCase):
             "/api/options/itm-scan-weekly": server.Handler._api_options_itm_scan_weekly,
             "/api/options/debit-spreads": server.Handler._api_options_debit_spreads,
             "/api/options/gamma": server.Handler._api_options_gamma,
+            "/api/options/modeled-backtest": server.Handler._api_options_modeled_backtest,
             "/api/snipe-log": server.Handler._api_snipe_log,
         }
         self.assertEqual(server.Handler._API_ROUTES, expected)
@@ -1751,6 +1752,135 @@ class GammaExposureTests(NetworkFreeTestCase):
         self._patch([self._c(500.0, dte=10)])
         out = server.get_gamma_exposure("SPY", target_dte=10 ** 6)
         self.assertLessEqual(out["target_dte"], server.MAX_TARGET_DTE)
+
+
+class BlackScholesTests(unittest.TestCase):
+    """The pricer underpinning the modeled simulation. Checked against
+    textbook reference values and put-call parity, because a subtly wrong
+    Black-Scholes produces plausible-looking garbage rather than an error --
+    every downstream number would be wrong and nothing would complain."""
+
+    def test_matches_reference_call_and_put(self):
+        # S=100 K=100 T=1 sigma=0.20 r=0.05 -> C=10.4506, P=5.5735
+        self.assertAlmostEqual(
+            server.black_scholes_price(100, 100, 1, 0.20, 0.05, True), 10.4506, places=4)
+        self.assertAlmostEqual(
+            server.black_scholes_price(100, 100, 1, 0.20, 0.05, False), 5.5735, places=4)
+
+    def test_put_call_parity_holds(self):
+        c = server.black_scholes_price(100, 95, 0.5, 0.25, 0.05, True)
+        p = server.black_scholes_price(100, 95, 0.5, 0.25, 0.05, False)
+        self.assertAlmostEqual(c - p, 100 - 95 * math.exp(-0.05 * 0.5), places=8)
+
+    def test_expiry_and_zero_vol_return_intrinsic(self):
+        self.assertAlmostEqual(server.black_scholes_price(150, 100, 0, 0.2, 0.04, True), 50.0)
+        self.assertAlmostEqual(server.black_scholes_price(150, 100, 1, 0.0, 0.04, True), 50.0)
+        self.assertAlmostEqual(server.black_scholes_price(80, 100, 0, 0.2, 0.04, True), 0.0)
+
+    def test_higher_volatility_is_never_cheaper(self):
+        lo = server.black_scholes_price(100, 100, 0.25, 0.15, 0.04, True)
+        hi = server.black_scholes_price(100, 100, 0.25, 0.45, 0.04, True)
+        self.assertGreater(hi, lo)
+
+    def test_norm_cdf_anchors(self):
+        self.assertAlmostEqual(server._norm_cdf(0), 0.5, places=10)
+        self.assertAlmostEqual(server._norm_cdf(-8), 0.0, places=10)
+        self.assertAlmostEqual(server._norm_cdf(8), 1.0, places=10)
+
+
+class ModeledBacktestTests(NetworkFreeTestCase):
+    """The simulation is explicitly a MODEL, not a backtest. These pin the
+    properties that keep it honest -- no lookahead, execution costs applied,
+    and the vol-premium sensitivity actually present -- rather than pinning
+    any particular return, which is a function of whatever history the feed
+    happens to return."""
+
+    def _patch_history(self, closes):
+        base = 1700000000
+        self.patch_server("get_history", lambda sym, rng="6mo": {
+            "t": [base + i * 86400 for i in range(len(closes))], "c": closes})
+
+    @staticmethod
+    def _drifting(n=200, start=100.0, step=0.004):
+        # deterministic zigzag with upward drift -- no RNG in tests
+        out, price = [], start
+        for i in range(n):
+            price *= (1 + step) if i % 3 else (1 - step / 2)
+            out.append(round(price, 4))
+        return out
+
+    def test_realized_vol_from_slice(self):
+        self.assertAlmostEqual(server._realized_vol_from([100.0] * 30), 0.0)
+        self.assertIsNone(server._realized_vol_from([100.0]))
+        self.assertGreater(server._realized_vol_from(self._drifting(60)), 0)
+
+    def test_simulation_uses_only_prior_bars_for_volatility(self):
+        """No lookahead: the sigma for a trade entered at bar i must be
+        computable from bars <= i. Feeding a series whose tail volatility
+        explodes must not change earlier trades."""
+        calm = self._drifting(120)
+        wild = calm[:100] + [calm[99] * (1.5 if i % 2 else 0.6) for i in range(20)]
+        a = server._simulate_weekly_itm([(f"d{i}", c) for i, c in enumerate(calm)],
+                                        7, 0.01, 30, 1.0, 0.03)
+        b = server._simulate_weekly_itm([(f"d{i}", c) for i, c in enumerate(wild)],
+                                        7, 0.01, 30, 1.0, 0.03)
+        early_a = [t for t in a if int(t["entry_date"][1:]) < 60]
+        early_b = [t for t in b if int(t["entry_date"][1:]) < 60]
+        self.assertEqual([t["entry"] for t in early_a], [t["entry"] for t in early_b])
+
+    def test_spread_haircut_makes_entries_more_expensive(self):
+        bars = [(f"d{i}", c) for i, c in enumerate(self._drifting(120))]
+        free = server._simulate_weekly_itm(bars, 7, 0.01, 30, 1.0, 0.0)
+        costed = server._simulate_weekly_itm(bars, 7, 0.01, 30, 1.0, 0.10)
+        self.assertGreater(costed[0]["entry"], free[0]["entry"])
+        self.assertLess(costed[0]["pnl_dollars"], free[0]["pnl_dollars"])
+
+    def test_higher_vol_premium_raises_entry_cost(self):
+        bars = [(f"d{i}", c) for i, c in enumerate(self._drifting(120))]
+        cheap = server._simulate_weekly_itm(bars, 7, 0.01, 30, 1.0, 0.03)
+        dear = server._simulate_weekly_itm(bars, 7, 0.01, 30, 1.5, 0.03)
+        self.assertGreater(dear[0]["entry"], cheap[0]["entry"])
+
+    def test_summary_math(self):
+        trades = [{"pnl_dollars": 100.0, "pnl_pct": 0.5},
+                  {"pnl_dollars": -50.0, "pnl_pct": -0.25}]
+        s = server._summarize_trades(trades)
+        self.assertEqual((s["trades"], s["wins"], s["win_rate"]), (2, 1, 0.5))
+        self.assertAlmostEqual(s["total_pnl_dollars"], 50.0)
+        self.assertAlmostEqual(s["avg_pnl_pct"], 0.125)
+        self.assertEqual((s["best_pnl_pct"], s["worst_pnl_pct"]), (0.5, -0.25))
+
+    def test_summary_of_no_trades_is_not_a_crash(self):
+        s = server._summarize_trades([])
+        self.assertEqual(s["trades"], 0)
+        self.assertIsNone(s["win_rate"])
+
+    def test_result_carries_the_sensitivity_and_no_spread_comparison(self):
+        """These exist so the two biggest sources of optimism are visible as
+        numbers rather than buried in a disclaimer nobody reads."""
+        self._patch_history(self._drifting(200))
+        out = server.get_modeled_backtest("SPY")
+        self.assertEqual([r["vol_premium"] for r in out["sensitivity"]],
+                         list(server._VOL_PREMIUM_SENSITIVITY))
+        self.assertIn("no_spread_summary", out)
+        self.assertTrue(out["modeled"])
+
+    def test_result_is_labeled_a_model_not_a_backtest(self):
+        self._patch_history(self._drifting(200))
+        note = server.get_modeled_backtest("SPY")["note"]
+        self.assertIn("MODELED, NOT A BACKTEST", note)
+        self.assertIn("optimistic", note)
+        self.assertIn("never as a performance claim", note)
+
+    def test_short_history_yields_no_trades_rather_than_an_error(self):
+        self._patch_history([100.0, 101.0, 102.0])
+        out = server.get_modeled_backtest("SPY")
+        self.assertEqual(out["summary"]["trades"], 0)
+
+    def test_hold_days_and_lookback_are_clamped(self):
+        self._patch_history(self._drifting(200))
+        out = server.get_modeled_backtest("SPY", hold_days=10 ** 6, vol_lookback=10 ** 6)
+        self.assertLessEqual(out["hold_days"], server.MAX_TARGET_DTE)
 
 
 class WeeklySnipeLogTests(NetworkFreeTestCase):
