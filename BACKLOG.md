@@ -75,59 +75,59 @@ than being a bolted-on screener.
 
 ## 5. What the modeled simulation actually said
 
-Not a to-do — a result worth not losing, and one that has moved three times as
-the volatility input got closer to correct.
+Not a to-do — a result worth not losing. It has moved four times as the
+inputs got closer to correct, and the direction of each move matters more
+than any single number.
 
-Buying a ~1% ITM weekly call over 2 years of daily bars, held to expiry, 3%
-execution haircut. Same trades throughout; only the volatility used to price
-entry changes:
+Buying a ~1% ITM weekly call, held to expiry, 3% execution haircut:
 
-| priced off | SPY | QQQ |
+| input corrected | SPY avg/trade | why it moved |
 |---|---|---|
-| realized vol (30d trailing) | +21.6% | +26.8% |
-| implied, 30-day (`^VIX` / `^VXN`) | +5.7% | +14.8% |
-| **implied at ~9-day tenor** | **+10.4%** *(measured)* | **+19.8%** *(modelled)* |
+| realized vol, 2y | +21.6% | wrong instrument — options trade at implied |
+| implied 30-day (`^VIX`), 2y | +5.7% | right instrument, wrong tenor |
+| implied 9-day (`^VIX9D`), 2y | +10.4% | right tenor for ~7-DTE contracts |
+| **implied 9-day, 10y** | **+13.3%** | **more than one regime** |
 
-**A prediction I got wrong, kept because the reasoning matters more than the
-number.** The plan said moving to short-dated vol should make results *worse*,
-assuming short-dated vol is pricier, and that an improvement would signal a
-bug. It improved — so it got checked. Over 484 sessions `^VIX9D` sits **below**
-`^VIX` on 83% of days (median 0.912, range 0.68–1.33): the VIX term structure
-is normally in **contango** and only inverts under stress. So 30-day vol was
-*overstating* entry cost for 7-day contracts, and correcting the tenor
-legitimately improved the estimate.
+**The regime caveat is now largely retired.** 2y (2024–2026) was a single
+benign stretch, which was the biggest remaining unknown. 10y spans the 2018
+Q4 selloff, the 2020 COVID crash and the 2022 bear market, and takes the
+sample from 465 trades to **2,476**. Held on the same 9-day tenor throughout:
 
-**SPY and QQQ are still not strictly comparable**, for a new reason. SPY uses
-real 9-day data (`^VIX9D`). QQQ has no short-dated NDX index published
-anywhere on this feed, so its figure applies the SPX curve's own 9d/30d ratio
-per date — a **modelled** correction. Supporting it: the two indices' daily
-changes correlate 0.942. Undercutting it: level correlation is only 0.856 and
-the ratio itself varies (IQR 0.854–0.976). `unadjusted_summary` ships alongside
-so the size of that assumption is always visible.
+| range | trades | win rate | avg/trade |
+|---|---|---|---|
+| 2y | 465 | 48.6% | +10.7% |
+| 5y | 1,218 | 50.4% | +12.3% |
+| 10y | 2,476 | 52.3% | +13.3% |
 
-Sensitivity to the volatility assumption, which remains the dominant unknown:
+The short sample was, if anything, *understating* it. Yahoo returns monthly
+bars for `max`, so 10y is the longest usable daily window.
 
-| vol premium | SPY (measured) | QQQ (modelled) |
+Sensitivity to the volatility assumption, still the dominant unknown, is
+also more robust on the longer sample — a 25% vol error is now roughly
+breakeven rather than a loss:
+
+| vol premium | 2y | 10y |
 |---|---|---|
-| ×1.00 | +10.4% | +19.8% |
-| ×1.10 | +4.8% | +12.9% |
-| ×1.25 | **−2.9%** | +3.8% |
+| ×1.00 | +10.4% | +13.3% |
+| ×1.10 | +4.8% | +7.8% |
+| ×1.25 | −2.9% | **+0.3%** |
 
-QQQ holds up better under vol error than SPY — but part of that gap is the
-modelling, not the market, so don't read it as QQQ being the better trade.
-
-**Win rate stays under 50% at nearly every level for both.** Whatever profit
-exists rides on a few large winners, not consistency. Execution cost is
-second-order next to the vol input: removing the 3% spread haircut entirely
-moves SPY only +10.4% → +12.1%.
+**What has NOT changed, and shouldn't be forgotten:** win rate is barely
+above a coin flip (52.3%), and the trade distribution is violently skewed —
+best single trade +409.8%, worst **−100%**. A positive average here is
+carried by a few large winners, not by consistency, and a total loss on any
+given week is an ordinary outcome rather than a tail. Execution cost is
+second-order: removing the 3% haircut entirely moves +13.3% to only +15.0%.
 
 **Caveats that remain, in order of how much they'd move the number:**
 
-- IWM has no implied-vol source at all (below) and is still on the optimistic
-  realized-vol figure — **not comparable** to the other two.
-- QQQ's term correction is modelled, not measured.
+- IWM still has no implied-vol source at all (below) and is on the
+  optimistic realized-vol figure — **not comparable** to the other two.
+- QQQ's term correction is modelled (SPX curve borrowed), and at 10y it
+  falls back to plain 30-day `^VXN`, so its 10y figure understates it
+  relative to its own 2y/5y numbers. QQQ is not comparable across ranges.
 - These indices track the INDEX, not the ETF.
-- Two years is one regime, with no sustained bear market.
+- Still one market structure: no pre-2016 data at daily resolution here.
 
 ---
 
