@@ -191,8 +191,17 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
 .edge.flow { stroke-dasharray: 6 5; animation: flow 0.9s linear infinite; }
 @keyframes flow { to { stroke-dashoffset: -11; } }
 .node { cursor: pointer; }
-.node circle.body, .node path.body { transition: opacity 0.35s; }
+.node circle.body, .node path.body { transition: opacity 0.35s, filter 0.35s; }
+/* Unaffected nodes recede on TWO axes — dimmed and drained of colour — so the
+   cascade path carries the only saturated colour on screen. Deliberately not
+   blur: it would soften the ticker labels, which have to stay legible. */
 .node.dim { opacity: 0.26; }
+.node.dim circle.body, .node.dim path.body { filter: saturate(0.25); }
+/* Glow is class-driven rather than per-frame, so it costs nothing in the
+   animation loop and composites on the GPU. */
+.node.sel circle.body, .node.sel path.body { filter: drop-shadow(0 0 7px currentColor); }
+.node.hit circle.body, .node.hit path.body { filter: drop-shadow(0 0 4px rgba(255,255,255,0.30)); }
+.edge.flow { filter: drop-shadow(0 0 3px currentColor); }
 .node text {
   font-family: var(--font); font-size: 11px; font-weight: 600; fill: var(--ink-2);
   pointer-events: none; text-anchor: middle; paint-order: stroke; stroke: var(--page); stroke-width: 3px;
@@ -847,14 +856,22 @@ function applyView(){
   world.setAttribute("transform",`translate(${W/2+view.x},${H/2+view.y}) scale(${view.k})`);
 }
 
-/* Rebuilds the SVG <line> elements from the current `edges` global. Called at
+/* Rebuilds the SVG <path> elements from the current `edges` global. Called at
    boot and again after a live-correlation sync — replaceChildren() drops the
-   old <line> nodes in one shot so re-syncing never leaks orphaned elements. */
+   old nodes in one shot so re-syncing never leaks orphaned elements.
+
+   Paths rather than lines so edges can bow (see renderFrame). Straight lines
+   through a force layout stack on top of each other wherever several edges
+   share endpoints — the cluster around the mega-caps was unreadable for
+   exactly that reason. Everything downstream is element-agnostic: the
+   .dim/.flow classes, style.stroke and style.display all behave identically,
+   and stroke-dasharray (both the hop-order encoding and the flow animation)
+   applies to a path the same as to a line. */
 let edgeEls = [];
 function rebuildEdgeEls(){
   edgesG.replaceChildren();
   edgeEls = edges.map(e=>{
-    const l = el("line",{class:"edge"},edgesG);
+    const l = el("path",{class:"edge"},edgesG);
     const w = 0.7 + Math.abs(e.r)*2.2, o = 0.35 + Math.abs(e.r)*0.3;
     // curated supply/rate/fuel-chain edges carry the narrative — keep them
     // bold; auto-densified statistical edges recede so the graph reads as
@@ -870,6 +887,10 @@ const DASH = {1:"none", 2:"6,3", 3:"3,3", 4:"1.6,4", 5:"1,6"};
 function makeNodeEl(n, s){
   const g = el("g",{class:"node"},nodesG);
   const hex = SECTOR_BY_ID[n.sector].hex;
+  // Drives `currentColor` for the selection glow (see .node.sel in the CSS).
+  // Without it currentColor inherits a neutral ink tone and every node glows
+  // the same white, losing the sector reading the glow is meant to reinforce.
+  g.style.color = hex;
   el("circle",{class:"halo", r:s.r+5, "stroke-width":2.5},g);
   let body;
   if(n.sector==="macro"){
@@ -885,11 +906,24 @@ function makeNodeEl(n, s){
 }
 const nodeEls = nodes.map((n,i)=> makeNodeEl(n, sim[i]));
 
+/* How far an edge bows, as a fraction of its own length. Small on purpose:
+   enough to separate edges that share an endpoint, not so much that a link
+   stops reading as "a connects to b". */
+const EDGE_BOW = 0.11;
+
 function renderFrame(){
   tick();
   for(let ei=0;ei<edges.length;ei++){
     const e=edges[ei], a=sim[e.a], b=sim[e.b], L=edgeEls[ei];
-    L.setAttribute("x1",a.x);L.setAttribute("y1",a.y);L.setAttribute("x2",b.x);L.setAttribute("y2",b.y);
+    const dx=b.x-a.x, dy=b.y-a.y;
+    // Bow perpendicular to the edge, offset at the midpoint. The sign comes
+    // from the edge's fixed index parity rather than from geometry, so an
+    // edge keeps bowing the same way as its endpoints move -- deriving it
+    // from coordinates makes edges flip sides mid-drag.
+    const side = (ei & 1) ? 1 : -1;
+    const mx = (a.x+b.x)/2 + (-dy)*EDGE_BOW*side;
+    const my = (a.y+b.y)/2 + ( dx)*EDGE_BOW*side;
+    L.setAttribute("d", `M${a.x} ${a.y}Q${mx} ${my} ${b.x} ${b.y}`);
   }
   for(let i=0;i<N;i++) nodeEls[i].g.setAttribute("transform",`translate(${sim[i].x},${sim[i].y})`);
   requestAnimationFrame(renderFrame);
@@ -1126,6 +1160,7 @@ function applyCascadeVisual(){
         L.classList.remove("dim"); L.classList.add("flow");
         const child = (cascade.via[e.a]===e.b)? e.a : e.b;
         L.style.stroke = cascade.impact[child]>=0 ? "#0ca30c" : "#e66767";
+        L.style.color = L.style.stroke;  // tints the .edge.flow glow
         L.style.strokeOpacity = 0.9;
       } else { L.classList.add("dim"); L.classList.remove("flow"); }
       return;
@@ -1134,6 +1169,7 @@ function applyCascadeVisual(){
     if(inA || inB){
       L.classList.remove("dim"); L.classList.add("flow");
       L.style.stroke = (inA && inB) ? CMP_BOTH_EDGE : (inA ? CMP_A : CMP_B);
+      L.style.color = L.style.stroke;  // tints the .edge.flow glow
       L.style.strokeOpacity = 0.9;
     } else { L.classList.add("dim"); L.classList.remove("flow"); }
   });
@@ -1204,20 +1240,35 @@ function animateCascadeLayout(){
   const view0 = { x:view.x, y:view.y, k:view.k };
   const view1 = { x:-midX*fitK, y:-midY*fitK, k:fitK };
 
-  const dur=650, t0=performance.now();
+  /* Each ring starts moving slightly after the one inside it, so the layout
+     visibly propagates outward from the source instead of every node sliding
+     at once. The app is about order-by-order propagation and the animation
+     was the one place that didn't show it.
+
+     STAGGER stays well under `dur` so the outermost ring still finishes
+     within the same transition rather than trailing after it. */
+  const dur=650, STAGGER=90, t0=performance.now();
+  const maxOrder = Math.max(0, ...[...targets.keys()].map(i => cascade.order[i]||0));
   function step(now){
-    const t=Math.min(1,(now-t0)/dur), e=1-Math.pow(1-t,3);
+    const elapsed = now - t0;
     for(const [i,tg] of targets){
       const s0=starts.get(i);
-      sim[i].fx = s0.x + (tg.x-s0.x)*e;
-      sim[i].fy = s0.y + (tg.y-s0.y)*e;
+      const delay = (cascade.order[i]||0) * STAGGER;
+      const ti = Math.max(0, Math.min(1, (elapsed-delay)/dur));
+      const ei = 1-Math.pow(1-ti,3);
+      sim[i].fx = s0.x + (tg.x-s0.x)*ei;
+      sim[i].fy = s0.y + (tg.y-s0.y)*ei;
     }
+    // The viewport itself is not staggered -- easing the camera in steps
+    // would read as stutter rather than propagation.
+    const t=Math.min(1,elapsed/dur), e=1-Math.pow(1-t,3);
     view.x = view0.x + (view1.x-view0.x)*e;
     view.y = view0.y + (view1.y-view0.y)*e;
     view.k = view0.k + (view1.k-view0.k)*e;
     applyView();
     alpha = Math.max(alpha, 0.25);
-    if(t<1){ layoutAnim=requestAnimationFrame(step); }
+    // Run until the LAST staggered ring has finished, not just the camera.
+    if(elapsed < dur + maxOrder*STAGGER){ layoutAnim=requestAnimationFrame(step); }
     else { layoutAnim=null; for(const [i,tg] of targets){ sim[i].fx=tg.x; sim[i].fy=tg.y; } }
   }
   layoutAnim=requestAnimationFrame(step);
