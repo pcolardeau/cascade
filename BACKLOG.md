@@ -7,33 +7,11 @@ the point, since several of these look cheaper than they are.
 **Done since this file was written:**
 - The probability/profit-magnitude sort toggle (was item 3) — Balanced /
   Safer / Biggest swing, client-side, on all three boards.
+- The minimum reward:risk floor on spreads (was item 0) — framed as a
+  validity guard, not a risk preference, and disclosed in the board's note.
 - The weekly forward paper-trading log (was item 1). One resolver now serves
   both boards by settling on the contract's expiry rather than the log date;
   for 0DTE those are the same day, so existing records were unaffected.
-
----
-
-## 0. Minimum reward:risk floor on the spreads board
-
-**What:** `get_debit_spreads` accepts any pairing where `0 < net_debit <
-width`. That admits spreads like SPY 735/740 at a $498 debit for a $2 max
-gain — a 0.00× reward:risk. Technically a valid debit spread; economically
-pointless, since it needs a ~99.6% win rate just to cover the debit, before
-commission.
-
-**Why:** They're invisible under the default Balanced sort (the Spread Score
-buries them on the reward term), but "Safer" ranks by short-leg delta alone
-and floats them straight to the top — so the sort toggle that just shipped
-made a pre-existing wart newly prominent.
-
-**Blockers / notes:**
-- Mostly a question of what the floor should be, not how to implement it. A
-  fixed minimum (say 0.15×) is crude but honest; scaling it with DTE would be
-  better-founded, since a longer hold needs more edge to be worth the capital.
-- Alternative to filtering: keep them but flag them, consistent with how
-  every other risk signal on these boards behaves. That may be the more
-  in-keeping answer — the boards' whole design is "penalize and explain,
-  don't hide."
 
 ---
 
@@ -62,30 +40,33 @@ question a screener naturally raises and currently can't answer.
 
 ---
 
-## 4. Dealer-positioning / gamma overlay near candidate strikes
+## 4. Gamma overlay — UI half
 
-**What:** Compute open-interest-weighted gamma exposure across the *full*
-chain (not just the ITM subset the Snipe boards filter to) to flag likely
-pin levels and support/resistance, then overlay those levels on the candidate
-list and/or the existing network visualization.
+**What:** `/api/options/gamma` and `get_gamma_exposure()` now exist: gamma
+concentration per strike, calls and puts separate, in dollars of delta per 1%
+move. Nothing in the UI shows it yet. Options: a panel on the Snipe tab, or
+markers on the existing network/price visualizations at the high-concentration
+strikes.
 
-**Why:** It's positioning context nothing else in the app provides, and it ties
-the options work back into CASCADE's actual thesis (cross-asset effects and
-propagation) rather than being a bolted-on screener.
+**Why:** It's positioning context nothing else in the app provides, and it's
+the piece that ties the options work back to CASCADE's actual thesis rather
+than being a bolted-on screener.
 
 **Blockers / notes:**
-- The full chain is already fetched per underlying, so the raw data is there
-  — but `_parse_chain` currently drops zero-volume contracts, and pin
-  analysis specifically cares about high-OI/low-volume strikes. That filter
-  would need to become conditional.
-- CBOE's feed carries `delta` and `theta` but gamma isn't confirmed present
-  in the payload — needs verification before designing around it. If absent,
-  it can be approximated from delta across adjacent strikes, with the
-  accuracy caveat that implies.
-- Genuine interpretation risk: dealer-positioning inference from public OI
-  is a heuristic built on assumptions about who's long vs short, which the
-  data doesn't actually say. Presenting it as fact would be the most
-  overconfident thing in the app. Label accordingly.
+- Both original blockers are resolved. Gamma is present in CBOE's payload
+  (all 14,672 SPY rows; non-zero on 11,074), so no delta-difference
+  approximation is needed. And `_parse_chain` now takes `require_volume`,
+  so the untraded strikes holding 17% of open interest are reachable.
+- The remaining risk is presentational, and it's the important one. The
+  backend deliberately refuses to net calls against puts or infer dealer
+  positioning, because open interest never says who holds which side. A UI
+  that draws a single "gamma flip level" or labels a strike as a magnet
+  would smuggle that claim back in through the visualization after the API
+  carefully avoided making it. Show the two sides separately.
+- Worth deciding: is the peak strike genuinely useful to a user screening
+  single contracts, or is this a separate analytical view? On SPY it lands
+  near the money and mostly restates "the most open interest is near the
+  money", which may not earn its screen space on the candidate board.
 
 ---
 
