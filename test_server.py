@@ -262,6 +262,7 @@ class ApiRoutesTests(unittest.TestCase):
             "/api/options/gamma": server.Handler._api_options_gamma,
             "/api/options/modeled-backtest": server.Handler._api_options_modeled_backtest,
             "/api/snipe-log": server.Handler._api_snipe_log,
+            "/api/watchlist": server.Handler._api_watchlist,
         }
         self.assertEqual(server.Handler._API_ROUTES, expected)
 
@@ -2225,6 +2226,78 @@ class ModeledBacktestTests(NetworkFreeTestCase):
         self._patch_history(self._drifting(200))
         out = server.get_modeled_backtest("SPY", hold_days=10 ** 6, vol_lookback=10 ** 6)
         self.assertLessEqual(out["hold_days"], server.MAX_TARGET_DTE)
+
+
+class WatchlistTests(NetworkFreeTestCase):
+    """Tickers the user adds to the graph, persisted so they survive a
+    reload. Same storage contract as the Snipe Log: a corrupt or missing
+    file degrades to "nothing saved" rather than breaking the endpoint, and
+    writes are atomic so a crash can't leave truncated JSON behind."""
+
+    def setUp(self):
+        super().setUp()
+        self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
+        self.patch_server("WATCHLIST_PATH", os.path.join(self._tmpdir, "watchlist.json"))
+
+    def test_round_trip(self):
+        self.assertEqual(server.save_watchlist(["COST", "NEE"]), ["COST", "NEE"])
+        self.assertEqual(server.load_watchlist(), ["COST", "NEE"])
+
+    def test_missing_file_is_an_empty_list(self):
+        self.assertEqual(server.load_watchlist(), [])
+
+    def test_corrupt_file_degrades_to_empty(self):
+        with open(server.WATCHLIST_PATH, "w", encoding="utf-8") as f:
+            f.write("{not json at all")
+        self.assertEqual(server.load_watchlist(), [])
+
+    def test_wrong_shape_degrades_to_empty(self):
+        """A JSON object rather than a list is still 'nothing saved', not a
+        crash on the next boot."""
+        with open(server.WATCHLIST_PATH, "w", encoding="utf-8") as f:
+            json.dump({"tickers": ["COST"]}, f)
+        self.assertEqual(server.load_watchlist(), [])
+
+    def test_normalizes_case_and_whitespace(self):
+        self.assertEqual(server.save_watchlist([" cost ", "nee"]), ["COST", "NEE"])
+
+    def test_deduplicates_preserving_order(self):
+        self.assertEqual(server.save_watchlist(["COST", "NEE", "cost"]), ["COST", "NEE"])
+
+    def test_rejects_junk_tickers(self):
+        stored = server.save_watchlist(["COST", "", "  ", "way-too-long-ticker",
+                                        "bad ticker", 42, None, "<script>"])
+        self.assertEqual(stored, ["COST"])
+
+    def test_accepts_dotted_and_dashed_symbols(self):
+        """Real tickers carry both forms (BRK-B on Yahoo, BF.B elsewhere)."""
+        self.assertEqual(server.save_watchlist(["BRK-B", "BF.B"]), ["BRK-B", "BF.B"])
+
+    def test_is_bounded(self):
+        stored = server.save_watchlist([f"T{i}" for i in range(server.MAX_WATCHLIST + 50)])
+        self.assertEqual(len(stored), server.MAX_WATCHLIST)
+
+    def test_non_list_payload_saves_nothing(self):
+        self.assertEqual(server.save_watchlist("COST"), [])
+        self.assertEqual(server.save_watchlist(None), [])
+
+    def test_corrupt_entries_are_filtered_on_read_too(self):
+        """Validation on read as well as write -- the file is on disk and a
+        human may have edited it."""
+        with open(server.WATCHLIST_PATH, "w", encoding="utf-8") as f:
+            json.dump(["COST", 42, "bad ticker", None, "NEE"], f)
+        self.assertEqual(server.load_watchlist(), ["COST", "NEE"])
+
+    def test_save_is_atomic_leaving_no_temp_files(self):
+        server.save_watchlist(["COST"])
+        leftovers = [f for f in os.listdir(self._tmpdir) if ".tmp-" in f]
+        self.assertEqual(leftovers, [], "temp file must be renamed, not left behind")
+
+    def test_endpoint_returns_the_stored_list(self):
+        server.save_watchlist(["COST"])
+        self.assertEqual(server.Handler._api_watchlist(server.Handler, {}),
+                         {"tickers": ["COST"]})
 
 
 class WeeklySnipeLogTests(NetworkFreeTestCase):

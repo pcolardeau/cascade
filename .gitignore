@@ -4,3 +4,5 @@ cascade-serve.log
 .ironpaw/
 .playwright-mcp/
 snipe_log.json
+# user state, same as snipe_log.json -- the saved graph is per-install
+watchlist.json
