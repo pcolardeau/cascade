@@ -1,104 +1,187 @@
 # CASCADE — Backlog
 
-Ideas that are worth doing but aren't being built yet. Each entry says what it
-is, why it's valuable, and what actually stands in the way — the blockers are
-the point, since several of these look cheaper than they are.
+Everything outstanding, plus the findings worth not re-deriving. Written to be
+self-contained: a fresh session should be able to pick up from this file alone.
 
-**Done since this file was written:**
-- The probability/profit-magnitude sort toggle (was item 3) — Balanced /
-  Safer / Biggest swing, client-side, on all three boards.
-- The minimum reward:risk floor on spreads (was item 0) — framed as a
-  validity guard, not a risk preference, and disclosed in the board's note.
-- Gamma concentration by strike, backend only (was half of item 4).
-- The modeled historical simulation (was item 5). Its headline number is
-  not the finding; the vol-premium sensitivity is. See below.
-- The weekly forward paper-trading log (was item 1). One resolver now serves
-  both boards by settling on the contract's expiry rather than the log date;
-  for 0DTE those are the same day, so existing records were unaffected.
+Each entry says what it is, why it matters, and what actually stands in the
+way — the blockers are the point, since several of these look cheaper than
+they are.
+
+**State as of this writing:** working tree clean, 299 tests passing, no open
+PRs (all nine merged to `main`), no TODO/FIXME markers in the source. The
+watchlist has been cleared to empty.
 
 ---
 
-## 2. Kelly sizing — shipped, and mostly it refuses
+# 1. Blocked — do not re-investigate
 
-Implemented, but the useful behaviour is the refusal. Recorded here because
-the numbers are easy to misread.
+## 1.1 IWM implied volatility
 
-**It reports a FRACTION of bankroll, and never asks for an account size.**
-The fraction is the part actually derived from data; keeping the money out
-of the app avoids storing something sensitive for no analytical gain.
+There is **no usable IWM implied-vol history on this feed**. Probed directly:
 
-**The binary formula doesn't apply.** `(p*b - q)/b` assumes two outcomes.
-These payoffs run from −100% to +410%, with **22% of trades a total loss**,
-so sizing maximizes `E[log(1 + f·r)]` over the empirical returns — the
-general form the textbook one is a special case of. (A test pins that the
-general form reproduces the closed-form answer on a genuinely binary bet.)
-
-On the modelled SPY distribution (n=2,475, 10y):
-
-| | fraction of bankroll |
+| ticker | result |
 |---|---|
-| full Kelly | 15.8% |
-| half | 7.9% |
-| **quarter (headline)** | **3.9%** |
+| `^RVX` (Russell 2000 vol) | 404 |
+| `^RUTVIX` | returns nothing |
+| `^VXD`, `^VIX3M` | a single bar |
 
-**Why fractional is the headline, not a hedge.** Full Kelly is growth-optimal
-only if the distribution is known exactly. It isn't — it's modelled. On the
-same trades, assuming volatility 10% higher moves f\* from 15.8% to 9.9%: a
-**37% smaller position from a modest input error**. Kelly is far more
-sensitive to its inputs than to the trades themselves, so that stress case
-ships as a first-class field rather than a footnote.
+IWM therefore falls back to realized vol and **says so** in `vol_source`. Its
+simulation column is the optimistic realized-vol figure and is **not
+comparable** to SPY/QQQ. Borrowing SPY's volatility would be a different
+underlying's risk relabelled, which is why the fallback is explicit rather
+than silent.
 
-**The gate.** Below 100 settled trades it returns a refusal instead of a
-number. The live 0DTE log currently holds **3 closed trades, all winners** —
-naive Kelly on a 100% win rate implies betting essentially the whole
-bankroll. That is precisely the failure the gate exists to prevent, and it
-will keep refusing for months, which is correct.
-
-**What would make the realized figure trustworthy:** roughly 100 settled
-trades, i.e. ~5 months of daily logging. Even then the estimate is noisy —
-win-rate error scales like 1/sqrt(n).
+Only worth revisiting if the data source changes.
 
 ---
 
-## 4. Gamma — resolved, and the panel lost
+# 2. Waiting on time, not on code
 
-The open question was whether the peak-gamma strike earned its screen space
-on the candidate board. **It didn't**, and the measurement was unambiguous.
+## 2.1 Kelly from realized trades (~5 months out)
 
-Across SPY/QQQ/IWM at 7/30/90 DTE, **8 of 9 peaks sat within 0.5% of spot**
-(median 0.10%). The peak strike was restating the spot price already in the
-header. The single exception was QQQ at 90 DTE, where a real put wall sits
-3.3% below — but the Snipe boards only look 0–10 DTE, so that case never
-appears where the panel lived.
+Kelly sizing is implemented and **correctly refuses** below 100 settled
+trades. The live 0DTE log holds 3 closed trades, all winners — naive Kelly on
+a 100% win rate implies betting essentially the whole bankroll, which is
+exactly the failure the gate exists to prevent.
 
-**What replaced it carries actual signal.** Gamma concentration at a
-*candidate's own strike*, as a share of that underlying's peak, varies
-enormously across contracts the score rates as equivalent — measured 1% to
-53% across twelve candidates scoring 72–77. SPY P780 (score 74.0) sat at 53%
-of peak while C752 (score 74.3) sat at 1%. The board calls them equivalent;
-they are in completely different gamma environments, and nothing else on the
-row says so.
+Nothing to build. It starts answering at ~100 settled trades, roughly five
+months of daily logging. Even then the estimate is noisy: win-rate error
+scales like 1/√n.
 
-So: a per-row `Γ` column on all three boards, and the by-strike chart
-collapsed behind a toggle. The chart is a genuine analytical view — it shows
-call/put walls clearly — it just isn't what someone screening single
-contracts needs occupying half the board.
+## 2.2 First weekly-log settlement
 
-**Implementation note worth keeping:** the gamma fetch for the column has to
-be deep (top=250, not top=14). With a shallow fetch a candidate whose strike
-falls outside the top slice reads as `0%` gamma rather than "not measured",
-which is a wrong answer rather than a missing one. The chart still slices to
-the leading strikes for display.
+The weekly paper log records daily and settles against the underlying's close
+on the contract's **expiry**, so the first real result cannot arrive until a
+logged pick reaches expiry (~7–10 days after logging). The settlement path is
+already verified end-to-end against real market data — a SPY C732 expiring
+2026-08-03 settled against the real 757.67 close for $1,367, matching an
+independent calculation exactly. Only the sample is missing.
 
 ---
 
-## 5. What the modeled simulation actually said
+# 3. Open work
 
-Not a to-do — a result worth not losing. It has moved four times as the
-inputs got closer to correct, and the direction of each move matters more
-than any single number.
+## 3.1 No JavaScript tests at all — the largest gap
 
-Buying a ~1% ITM weekly call, held to expiry, 3% execution haircut:
+`index.html` is **3,840 lines** and is now the biggest file in the project,
+carrying the force simulation, cascade propagation, radial layout, three
+option boards, the index view, the watchlist and all rendering. There is not
+a single automated test for any of it — `test_server.py` covers the backend
+only. Every bug found in the frontend this session was found by driving a real
+browser.
+
+Concretely, bugs that reached `main` and were caught only by manual browser
+checks:
+- the spreads board returned early and skipped the shared trailer, so the
+  gamma section silently vanished on one mode;
+- switching boards fetched the scan but not the log, so the weekly log
+  rendered "unavailable" while its endpoint was fine.
+
+Options: a headless-browser smoke pass over the render paths, or extracting
+the pure logic (cascade propagation, scoring, layout maths, `sortSnipeRows`)
+into testable functions. The second is more work and more durable.
+
+## 3.2 Spreads board has no paper log
+
+The 0DTE and weekly boards both record and settle. Spreads doesn't, because
+settling a two-leg position needs its own math — max-gain/max-loss resolution
+at expiry rather than a single intrinsic value. `SNIPE_LOG_BOARDS` is already
+the extension point; the resolver is the work.
+
+## 3.3 QQQ isn't comparable across its own ranges
+
+QQQ's term correction borrows the SPX 9d/30d ratio, which needs `^VIX9D`. At
+10y that fetch falls back often enough that QQQ's 10y run uses plain 30-day
+`^VXN` while its 2y/5y runs are term-adjusted. So QQQ's ranges aren't
+comparable **to each other**, and its 10y figure understates it. Either force
+the adjustment or report its absence more loudly per-range.
+
+## 3.4 `^VIX9D` truncation is mitigated, not eliminated
+
+Yahoo answers HTTP 200 with a truncated series. Retries with escalating
+backoff took `^VIX9D` selection from **1/5 to 5/6** at the 10y range, and the
+fallback is always labelled — but roughly one run in six still quietly uses
+30-day vol instead of 9-day and reports a different number. A stronger fix
+would cache a known-good series to disk rather than re-fetching.
+
+## 3.5 Static file server has no image content-type
+
+`_send_file`'s ctype chain maps `.html`, `.js` and `.css`, then falls through
+to `application/octet-stream`. `screenshot.png` in the repo root would serve
+as a download rather than an image. One line, no risk.
+
+## 3.6 Sector factor exposures are hand-chosen, not fitted
+
+The four sectors added with the S&P 500 library (Utilities, Real Estate,
+Materials, Communication Services) have `[mkt, sector, rate, oil]` exposure
+vectors picked to reflect known behaviour — utilities as a low-beta,
+rate-negative bond proxy; real estate the most rate-sensitive; materials the
+only one with real oil beta.
+
+They were sanity-checked and behave correctly (NEE comes out negatively
+correlated with US10Y at −0.38 and DXY at −0.41, positively with AMT at
++0.44), but they are **judgement, not fitted**. Fitting them to real
+historical returns would make the synthetic correlations defensible rather
+than merely plausible.
+
+## 3.7 Live correlation still only covers the curated graph
+
+"Sync History" rebuilds correlations from real 6-month history for the
+rendered graph only. Extending it to all 503 S&P names would take
+**~6 minutes** serialized behind Yahoo's rate limiter (measured), which is why
+the index view uses the synthetic factor model and says so in its caption. A
+batched or background sync would be the way in.
+
+## 3.8 Per-symbol cost on a cold scan
+
+`realized_vol` adds a Yahoo history call per symbol per cold scan, on top of
+chain and quote fetches. Fine at three index ETFs; it is the thing that would
+bite first if the scan universe ever widens.
+
+## 3.9 Cosmetic
+
+- `/favicon.ico` 404s on every page load. Pre-existing and harmless, but it
+  appears in every console check and adds noise to real debugging.
+
+---
+
+# 4. Accepted trade-offs — context, not tasks
+
+Recorded so they aren't re-opened as though they were oversights.
+
+- **cosmos.gl is only in the index view.** The curated graph keeps SVG because
+  cosmos.gl cannot draw per-node text labels or the dashed 1st–5th hop-order
+  encoding, and the pinned radial cascade fights its GPU simulation. Measured
+  at 42 nodes it was a net loss; at 503 it earns its 693 KB. Both renderers
+  coexist deliberately.
+- **The vendored bundle is the UMD build (693 KB), not the smaller `+esm`
+  (309 KB).** jsDelivr's `+esm` carries absolute imports like
+  `/npm/d3-selection@3.0.0/+esm` that the local server would 404 on — it would
+  have kept a silent CDN dependency and broken offline rendering. The UMD
+  build is self-contained.
+- **Watchlist restore only resolves S&P 500 names offline.** A non-S&P ticker
+  needs an `/api/lookup` round trip each, which at boot would serialize behind
+  the rate limiter. Such tickers stay saved and can be re-added by searching.
+- **The index view's correlations are synthetic**, from the same factor model
+  as the curated graph — not live. Stated in its caption.
+- **The S&P 500 library is a literal in `index.html`**, fetched once. It goes
+  stale slowly; that is the price of no build step and offline operation.
+- **Scanning is restricted to SPY/QQQ/IWM** (`INDEX_FUNDS`), which correlate
+  0.77–0.92 with each other — close to one bet made three ways. Accepted for
+  the execution advantage in §5.4. `validate_scan_symbols(..., allow_any=True)`
+  is the escape hatch.
+- **No build step, stdlib only.** This constrains every dependency decision
+  above and is load-bearing, not incidental.
+
+---
+
+# 5. Findings worth not re-deriving
+
+## 5.1 The modeled simulation
+
+Buying a ~1% ITM weekly call, held to expiry, 3% execution haircut. The number
+moved four times as inputs got closer to correct; the **direction** of each
+move matters more than any single figure.
 
 | input corrected | SPY avg/trade | why it moved |
 |---|---|---|
@@ -107,23 +190,19 @@ Buying a ~1% ITM weekly call, held to expiry, 3% execution haircut:
 | implied 9-day (`^VIX9D`), 2y | +10.4% | right tenor for ~7-DTE contracts |
 | **implied 9-day, 10y** | **+13.3%** | **more than one regime** |
 
-**The regime caveat is now largely retired.** 2y (2024–2026) was a single
-benign stretch, which was the biggest remaining unknown. 10y spans the 2018
-Q4 selloff, the 2020 COVID crash and the 2022 bear market, and takes the
-sample from 465 trades to **2,476**. Held on the same 9-day tenor throughout:
+Stable across regimes on a consistent tenor — 2y +10.7% (465 trades, 48.6%
+win), 5y +12.3% (1,218, 50.4%), 10y +13.3% (2,476, 52.3%) — spanning the 2018
+Q4 selloff, the 2020 COVID crash and the 2022 bear market. The short sample
+was, if anything, *understating* it.
 
-| range | trades | win rate | avg/trade |
-|---|---|---|---|
-| 2y | 465 | 48.6% | +10.7% |
-| 5y | 1,218 | 50.4% | +12.3% |
-| 10y | 2,476 | 52.3% | +13.3% |
+**What has not changed and shouldn't be forgotten:** the win rate is barely
+above a coin flip (52.3%) and the distribution is violently skewed — best
+single trade **+409.8%**, worst **−100%**, with **22% of trades a total
+loss**. The positive average is carried by a few large winners, not by
+consistency. Execution cost is second-order: removing the 3% haircut entirely
+moves +13.3% to only +15.0%.
 
-The short sample was, if anything, *understating* it. Yahoo returns monthly
-bars for `max`, so 10y is the longest usable daily window.
-
-Sensitivity to the volatility assumption, still the dominant unknown, is
-also more robust on the longer sample — a 25% vol error is now roughly
-breakeven rather than a loss:
+Sensitivity to the volatility assumption remains the dominant unknown:
 
 | vol premium | 2y | 10y |
 |---|---|---|
@@ -131,32 +210,75 @@ breakeven rather than a loss:
 | ×1.10 | +4.8% | +7.8% |
 | ×1.25 | −2.9% | **+0.3%** |
 
-**What has NOT changed, and shouldn't be forgotten:** win rate is barely
-above a coin flip (52.3%), and the trade distribution is violently skewed —
-best single trade +409.8%, worst **−100%**. A positive average here is
-carried by a few large winners, not by consistency, and a total loss on any
-given week is an ordinary outcome rather than a tail. Execution cost is
-second-order: removing the 3% haircut entirely moves +13.3% to only +15.0%.
+Yahoo returns **monthly** bars for `max`, so 10y is the longest usable daily
+window. These series track the INDEX, not the ETF.
 
-**Caveats that remain, in order of how much they'd move the number:**
+## 5.2 Kelly
 
-- IWM still has no implied-vol source at all (below) and is on the
-  optimistic realized-vol figure — **not comparable** to the other two.
-- QQQ's term correction is modelled (SPX curve borrowed), and at 10y it
-  falls back to plain 30-day `^VXN`, so its 10y figure understates it
-  relative to its own 2y/5y numbers. QQQ is not comparable across ranges.
-- These indices track the INDEX, not the ETF.
-- Still one market structure: no pre-2016 data at daily resolution here.
+Sizing maximizes `E[log(1 + f·r)]` over the empirical returns, **not** the
+binary `(p·b − q)/b` — that formula assumes two outcomes, and these payoffs
+run from −100% to +410%. (A test pins that the general form reproduces the
+closed-form answer on a genuinely binary bet.)
 
----
+On the modelled SPY distribution (n=2,475, 10y): full **15.8%**, half 7.9%,
+**quarter 3.9% (headline)**. Quarter-Kelly is the headline rather than a hedge
+because full Kelly is growth-optimal only with a *known* distribution — this
+one is modelled. Assuming volatility 10% higher moves f\* from 15.8% to 9.9%:
+a **37% smaller position from a modest input error**. That stress case ships
+as a first-class field, not a footnote.
 
-## 6. IWM implied vol — blocked, do not re-investigate
+It reports a **fraction of bankroll and never asks for an account size** — the
+fraction is the part derived from data, and keeping money out of the app
+avoids storing something sensitive for no analytical gain.
 
-Probed directly on this feed: `^RVX` 404s, `^RUTVIX` returns nothing, and
-`^VXD` / `^VIX3M` return a single bar. **There is no usable IWM implied-vol
-history available**, so IWM falls back to realized vol and says so in
-`vol_source`.
+Kelly's 3.9% is small *because* the distribution is violent — it and the
+simulation's win rate are the same fact stated twice.
 
-Recorded here so it isn't repeatedly rediscovered. Borrowing SPY's vol would be
-a different underlying's risk relabelled, which is why the fallback is explicit
-rather than silent.
+## 5.3 Gamma — the peak strike is empty, per-candidate isn't
+
+Across SPY/QQQ/IWM at 7/30/90 DTE, **8 of 9 peak-gamma strikes sat within
+0.5% of spot** (median 0.10%) — the peak restated the spot price already in
+the header. The one exception, QQQ at 90 DTE with a real put wall 3.3% below,
+never appears on boards that look 0–10 DTE.
+
+Per-candidate concentration does carry signal: **1% to 53% of peak** across
+twelve candidates scoring 72–77, uncorrelated with score. SPY P780 (74.0) sat
+at 53% while C752 (74.3) sat at 1%. The board rates them equivalent; they are
+in completely different gamma environments.
+
+The column's fetch must be **deep** (`top=250`, not 14): with a shallow fetch
+a strike outside the slice reads as `0%` rather than "not measured" — a wrong
+answer, not a missing one. The chart slices client-side for display.
+
+## 5.4 Index funds vs single names
+
+Measured on live ~7-DTE ITM contracts:
+
+| | median spread | p90 | median OI |
+|---|---|---|---|
+| index ETFs | **2.78%** | 8.4% | 164 |
+| single names | 6.20% | 14.6% | 168 |
+
+~2.2× tighter on spread — the cost that matters, paid on entry *and* exit. The
+advantage is in **spread, not depth**: per-contract open interest is
+effectively identical, because index chains spread far larger total OI across
+many more strikes.
+
+## 5.5 The DTE window is ±3 for a reason
+
+`[target−3, target+3]` spans exactly 7 calendar days, and weekly expiries are
+7 days apart, so any 7-day span contains exactly one Friday. That makes 3 the
+**smallest** window guaranteeing a hit. At ±2 the window is [5,9] and returns
+**zero** candidates for names carrying only Friday weeklies — SMCI, WMT and
+COIN all list expiries at 3/10/17 DTE with nothing between. ±4 caught nothing
+±3 didn't.
+
+## 5.6 Every node needs at least one edge
+
+`buildGraph` adds at most one statistical edge per node at |r| ≥ 0.5. A saved
+stock could land **orphaned**: NEE peaked at 0.438 against its nearest
+neighbour, so it had zero edges and a cascade from it reached exactly 1 node.
+The model was right — a low-beta utility genuinely correlates weakly with tech
+— but a node that can't cascade is the app's core feature silently not working
+for it. Every node now gets its strongest correlate, drawn at its true weak
+|r| so it renders thin rather than pretending to be strong.
