@@ -60,33 +60,35 @@ win-rate error scales like 1/sqrt(n).
 
 ---
 
-## 4. Gamma overlay — UI half
+## 4. Gamma — resolved, and the panel lost
 
-**What:** `/api/options/gamma` and `get_gamma_exposure()` now exist: gamma
-concentration per strike, calls and puts separate, in dollars of delta per 1%
-move. Nothing in the UI shows it yet. Options: a panel on the Snipe tab, or
-markers on the existing network/price visualizations at the high-concentration
-strikes.
+The open question was whether the peak-gamma strike earned its screen space
+on the candidate board. **It didn't**, and the measurement was unambiguous.
 
-**Why:** It's positioning context nothing else in the app provides, and it's
-the piece that ties the options work back to CASCADE's actual thesis rather
-than being a bolted-on screener.
+Across SPY/QQQ/IWM at 7/30/90 DTE, **8 of 9 peaks sat within 0.5% of spot**
+(median 0.10%). The peak strike was restating the spot price already in the
+header. The single exception was QQQ at 90 DTE, where a real put wall sits
+3.3% below — but the Snipe boards only look 0–10 DTE, so that case never
+appears where the panel lived.
 
-**Blockers / notes:**
-- Both original blockers are resolved. Gamma is present in CBOE's payload
-  (all 14,672 SPY rows; non-zero on 11,074), so no delta-difference
-  approximation is needed. And `_parse_chain` now takes `require_volume`,
-  so the untraded strikes holding 17% of open interest are reachable.
-- The remaining risk is presentational, and it's the important one. The
-  backend deliberately refuses to net calls against puts or infer dealer
-  positioning, because open interest never says who holds which side. A UI
-  that draws a single "gamma flip level" or labels a strike as a magnet
-  would smuggle that claim back in through the visualization after the API
-  carefully avoided making it. Show the two sides separately.
-- Worth deciding: is the peak strike genuinely useful to a user screening
-  single contracts, or is this a separate analytical view? On SPY it lands
-  near the money and mostly restates "the most open interest is near the
-  money", which may not earn its screen space on the candidate board.
+**What replaced it carries actual signal.** Gamma concentration at a
+*candidate's own strike*, as a share of that underlying's peak, varies
+enormously across contracts the score rates as equivalent — measured 1% to
+53% across twelve candidates scoring 72–77. SPY P780 (score 74.0) sat at 53%
+of peak while C752 (score 74.3) sat at 1%. The board calls them equivalent;
+they are in completely different gamma environments, and nothing else on the
+row says so.
+
+So: a per-row `Γ` column on all three boards, and the by-strike chart
+collapsed behind a toggle. The chart is a genuine analytical view — it shows
+call/put walls clearly — it just isn't what someone screening single
+contracts needs occupying half the board.
+
+**Implementation note worth keeping:** the gamma fetch for the column has to
+be deep (top=250, not top=14). With a shallow fetch a candidate whose strike
+falls outside the top slice reads as `0%` gamma rather than "not measured",
+which is a wrong answer rather than a missing one. The chart still slices to
+the leading strikes for display.
 
 ---
 

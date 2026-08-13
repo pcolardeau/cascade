@@ -210,6 +210,9 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
   line-height: 1.5; backdrop-filter: blur(6px);
 }
 #index-note.on { display: block; }
+/* collapsed-by-default gamma chart: available, but not occupying the board */
+.gx-toggle-row { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--grid); }
+.gx-toggle-row .tbtn { font-size: 9.5px; letter-spacing: 1px; }
 .tbtn.on { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
 
 /* node/edge svg styling */
@@ -3147,9 +3150,13 @@ function renderSnipe(){
     const isWeekly = snipeMode==="weekly";
     const tbl=document.createElement("table"); tbl.className="opt";
     const hr=document.createElement("tr");
+    // "Γ" = share of this underlying's peak gamma concentration at this
+    // strike. Replaces a peak-strike readout that measured as empty (8 of 9
+    // peaks sat within 0.5% of spot); this varies 1%-53% across candidates
+    // the score rates as equivalent.
     const cols = isWeekly
-      ? ["Ticker","Type","Score","Strike","DTE","Δ","IV/RV","Spread%","Bid/Ask","Cost $","Breakeven","Exp.Move","P&L Flat","P&L Move","Extrinsic","Flags"]
-      : ["Ticker","Type","Score","Strike","Δ","Spread%","Bid/Ask","Cost $","Breakeven","Cushion%","P&L Down","P&L Flat","P&L Up","Tier","Flags"];
+      ? ["Ticker","Type","Score","Strike","DTE","Δ","IV/RV","Spread%","Bid/Ask","Cost $","Breakeven","Exp.Move","P&L Flat","P&L Move","Extrinsic","Γ","Flags"]
+      : ["Ticker","Type","Score","Strike","Δ","Spread%","Bid/Ask","Cost $","Breakeven","Cushion%","P&L Down","P&L Flat","P&L Up","Tier","Γ","Flags"];
     for(const t of cols){
       const th=document.createElement("th"); th.textContent=t; hr.append(th);
     }
@@ -3208,7 +3215,7 @@ function renderSnipe(){
                   pnlCell(sc.flat?sc.flat.pnl_dollars:null),
                   pnlCell(sc.favorable?sc.favorable.pnl_dollars:null,
                           sc.favorable?sc.favorable.pnl_pct:null),
-                  tdExtr,tdFlags);
+                  tdExtr,gammaCell(o.underlying,o.strike),tdFlags);
       } else {
         const tdCushion=document.createElement("td"); tdCushion.className="num"; tdCushion.textContent=fmtPct1(o.breakeven_cushion_pct);
         const tdTier=document.createElement("td"); tdTier.className="num";
@@ -3219,7 +3226,7 @@ function renderSnipe(){
                   pnlCell(sc.flat?sc.flat.pnl_dollars:null),
                   pnlCell(sc.up?sc.up.pnl_dollars:null,
                           sc.up?sc.up.pnl_pct:null),
-                  tdTier,tdFlags);
+                  tdTier,gammaCell(o.underlying,o.strike),tdFlags);
       }
       if(fromY[o.underlying]!=null) tr.addEventListener("click",()=>selectNode(fromY[o.underlying]));
       tbl.append(tr);
@@ -3239,15 +3246,77 @@ function renderSnipe(){
 /* Everything that hangs off the tab rather than a specific board. Shared by
    every mode, so it lives in one function instead of being appended at each
    render path's tail — which is how the spreads board silently lost it. */
+/* Gamma concentration at a specific candidate's strike, as a share of that
+   underlying's peak.
+
+   This replaced a peak-strike readout, which was measured to be empty: across
+   SPY/QQQ/IWM at 7/30/90 DTE, 8 of 9 peaks sat within 0.5% of spot (median
+   0.10%), i.e. it restated the spot price already in the header.
+
+   Per-candidate concentration does carry signal, and the score doesn't
+   contain it. Measured on one board: twelve candidates scoring 72-77 ranged
+   from 1% to 53% of peak gamma. SPY P780 (score 74.0) sits at 53% while
+   C752 (score 74.3) sits at 1% -- the board rates them equivalent, and they
+   are in completely different gamma environments. */
+function gammaShareFor(underlying, strike){
+  const st = gammaCache[underlying];
+  const d = st && st.data;
+  if(!d || !d.strikes || !d.strikes.length) return null;
+  let peak = 0;
+  for(const r of d.strikes) if(r.total > peak) peak = r.total;
+  if(!peak) return null;
+  const row = d.strikes.find(r => r.strike === strike);
+  return row ? row.total / peak : 0;
+}
+
+/* Gamma is fetched per underlying and the boards scan up to three, so warm
+   each one the rows actually reference rather than only the first. */
+function ensureGammaFor(rows){
+  const syms = [...new Set((rows||[]).map(r=>r.underlying).filter(Boolean))];
+  for(const s of syms){
+    const st = gammaState(s);
+    if(!st.loaded && !st.loading) fetchGamma(s);
+  }
+  return syms;
+}
+
+function gammaCell(underlying, strike){
+  const td = document.createElement("td"); td.className = "num";
+  const share = gammaShareFor(underlying, strike);
+  if(share == null){ td.textContent = "—"; return td; }
+  const span = document.createElement("span");
+  span.textContent = (share*100).toFixed(0)+"%";
+  // Only the high end is worth colouring: a candidate sitting on a large
+  // gamma concentration is the notable case, not one sitting off it.
+  if(share >= 0.25){ span.style.color = "var(--accent)"; span.style.fontWeight = "700"; }
+  else if(share < 0.05){ span.style.color = "var(--ink-muted)"; }
+  span.title = "share of this underlying's peak gamma concentration, at this strike";
+  td.append(span);
+  return td;
+}
+
+/* The by-strike chart is collapsed by default. It's a genuine analytical
+   view -- it shows call/put walls clearly -- but it is not what someone
+   screening single contracts needs in front of them, and it costs a lot of
+   vertical space on a board whose rows are the point. The per-row gamma
+   column carries the actionable part; this is here when you want the shape. */
+let gammaExpanded = false;
+
 function renderSnipeTrailer(box, snipeData){
-  // Gamma is a property of the underlying, not of any board's scoring.
-  // Keyed to the first scanned symbol so it always has a concrete subject.
-  const gxSym = (snipeData.contracts && snipeData.contracts[0] && snipeData.contracts[0].underlying)
-             || (snipeData.spreads && snipeData.spreads[0] && snipeData.spreads[0].underlying)
-             || "SPY";
-  const gst = gammaState(gxSym);
-  if(!gst.loaded && !gst.loading) fetchGamma(gxSym);
-  renderGammaSection(box, gxSym);
+  const rows = snipeData.contracts || snipeData.spreads || [];
+  const syms = ensureGammaFor(rows);
+  const gxSym = syms[0] || "SPY";
+
+  const bar = document.createElement("div"); bar.className = "gx-toggle-row";
+  const btn = document.createElement("button"); btn.className = "tbtn";
+  btn.textContent = (gammaExpanded ? "▾ " : "▸ ") + "GAMMA BY STRIKE · " + gxSym;
+  btn.title = "Where option convexity sits across strikes. The per-row Γ column "
+            + "already shows each candidate's share of it.";
+  btn.addEventListener("click", ()=>{ gammaExpanded = !gammaExpanded; renderSnipe(); });
+  bar.append(btn);
+  box.append(bar);
+
+  if(gammaExpanded) renderGammaSection(box, gxSym);
 }
 
 /* Shared footer note. Prefers the server's own note (which spells out the
@@ -3276,7 +3345,7 @@ function renderSpreadsTable(box, data, cfg){
   const ch=document.createElement("h3"); ch.textContent=cfg.ranked; cc.append(ch);
   const tbl=document.createElement("table"); tbl.className="opt";
   const hr=document.createElement("tr");
-  for(const t of ["Ticker","Type","Score","Long/Short","Width","DTE","Short Δ","Net Debit","Max Gain","Max Loss","Reward:Risk","Breakeven","Cost%","Flags"]){
+  for(const t of ["Ticker","Type","Score","Long/Short","Width","DTE","Short Δ","Net Debit","Max Gain","Max Loss","Reward:Risk","Breakeven","Cost%","Γ","Flags"]){
     const th=document.createElement("th"); th.textContent=t; hr.append(th);
   }
   tbl.append(hr);
@@ -3313,7 +3382,8 @@ function renderSpreadsTable(box, data, cfg){
     const tdCost=document.createElement("td"); tdCost.className="num"; tdCost.textContent=fmtPct1(s.cost_pct);
     const tdFlags=document.createElement("td"); tdFlags.append(renderFlags(s.flags));
 
-    tr.append(td1,td2,tdScore,tdLegs,tdWidth,tdDte,tdSd,tdDebit,tdGain,tdLoss,tdRr,tdBe,tdCost,tdFlags);
+    tr.append(td1,td2,tdScore,tdLegs,tdWidth,tdDte,tdSd,tdDebit,tdGain,tdLoss,tdRr,tdBe,tdCost,
+              gammaCell(s.underlying, s.long_strike), tdFlags);
     if(fromY[s.underlying]!=null) tr.addEventListener("click",()=>selectNode(fromY[s.underlying]));
     tbl.append(tr);
   }
@@ -3338,7 +3408,11 @@ async function fetchGamma(symbol){
   if(st.loading) return;
   st.loading=true; renderSnipe();
   try{
-    const r=await fetch("/api/options/gamma?symbol="+encodeURIComponent(symbol)+"&top=14");
+    // Fetch deep, not just the top strikes: the per-row column needs a
+    // candidate's OWN strike to be present, and a strike missing from a
+    // top-14 slice would read as 0% gamma rather than "not measured".
+    // The chart below still shows only the leading strikes.
+    const r=await fetch("/api/options/gamma?symbol="+encodeURIComponent(symbol)+"&top=250");
     st.data=await r.json(); st.loaded=true;
   }catch(e){ st.data={_error:String(e)}; }
   st.loading=false; renderSnipe();
@@ -3360,7 +3434,12 @@ function renderGammaSection(box, symbol){
     e.textContent="Gamma data unavailable"+(st.data&&st.data._error?" ("+st.data._error+")":"")+".";
     sec.append(e); box.append(sec); return;
   }
-  const d=st.data, strikes=d.strikes||[];
+  const d=st.data;
+  // Chart the leading strikes only -- the fetch is deep so the per-row
+  // column can resolve any candidate, but 250 bars is not a chart.
+  const strikes=[...(d.strikes||[])]
+    .sort((a,b)=>b.total-a.total).slice(0,14)
+    .sort((a,b)=>a.strike-b.strike);
   if(!strikes.length){
     const e=document.createElement("div"); e.className="empty-note";
     e.textContent="No open interest with gamma in range."; sec.append(e); box.append(sec); return;
