@@ -1866,6 +1866,105 @@ class GammaExposureTests(NetworkFreeTestCase):
         self.assertLessEqual(out["target_dte"], server.MAX_TARGET_DTE)
 
 
+class KellyTests(unittest.TestCase):
+    """Kelly sizing. The payoff here is NOT binary -- measured returns run
+    from -100% to +410% with 22% total losses -- so this uses the general
+    E[log(1+f*r)] form rather than the textbook (p*b-q)/b."""
+
+    def test_matches_the_binary_formula_on_a_binary_bet(self):
+        """Sanity anchor: on a two-valued payoff the general form must agree
+        with the closed-form answer. Even-money bet at p=0.6 -> f*=0.2."""
+        returns = [1.0]*600 + [-1.0]*400
+        self.assertAlmostEqual(server.kelly_fraction(returns), 0.20, places=2)
+
+    def test_favourable_2to1_payoff(self):
+        """p=0.5, b=2 -> f* = (0.5*2 - 0.5)/2 = 0.25."""
+        returns = [2.0]*500 + [-1.0]*500
+        self.assertAlmostEqual(server.kelly_fraction(returns), 0.25, places=2)
+
+    def test_no_edge_means_no_bet(self):
+        returns = [1.0]*500 + [-1.0]*500        # even money, 50/50
+        self.assertEqual(server.kelly_fraction(returns), 0.0)
+
+    def test_negative_edge_means_no_bet(self):
+        returns = [1.0]*400 + [-1.0]*600
+        self.assertEqual(server.kelly_fraction(returns), 0.0)
+
+    def test_possibility_of_total_loss_keeps_the_fraction_below_everything(self):
+        """A -100% outcome drives log to -infinity as f approaches 1, which
+        is exactly what should stop Kelly recommending the whole bankroll
+        however good the winners look."""
+        returns = [5.0]*900 + [-1.0]*100        # huge edge, but ruin possible
+        f = server.kelly_fraction(returns)
+        self.assertLess(f, 1.0)
+        self.assertGreater(f, 0.0)
+
+    def test_empty_returns_are_safe(self):
+        self.assertEqual(server.kelly_fraction([]), 0.0)
+
+    # -- the gate ----------------------------------------------------------
+
+    def test_refuses_on_a_small_sample(self):
+        """The live paper log's 3 straight winners would naively imply
+        betting nearly everything. That refusal is the point of the gate."""
+        out = server.kelly_summary([0.03, 0.02, 0.04], source="realized")
+        self.assertFalse(out["available"])
+        self.assertEqual(out["trades"], 3)
+        self.assertEqual(out["trades_needed"], server.MIN_KELLY_TRADES)
+        self.assertIn("noise", out["reason"])
+
+    def test_a_winning_streak_is_never_sized_from(self):
+        """All-winners is the specific shape that breaks naive Kelly."""
+        out = server.kelly_summary([0.05]*(server.MIN_KELLY_TRADES - 1),
+                                   source="realized")
+        self.assertFalse(out["available"])
+
+    def test_computes_once_the_sample_is_big_enough(self):
+        returns = ([1.0]*600 + [-1.0]*400)
+        out = server.kelly_summary(returns, source="modelled")
+        self.assertTrue(out["available"])
+        self.assertAlmostEqual(out["full"], 0.20, places=2)
+        self.assertAlmostEqual(out["half"], out["full"]*0.5, places=4)
+        self.assertAlmostEqual(out["quarter"], out["full"]*0.25, places=4)
+
+    def test_headline_is_fractional_not_full_kelly(self):
+        """Full Kelly is growth-optimal only with a known distribution; the
+        recommended figure must be the conservative one."""
+        returns = ([1.0]*600 + [-1.0]*400)
+        out = server.kelly_summary(returns, source="modelled")
+        self.assertLess(out["recommended"], out["full"])
+        self.assertAlmostEqual(out["recommended"],
+                               out["full"]*server.DEFAULT_KELLY_FRACTION, places=4)
+
+    def test_reports_the_total_loss_rate(self):
+        returns = ([1.0]*600 + [-1.0]*400)
+        out = server.kelly_summary(returns, source="modelled")
+        self.assertAlmostEqual(out["total_loss_rate"], 0.4, places=3)
+
+    def test_source_is_always_stated(self):
+        """A modelled fraction must never read as one earned on real fills."""
+        returns = ([1.0]*600 + [-1.0]*400)
+        self.assertIn("MODELLED", server.kelly_summary(returns, source="modelled")["note"])
+        self.assertIn("finite sample",
+                      server.kelly_summary(returns, source="realized")["note"])
+
+    def test_stress_case_travels_with_the_number(self):
+        good = ([1.0]*600 + [-1.0]*400)
+        worse = ([1.0]*540 + [-1.0]*460)
+        out = server.kelly_summary(good, stressed_returns=worse, source="modelled")
+        self.assertIn("stressed_full", out)
+        self.assertLess(out["stressed_full"], out["full"])
+        self.assertIn("sensitive", out["stress_note"])
+
+    def test_stress_note_survives_a_zero_full_kelly(self):
+        """Regression: the percentage-change text divided by full without
+        guarding it, so a no-edge distribution raised ZeroDivisionError."""
+        flat = ([1.0]*500 + [-1.0]*500)
+        out = server.kelly_summary(flat, stressed_returns=flat, source="modelled")
+        self.assertEqual(out["full"], 0.0)
+        self.assertIn("stress_note", out)
+
+
 class BlackScholesTests(unittest.TestCase):
     """The pricer underpinning the modeled simulation. Checked against
     textbook reference values and put-call parity, because a subtly wrong

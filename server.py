@@ -2059,6 +2059,131 @@ def _simulate_weekly_itm(bars, hold_days, moneyness, vol_lookback,
     return trades
 
 
+# ---------------------------------------------------------------------------
+# Kelly position sizing
+#
+# Kelly answers "what fraction of the bankroll maximizes long-run growth",
+# and it is reported as a FRACTION -- the app never asks for or stores an
+# account size. That keeps a genuinely sensitive number out of the app
+# entirely, and the fraction is the part that's actually derived from data.
+#
+# The binary textbook form (p*b - q)/b does NOT apply here. These payoffs
+# aren't two-valued: measured over 2,475 simulated trades they run from
+# -100% to +409.8%, with 22% of trades a total loss. So this maximizes
+# E[log(1 + f*r)] over the empirical returns, which is the general form the
+# binary formula is a special case of.
+#
+# WHY FRACTIONAL BY DEFAULT. Full Kelly is growth-optimal only if you know
+# the true distribution. You don't -- you have an estimate, and Kelly is
+# violently sensitive to it: on the same trades, assuming volatility 10%
+# higher moves f* from 15.7% to 9.9%, a 37% smaller position from a modest
+# input error. Half-Kelly gives up ~25% of the growth rate for roughly half
+# the drawdown, and quarter-Kelly is the honest default when the inputs are
+# themselves modelled.
+# ---------------------------------------------------------------------------
+# Minimum closed trades before a Kelly figure is offered at all. The live
+# paper log currently holds 3 trades, all winners -- a 100% win rate implies
+# betting essentially the whole bankroll, which is exactly the failure this
+# gate exists to prevent. Even at 100 the estimate is noisy; the error on a
+# win rate scales like 1/sqrt(n).
+MIN_KELLY_TRADES = 100
+
+# What fraction of full Kelly to headline. Not a hedge -- see above.
+DEFAULT_KELLY_FRACTION = 0.25
+
+
+def kelly_fraction(returns, cap=0.999):
+    """Growth-optimal bankroll fraction for a list of per-trade returns
+    (0.25 = +25%, -1.0 = total loss).
+
+    Maximizes E[log(1 + f*r)] by golden-section search. g is concave in f,
+    so the search is safe. Any return of exactly -1 drives log to -infinity
+    as f approaches 1, which is what correctly keeps the answer well below
+    "bet everything" whenever total loss is possible.
+
+    Returns 0.0 when no positive fraction beats not betting at all.
+    """
+    if not returns:
+        return 0.0
+
+    def growth(f):
+        total = 0.0
+        for r in returns:
+            v = 1.0 + f * r
+            if v <= 1e-12:
+                return -1e18          # ruin at this size
+            total += math.log(v)
+        return total / len(returns)
+
+    a, b = 0.0, cap
+    phi = (math.sqrt(5) - 1) / 2
+    c, d = b - phi * (b - a), a + phi * (b - a)
+    for _ in range(120):
+        if growth(c) < growth(d):
+            a = c
+        else:
+            b = d
+        c, d = b - phi * (b - a), a + phi * (b - a)
+    f = (a + b) / 2
+    return round(f, 4) if growth(f) > 0 else 0.0
+
+
+def kelly_summary(returns, stressed_returns=None, source="modelled"):
+    """Kelly sizing for a return distribution, or a refusal explaining why.
+
+    Args:
+        returns: per-trade returns to size from.
+        stressed_returns: the SAME trades under a worse assumption. Included
+            as a first-class field rather than a footnote, because Kelly's
+            sensitivity to its inputs is the single most important thing to
+            know before acting on it.
+        source: what produced these returns, so a modelled figure can never
+            be mistaken for one earned on real fills.
+    """
+    n = len(returns or [])
+    if n < MIN_KELLY_TRADES:
+        return {
+            "available": False,
+            "trades": n,
+            "trades_needed": MIN_KELLY_TRADES,
+            "source": source,
+            "reason": (f"only {n} settled trade(s); Kelly needs at least "
+                       f"{MIN_KELLY_TRADES}. On a small sample the estimate is "
+                       "dominated by noise -- a run of winners implies betting "
+                       "nearly the whole bankroll."),
+        }
+    full = kelly_fraction(returns)
+    out = {
+        "available": True,
+        "trades": n,
+        "source": source,
+        "full": full,
+        "half": round(full * 0.5, 4),
+        "quarter": round(full * 0.25, 4),
+        "recommended": round(full * DEFAULT_KELLY_FRACTION, 4),
+        "recommended_label": f"{DEFAULT_KELLY_FRACTION:.0%} Kelly",
+        "total_loss_rate": round(sum(1 for r in returns if r <= -0.999) / n, 4),
+        "note": ("Fraction of bankroll per trade, from maximizing "
+                 "E[log(1+f*r)] over the actual return distribution -- not the "
+                 "binary formula, which doesn't apply to a payoff running from "
+                 "-100% to +400%. Quarter-Kelly is the headline because full "
+                 "Kelly is optimal only if the distribution is known exactly, "
+                 "and this one is "
+                 + ("MODELLED, so its errors propagate straight into the size."
+                    if source == "modelled" else "estimated from a finite sample.")),
+    }
+    if stressed_returns:
+        stressed = kelly_fraction(stressed_returns)
+        out["stressed_full"] = stressed
+        shift = (f", a {abs(stressed - full) / full:.0%} change in position size"
+                 if full > 0 else "")
+        out["stress_note"] = (
+            f"Under a 10% higher volatility assumption the same trades give "
+            f"f*={stressed:.1%} instead of {full:.1%}{shift}. Kelly is far more "
+            f"sensitive to its inputs than to the trades themselves.")
+    return out
+
+
 def _summarize_trades(trades):
     n = len(trades)
     if not n:
@@ -2166,6 +2291,12 @@ def get_modeled_backtest(symbol, rng=_DEFAULT_BACKTEST_RANGE, hold_days=7, money
     # so the size of the modelling assumption is a visible number.
     unadjusted = (_summarize_trades(_run(1.0, spread_pct, iv=unadjusted_iv))
                   if term_adjusted else None)
+    # Kelly off the FULL headline distribution, with the 1.1x-volatility run
+    # as its stress case -- Kelly's sensitivity to its inputs matters more
+    # than the number itself, so it travels with it.
+    kelly = kelly_summary([t["pnl_pct"] for t in headline],
+                          stressed_returns=[t["pnl_pct"] for t in _run(1.1, spread_pct)],
+                          source="modelled")
 
     out = {
         "symbol": symbol,
@@ -2182,6 +2313,7 @@ def get_modeled_backtest(symbol, rng=_DEFAULT_BACKTEST_RANGE, hold_days=7, money
         "realized_vol_summary": realized_only,
         "unadjusted_summary": unadjusted,
         "term_adjusted": term_adjusted,
+        "kelly": kelly,
         "trades": headline[-20:],  # a tail sample, not the whole series
         "modeled": True,
         "note": ("MODELED, NOT A BACKTEST. No historical options prices exist on "
@@ -2542,7 +2674,15 @@ def get_snipe_log(board=DEFAULT_SNIPE_BOARD):
             "avg_pnl_dollars": round(total_pnl / n, 2),
             "avg_pnl_pct": round(avg_pct, 4),
         }
-    return {"board": board, "entries": ordered, "summary": summary}
+    # Kelly from REAL settled trades -- which almost always means a refusal,
+    # and that refusal is the useful output. With 3 closed trades all winners
+    # the naive estimate implies betting nearly the whole bankroll; the gate
+    # is what stops a lucky streak from being read as an edge.
+    kelly = kelly_summary([e.get("pnl_pct") for e in closed
+                           if e.get("pnl_pct") is not None],
+                          source="realized")
+    return {"board": board, "entries": ordered, "summary": summary,
+            "kelly": kelly}
 
 
 def _next_snipe_snapshot_time(now=None):

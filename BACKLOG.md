@@ -18,28 +18,45 @@ the point, since several of these look cheaper than they are.
 
 ---
 
-## 2. Kelly-fraction position sizing
+## 2. Kelly sizing — shipped, and mostly it refuses
 
-**What:** Every board currently models exactly 1 contract (`contract_cost`,
-`max_loss` both assume it). Once a paper-trading log has enough closed trades
-to establish a real win rate and average win/loss, use those to suggest a
-fractional-Kelly position size instead.
+Implemented, but the useful behaviour is the refusal. Recorded here because
+the numbers are easy to misread.
 
-**Why:** Turns the track record from a scorecard into an input. "This setup has
-historically hit 62% with a 1.4:1 payoff, so risk X% of the account" is the
-question a screener naturally raises and currently can't answer.
+**It reports a FRACTION of bankroll, and never asks for an account size.**
+The fraction is the part actually derived from data; keeping the money out
+of the app avoids storing something sensitive for no analytical gain.
 
-**Blockers / notes:**
-- Needs a meaningful sample first. Full Kelly on a handful of trades is
-  actively dangerous — the estimate's variance swamps the signal. Gate this
-  behind a minimum closed-trade count and default to fractional (½ or ¼)
-  Kelly, never full.
-- Requires an account-size input, which the app has never had. That's a new
-  piece of user state to persist and a new (small) responsibility — worth
-  being deliberate about rather than sneaking in a number field.
-- The weekly log this depended on now exists, so both boards can feed it —
-  but neither has a settled sample yet. The weekly board's first result
-  can't arrive until a logged pick reaches its expiry.
+**The binary formula doesn't apply.** `(p*b - q)/b` assumes two outcomes.
+These payoffs run from −100% to +410%, with **22% of trades a total loss**,
+so sizing maximizes `E[log(1 + f·r)]` over the empirical returns — the
+general form the textbook one is a special case of. (A test pins that the
+general form reproduces the closed-form answer on a genuinely binary bet.)
+
+On the modelled SPY distribution (n=2,475, 10y):
+
+| | fraction of bankroll |
+|---|---|
+| full Kelly | 15.8% |
+| half | 7.9% |
+| **quarter (headline)** | **3.9%** |
+
+**Why fractional is the headline, not a hedge.** Full Kelly is growth-optimal
+only if the distribution is known exactly. It isn't — it's modelled. On the
+same trades, assuming volatility 10% higher moves f\* from 15.8% to 9.9%: a
+**37% smaller position from a modest input error**. Kelly is far more
+sensitive to its inputs than to the trades themselves, so that stress case
+ships as a first-class field rather than a footnote.
+
+**The gate.** Below 100 settled trades it returns a refusal instead of a
+number. The live 0DTE log currently holds **3 closed trades, all winners** —
+naive Kelly on a 100% win rate implies betting essentially the whole
+bankroll. That is precisely the failure the gate exists to prevent, and it
+will keep refusing for months, which is correct.
+
+**What would make the realized figure trustworthy:** roughly 100 settled
+trades, i.e. ~5 months of daily logging. Even then the estimate is noisy —
+win-rate error scales like 1/sqrt(n).
 
 ---
 
