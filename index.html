@@ -39,6 +39,9 @@
   /* price direction (status semantics, reserved) */
   --up:          #0ca30c;
   --down:        #e66767;
+  /* supply-chain flow direction (distinct from --accent, --up/--down, --div-*) */
+  --supply-in:   #f2a94a;
+  --supply-out:  #4fd1c5;
   --font: system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -220,6 +223,8 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
 .edge.dim { opacity: 0.12; }
 .edge.flow { stroke-dasharray: 6 5; animation: flow 0.9s linear infinite; }
 @keyframes flow { to { stroke-dashoffset: -11; } }
+.edge.supply-in  { stroke: var(--supply-in); }
+.edge.supply-out { stroke: var(--supply-out); }
 .node { cursor: pointer; }
 .node circle.body, .node path.body { transition: opacity 0.35s, filter 0.35s; }
 /* Unaffected nodes recede on TWO axes — dimmed and drained of colour — so the
@@ -550,6 +555,12 @@ footer b { color: var(--ink-2); font-weight: 600; }
           <button data-d="1">1st</button><button data-d="2">2nd</button><button data-d="3" class="on">3rd</button><button data-d="4">4th</button><button data-d="5">5th</button>
         </div>
       </div>
+      <div class="tool-group">
+        <span class="tool-label">View</span>
+        <div class="seg" id="mode-seg">
+          <button data-m="correlation" class="on">CORRELATION</button><button data-m="supply">SUPPLY CHAIN</button>
+        </div>
+      </div>
       <button class="tbtn" id="btn-clear">CLEAR</button>
       <button class="tbtn" id="btn-reheat">RE-LAYOUT</button>
       <button class="tbtn" id="btn-sync-corr" title="Rebuild the correlation network from 6mo live daily history">SYNC HISTORY</button>
@@ -563,6 +574,10 @@ footer b { color: var(--ink-2); font-weight: 600; }
       <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="3 3"/></svg>3rd order — two hops</div>
       <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="1.6 4"/></svg>4th order — three hops</div>
       <div class="li"><svg width="22" height="14"><circle cx="7" cy="7" r="5.5" fill="none" stroke="#c3c2b7" stroke-width="2" stroke-dasharray="1 6"/></svg>5th order — four hops</div>
+    </div>
+    <div class="order-key" id="supply-key">
+      <div class="li"><svg width="22" height="14"><line x1="2" y1="7" x2="20" y2="7" stroke="var(--supply-in)" stroke-width="2.5" marker-end="url(#arrow-in)"/></svg>Suppliers — flow in</div>
+      <div class="li"><svg width="22" height="14"><line x1="2" y1="7" x2="20" y2="7" stroke="var(--supply-out)" stroke-width="2.5" marker-end="url(#arrow-out)"/></svg>Customers — flow out</div>
     </div>
   </section>
 
@@ -1387,6 +1402,36 @@ function buildGraph(corr){
 }
 let { edgeMap, edges, ADJ } = buildGraph(CORR);
 
+/* ---------- curated supply-chain links (directed, separate from LINKS) ----
+   [supplier, customer, mechanism]. This is a DIFFERENT relationship type
+   than LINKS (which mixes supply, rate-sensitivity, index-composition,
+   dollar-pricing and sector-flow ties, all undirected). Kept as its own
+   array -- not merged into LINKS/edgeMap/ADJ -- so Supply Chain mode can
+   never leak a non-supply LINKS entry, and Correlation mode's cascade
+   engine never sees a directed edge it isn't built for. Hand-curated,
+   expand over time; only direct (1st-tier) relationships. */
+const SUPPLY_LINKS = [
+  ["TSM","NVDA","Foundry — leading-edge (3nm/5nm) wafer supply"],
+  ["MU","NVDA","HBM memory supply"],
+  ["SKHY","NVDA","HBM memory supply"],
+  ["ASML","TSM","Lithography equipment supply"],
+  ["NVDA","MSFT","AI datacenter GPU sales (Azure)"],
+  ["NVDA","GOOGL","AI datacenter GPU sales (Google Cloud)"],
+  ["NVDA","META","AI datacenter GPU sales (AI infra)"],
+  ["NVDA","AMZN","AI datacenter GPU sales (AWS)"],
+  ["NVDA","ORCL","AI datacenter GPU sales (OCI)"],
+];
+function buildSupplyIndex(){
+  const m = {};
+  const ensure = tk => m[tk] || (m[tk] = { suppliers:[], customers:[] });
+  for(const [supplier,customer,mech] of SUPPLY_LINKS){
+    ensure(customer).suppliers.push({ tk:supplier, mech });
+    ensure(supplier).customers.push({ tk:customer, mech });
+  }
+  return m;
+}
+const SUPPLY_BY_TK = buildSupplyIndex();
+
 /* ============================================================================
    FORCE SIMULATION (custom, O(n²) fine at this scale)
    ========================================================================== */
@@ -1455,8 +1500,16 @@ const glow = el("filter",{id:"glow",x:"-80%",y:"-80%",width:"260%",height:"260%"
 el("feGaussianBlur",{stdDeviation:"3.2",result:"b"},glow);
 const fm = el("feMerge",{},glow); el("feMergeNode",{in:"b"},fm); el("feMergeNode",{in:"SourceGraphic"},fm);
 
+function mkArrow(id, colorVar){
+  const m = el("marker",{id, viewBox:"0 0 10 10", refX:"8", refY:"5", markerWidth:"7", markerHeight:"7", orient:"auto-start-reverse"}, defs);
+  el("path",{d:"M0,0 L10,5 L0,10 z", fill:`var(${colorVar})`}, m);
+}
+mkArrow("arrow-in",  "--supply-in");
+mkArrow("arrow-out", "--supply-out");
+
 const world   = el("g",{},svg);
 const edgesG  = el("g",{},world);
+const supplyG = el("g",{},world);   // directed supply-chain edges — above correlation edges, below ripples/nodes
 const ripG    = el("g",{},world);
 const nodesG  = el("g",{},world);
 
@@ -1492,6 +1545,21 @@ function rebuildEdgeEls(){
   });
 }
 rebuildEdgeEls();
+
+/* Directed supply-chain edges — a small, ephemeral set rebuilt on every
+   selection change (unlike edgeEls, which persists across the whole
+   session). Straight lines, not bowed paths: the set is always tiny
+   (<=~8 edges from one node) so overlap isn't the problem it is for the
+   dense correlation graph. */
+let supplyEdgeEls = [];
+function rebuildSupplyEdgeEls(list){ // list: [{aIdx,bIdx,dir:"in"|"out"}]
+  supplyG.replaceChildren();
+  supplyEdgeEls = list.map(d=>{
+    const p = el("path",{class:`edge flow ${d.dir==="in"?"supply-in":"supply-out"}`,
+      "marker-end": d.dir==="in" ? "url(#arrow-in)" : "url(#arrow-out)"}, supplyG);
+    return { el:p, aIdx:d.aIdx, bIdx:d.bIdx };
+  });
+}
 
 const DASH = {1:"none", 2:"6,3", 3:"3,3", 4:"1.6,4", 5:"1,6"};
 function makeNodeEl(n, s){
@@ -1534,6 +1602,10 @@ function renderFrame(){
     const mx = (a.x+b.x)/2 + (-dy)*EDGE_BOW*side;
     const my = (a.y+b.y)/2 + ( dx)*EDGE_BOW*side;
     L.setAttribute("d", `M${a.x} ${a.y}Q${mx} ${my} ${b.x} ${b.y}`);
+  }
+  for(const s of supplyEdgeEls){
+    const a=sim[s.aIdx], b=sim[s.bIdx];
+    s.el.setAttribute("d", `M${a.x} ${a.y} L${b.x} ${b.y}`);
   }
   for(let i=0;i<N;i++) nodeEls[i].g.setAttribute("transform",`translate(${sim[i].x},${sim[i].y})`);
   requestAnimationFrame(renderFrame);
@@ -1631,6 +1703,7 @@ nodes.forEach(wireNodeHover);
 /* ============================================================================
    CASCADE PROPAGATION — signed best-path product with per-hop damping
    ========================================================================== */
+let viewMode = "correlation"; // "correlation" | "supply"
 let selected = -1;
 let cascade  = null;      // { src, impact[], order[], via[], usedEdges:Set }
 let selectedB = -1;       // second shock source, scenario-compare mode
@@ -1709,6 +1782,8 @@ function compareClass(i){
 }
 
 function applyCascadeVisual(){
+  document.getElementById("supply-key").classList.remove("show");
+  rebuildSupplyEdgeEls([]);   // drop any directed supply-chain edges left over from Supply Chain mode
   document.getElementById("order-key").classList.toggle("show", !!cascade && !cascadeB);
   for(let i=0;i<N;i++){
     const ne=nodeEls[i];
@@ -1783,6 +1858,38 @@ function applyCascadeVisual(){
       L.style.strokeOpacity = 0.9;
     } else { L.classList.add("dim"); L.classList.remove("flow"); }
   });
+}
+
+/* Supply Chain mode's visual apply -- the counterpart to applyCascadeVisual
+   above, but over the small curated SUPPLY_LINKS set instead of the
+   correlation graph: no shock math, just direct suppliers (inbound, amber)
+   vs. direct customers (outbound, teal) vs. everything else (dimmed).
+   Reuses the same node halo/dim/glow DOM hooks applyCascadeVisual uses. */
+function applySupplyVisual(i){
+  document.getElementById("order-key").classList.remove("show");
+  document.getElementById("supply-key").classList.toggle("show", i>=0);
+  const data = i>=0 ? SUPPLY_BY_TK[nodes[i].tk] : null;
+  const supplierIdx = new Set((data?.suppliers||[]).map(s=>IDX[s.tk]).filter(x=>x!=null));
+  const customerIdx = new Set((data?.customers||[]).map(c=>IDX[c.tk]).filter(x=>x!=null));
+  for(let k=0;k<N;k++){
+    const ne = nodeEls[k];
+    if(i<0){ ne.g.classList.remove("dim","sel"); ne.halo.style.opacity=0; ne.chip.setAttribute("opacity",0); ne.body.removeAttribute("filter"); continue; }
+    const isSrc=k===i, isSup=supplierIdx.has(k), isCust=customerIdx.has(k);
+    ne.g.classList.toggle("sel", isSrc);
+    ne.g.classList.toggle("dim", !(isSrc||isSup||isCust));
+    ne.chip.setAttribute("opacity",0);
+    ne.halo.removeAttribute("stroke-dasharray");
+    if(isSrc){ ne.halo.style.opacity=1; ne.halo.style.stroke="var(--accent)"; ne.body.setAttribute("filter","url(#glow)"); }
+    else if(isSup){ ne.halo.style.opacity=1; ne.halo.style.stroke="var(--supply-in)"; ne.body.removeAttribute("filter"); }
+    else if(isCust){ ne.halo.style.opacity=1; ne.halo.style.stroke="var(--supply-out)"; ne.body.removeAttribute("filter"); }
+    else { ne.halo.style.opacity=0; ne.body.removeAttribute("filter"); }
+  }
+  edgeEls.forEach(L=>{ L.classList.add("dim"); L.classList.remove("flow"); L.style.stroke=""; }); // correlation edges suppressed in this mode
+  if(i<0){ rebuildSupplyEdgeEls([]); return; }
+  const list=[];
+  for(const s of (data?.suppliers||[])){ const si=IDX[s.tk]; if(si!=null) list.push({aIdx:si,bIdx:i,dir:"in"}); }
+  for(const c of (data?.customers||[])){ const ci=IDX[c.tk]; if(ci!=null) list.push({aIdx:i,bIdx:ci,dir:"out"}); }
+  rebuildSupplyEdgeEls(list);
 }
 
 /* ---------- radial cascade layout ----------
@@ -1907,6 +2014,12 @@ function fireRipples(src){
 }
 
 function selectNode(i, opts={}){
+  if(viewMode==="supply"){
+    selected=i; selectedB=-1; cascade=null; cascadeB=null;
+    applySupplyVisual(i);
+    renderList(); renderOverview(); renderCascadePanel(); drawMatrix();
+    return;
+  }
   if(opts.compare && selected>=0 && i!==selected){
     // shift-click a second node: toggle it as the scenario-compare source
     // instead of replacing the primary selection. Layout stays put — only
@@ -1932,7 +2045,8 @@ function clearSelection(){
   selected=-1; cascade=null;
   selectedB=-1; cascadeB=null;
   releaseCascadeLayout();
-  applyCascadeVisual(); renderList(); renderOverview(); renderCascadePanel(); drawMatrix();
+  if(viewMode==="supply") applySupplyVisual(-1); else applyCascadeVisual();
+  renderList(); renderOverview(); renderCascadePanel(); drawMatrix();
   applySearchVisual();
 }
 
@@ -2301,6 +2415,34 @@ function renderOverview(){
     cl.append(row);
   }
   box.append(cl);
+
+  // supply chain: direct suppliers / customers (Supply Chain mode only)
+  if(viewMode==="supply"){
+    const sd = SUPPLY_BY_TK[n.tk];
+    const mk=(title, arr, colorVar)=>{
+      const c=document.createElement("div"); c.className="chart-card corr-list";
+      const h2b=document.createElement("h3"); h2b.textContent=title; c.append(h2b);
+      if(!arr || !arr.length){
+        const e=document.createElement("div"); e.className="empty-note"; e.textContent="No curated data yet.";
+        c.append(e);
+      } else {
+        for(const {tk,mech} of arr){
+          const j=IDX[tk]; if(j==null) continue;
+          const row=document.createElement("div"); row.className="row";
+          row.style.gridTemplateColumns="52px 1fr"; // no bar-wrap here, unlike the 3-col correlation rows above
+          const t=document.createElement("span"); t.className="tk"; t.textContent=tk; t.style.color=`var(${colorVar})`;
+          const rv=document.createElement("span"); rv.className="rv"; rv.textContent=mech;
+          rv.style.color="var(--ink-muted)"; rv.style.fontWeight="500"; rv.style.textAlign="left";
+          row.append(t,rv);
+          row.addEventListener("click",()=>selectNode(j));
+          c.append(row);
+        }
+      }
+      box.append(c);
+    };
+    mk("Suppliers →", sd?.suppliers, "--supply-in");
+    mk("→ Customers", sd?.customers, "--supply-out");
+  }
 }
 
 /* price chart with crosshair tooltip (per interaction spec).
@@ -2368,7 +2510,9 @@ function renderCascadePanel(){
   box.replaceChildren();
   if(!cascade){
     const e=document.createElement("div"); e.className="empty-note";
-    e.textContent="Click any node to shock it and trace up to 5 orders of effect through the correlation network — direct hits, then the second-, third-, fourth- and fifth-order ripples. Adjust magnitude with the SHOCK slider and depth with the 1st–5th control.";
+    e.textContent = (viewMode==="supply" && selected>=0)
+      ? "Cascade shock isn't available in Supply Chain mode — switch to Correlation to shock this node."
+      : "Click any node to shock it and trace up to 5 orders of effect through the correlation network — direct hits, then the second-, third-, fourth- and fifth-order ripples. Adjust magnitude with the SHOCK slider and depth with the 1st–5th control.";
     box.append(e); return;
   }
   const n=nodes[cascade.src];
@@ -2624,6 +2768,12 @@ document.getElementById("depth-seg").addEventListener("click",e=>{
   maxDepth=+b.dataset.d;
   document.querySelectorAll("#depth-seg button").forEach(x=>x.classList.toggle("on",x===b));
   if(selected>=0){ recomputeCascades(); applyCascadeVisual(); animateCascadeLayout(); renderCascadePanel(); }
+});
+document.getElementById("mode-seg").addEventListener("click", e=>{
+  const b = e.target.closest("button"); if(!b || b.classList.contains("on")) return;
+  viewMode = b.dataset.m;
+  document.querySelectorAll("#mode-seg button").forEach(x=>x.classList.toggle("on", x===b));
+  if(selected>=0) selectNode(selected); else clearSelection();
 });
 document.getElementById("btn-clear").addEventListener("click",clearSelection);
 document.getElementById("btn-reheat").addEventListener("click",()=>{ alpha=1; });
