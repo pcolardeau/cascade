@@ -1415,6 +1415,8 @@ const SUPPLY_LINKS = [
   ["MU","NVDA","HBM memory supply"],
   ["SKHY","NVDA","HBM memory supply"],
   ["ASML","TSM","Lithography equipment supply"],
+  ["AMD","MSFT","Server CPU/GPU supply (Azure)"],
+  ["TSM","MSFT","Foundry — custom silicon (Maia AI accelerator, Cobalt CPU)"],
   ["NVDA","MSFT","AI datacenter GPU sales (Azure)"],
   ["NVDA","GOOGL","AI datacenter GPU sales (Google Cloud)"],
   ["NVDA","META","AI datacenter GPU sales (AI infra)"],
@@ -1477,7 +1479,7 @@ function tick(){
   for(let pass=0;pass<2;pass++)
   for(let i=0;i<N;i++) for(let j=i+1;j<N;j++){
     const a=sim[i], b=sim[j];
-    const min=a.r+b.r+58;
+    const min=a.r+b.r+90;
     let dx=b.x-a.x, dy=b.y-a.y, d=Math.hypot(dx,dy);
     if(d>=min) continue;
     if(d<0.01){ dx=rand()-0.5; dy=rand()-0.5; d=Math.hypot(dx,dy); }
