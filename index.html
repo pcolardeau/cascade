@@ -653,7 +653,7 @@ const SECTOR_BY_ID = Object.fromEntries(SECTORS.map(s=>[s.id,s]));
 // [ticker, name, sector, size(mkt-cap weight 1..5)]
 const UNIVERSE = [
   ["AAPL","Apple","tech",5],["MSFT","Microsoft","tech",5],["GOOGL","Alphabet","tech",4],
-  ["META","Meta Platforms","tech",4],["ORCL","Oracle","tech",3],
+  ["META","Meta Platforms","tech",4],["ORCL","Oracle","tech",3],["SMCI","Super Micro Computer","tech",2],
   ["NVDA","NVIDIA","semi",5],["TSM","TSMC","semi",4],["AMD","Advanced Micro","semi",3],
   ["ASML","ASML Holding","semi",3],["MU","Micron","semi",2],["SKHY","SK hynix","semi",3],
   ["JPM","JPMorgan Chase","fin",4],["GS","Goldman Sachs","fin",3],["BAC","Bank of America","fin",3],
@@ -1426,6 +1426,7 @@ const SUPPLY_LINKS = [
   ["NVDA","META","AI datacenter GPU sales (AI infra)"],
   ["NVDA","AMZN","AI datacenter GPU sales (AWS)"],
   ["NVDA","ORCL","AI datacenter GPU sales (OCI)"],
+  ["NVDA","SMCI","AI server system integration"],
 ];
 function buildSupplyIndex(){
   const m = {};
